@@ -264,5 +264,33 @@ class TestBlockTableComputeSlotMapping(TestBase):
         )
 
 
+class TestMultiGroupBlockTableMambaSkip(unittest.TestCase):
+    def setUp(self):
+        from vllm_ascend.worker.block_table import MultiGroupBlockTable
+
+        self.multi_group = MultiGroupBlockTable.__new__(MultiGroupBlockTable)
+        self.mamba_table = MagicMock(is_mamba_group=True)
+        self.attention_table = MagicMock(is_mamba_group=False)
+        self.multi_group.block_tables = [self.mamba_table, self.attention_table]
+
+    def test_compute_slot_mapping_skips_mamba_group(self):
+        query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
+        positions = torch.tensor([0], dtype=torch.int64)
+
+        self.multi_group.compute_slot_mapping(1, query_start_loc, positions)
+
+        self.mamba_table.compute_slot_mapping.assert_not_called()
+        self.attention_table.compute_slot_mapping.assert_called_once_with(1, query_start_loc, positions)
+
+    def test_compute_slot_mapping_draft_skips_mamba_group(self):
+        req_indices = np.array([0], dtype=np.int32)
+        positions = np.array([0], dtype=np.int64)
+
+        self.multi_group.compute_slot_mapping_draft(req_indices, positions)
+
+        self.mamba_table.compute_slot_mapping_draft.assert_not_called()
+        self.attention_table.compute_slot_mapping_draft.assert_called_once_with(req_indices, positions)
+
+
 if __name__ == "__main__":
     unittest.main()

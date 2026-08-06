@@ -46,6 +46,7 @@
 #include "lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include "causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
 #include "recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
+#include "attention/chunk_gated_delta_rule/chunk_gated_delta_rule_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
@@ -924,6 +925,7 @@ npu_copy_and_expand_eagle_inputs(
 }
 
 at::Tensor npu_causal_conv1d_custom(
+    const at::Tensor& output,
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& conv_state,
@@ -936,7 +938,6 @@ at::Tensor npu_causal_conv1d_custom(
     int64_t  pad_slot_id,
     int64_t  run_mode)
 {
-    at::Tensor output = at::empty(x.sizes(), x.options());
     EXEC_NPU_CMD(aclnnCausalConv1d,
                     x,
                     weight,
@@ -1242,7 +1243,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("npu_copy_and_expand_eagle_inputs", torch::kPrivateUse1, &vllm_ascend::npu_copy_and_expand_eagle_inputs);
     ops.def(
-        "npu_causal_conv1d_custom(Tensor x, "
+        "npu_causal_conv1d_custom(Tensor output, Tensor x, "
         "                         Tensor weight, "
         "                         Tensor conv_state, "
         "                         Tensor? bias_opt, "
@@ -1255,6 +1256,16 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                         int run_mode"
         ") -> (Tensor output)");
     ops.impl("npu_causal_conv1d_custom", torch::kPrivateUse1, &vllm_ascend::npu_causal_conv1d_custom);
+    ops.def(
+        "npu_chunk_gated_delta_rule(Tensor query, "
+        "                           Tensor key, "
+        "                           Tensor value, "
+        "                           Tensor beta, "
+        "                           Tensor initial_state, "
+        "                           Tensor actual_seq_lengths, "
+        "                           Tensor? g=None, "
+        "                           float scale_value=1.0) -> (Tensor out, Tensor final_state)");
+    ops.impl("npu_chunk_gated_delta_rule", torch::kPrivateUse1, &vllm_ascend::npu_chunk_gated_delta_rule);
     ops.def(
         "moe_grouped_matmul("
             "Tensor x,"

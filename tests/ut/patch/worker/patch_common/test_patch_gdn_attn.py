@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 import vllm_ascend.patch.worker.patch_gdn_attn as patch_gdn_attn
 from vllm_ascend.ops.gdn import (
+    AscendGatedDeltaNetAttention,
     get_non_spec_causal_conv1d_host_args,
     get_non_spec_chunked_prefill_meta,
     to_int64_tuple,
@@ -42,6 +44,31 @@ def _patch_triton_cdiv(monkeypatch):
             lambda a, b: (a + b - 1) // b,
             raising=False,
         )
+
+
+def test_fused_chunk_prefers_custom_op_and_preserves_fp32_state(monkeypatch):
+    custom_op = MagicMock()
+    monkeypatch.setattr(torch.ops, "_C_ascend", SimpleNamespace(npu_chunk_gated_delta_rule=custom_op))
+
+    assert AscendGatedDeltaNetAttention._get_fused_chunk_op(torch.float32) == ("custom", custom_op)
+
+
+def test_fused_chunk_builtin_is_limited_to_bf16_state(monkeypatch):
+    import vllm_ascend.ops.gdn as gdn
+
+    builtin_op = MagicMock()
+    monkeypatch.setattr(torch.ops, "_C_ascend", SimpleNamespace())
+    monkeypatch.setattr(gdn.torch_npu, "npu_chunk_gated_delta_rule", builtin_op, raising=False)
+
+    assert AscendGatedDeltaNetAttention._get_fused_chunk_op(torch.bfloat16) == ("torch_npu", builtin_op)
+    assert AscendGatedDeltaNetAttention._get_fused_chunk_op(torch.float32) is None
+
+
+def test_fused_chunk_falls_back_for_unsupported_activation_dtype(monkeypatch):
+    custom_op = MagicMock()
+    monkeypatch.setattr(torch.ops, "_C_ascend", SimpleNamespace(npu_chunk_gated_delta_rule=custom_op))
+
+    assert AscendGatedDeltaNetAttention._get_fused_chunk_op(torch.float32, torch.float16) is None
 
 
 @dataclass
@@ -295,6 +322,15 @@ def test_non_spec_prefill_fallback_meta_matches_original_inputs_and_runtime_help
     assert fallback_meta is not None
     assert fallback_meta.causal_conv1d is not None
     assert fallback_meta.chunk is not None
+    assert torch.equal(
+        fallback_meta.actual_seq_lengths.cpu(),
+        attn_metadata.non_spec_query_start_loc.diff().to(torch.int32).cpu(),
+    )
+    expected_non_empty = torch.nonzero(fallback_meta.actual_seq_lengths, as_tuple=False).squeeze(-1)
+    if len(expected_non_empty) == len(fallback_meta.actual_seq_lengths):
+        assert fallback_meta.non_empty_indices is None
+    else:
+        assert torch.equal(fallback_meta.non_empty_indices, expected_non_empty)
 
     assert get_non_spec_causal_conv1d_host_args(attn_metadata) == _expected_conv1d_host_args(attn_metadata)
 

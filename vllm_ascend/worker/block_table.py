@@ -27,6 +27,10 @@ class BlockTable:
         self.pin_memory = pin_memory
         self.device = device
         self.physical_block_size = block_size
+        # model_runner_v1 uses [0] for Mamba groups because their slot mapping
+        # is never consumed. Keep this 19.1-compatible marker local to the
+        # block table instead of depending on the newer KVCacheGroup API.
+        self.is_mamba_group = kernel_sizes == [0]
 
         try:
             self.pcp_world_size = get_pcp_group().world_size
@@ -340,10 +344,14 @@ class MultiGroupBlockTable:
         positions: torch.Tensor,
     ) -> None:
         for block_table in self.block_tables:
+            if block_table.is_mamba_group:
+                continue
             block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
 
     def compute_slot_mapping_draft(self, req_indices: np.ndarray, positions: np.ndarray) -> None:
         for block_table in self.block_tables:
+            if block_table.is_mamba_group:
+                continue
             block_table.compute_slot_mapping_draft(req_indices, positions)
 
     def commit_block_table(self, num_reqs: int) -> None:

@@ -546,6 +546,7 @@ npu_copy_and_expand_eagle_inputs_meta(
 }
 
 at::Tensor npu_causal_conv1d_custom_meta(
+    const at::Tensor& output,
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& conv_state,
@@ -558,9 +559,23 @@ at::Tensor npu_causal_conv1d_custom_meta(
     int64_t  pad_slot_id,
     int64_t  run_mode)
 {
-
-    at::Tensor output = at::empty_symint(x.sym_sizes(), x.options());
     return output;
+}
+
+std::tuple<at::Tensor, at::Tensor> npu_chunk_gated_delta_rule_meta(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& beta,
+    const at::Tensor& initial_state,
+    const at::Tensor& actual_seq_lengths,
+    const c10::optional<at::Tensor>& g,
+    double scale_value)
+{
+    auto out_options = value.options().dtype(at::ScalarType::BFloat16);
+    at::Tensor out = at::empty_symint(value.sym_sizes(), out_options);
+    at::Tensor final_state = at::empty_symint(initial_state.sym_sizes(), initial_state.options());
+    return std::make_tuple(out, final_state);
 }
 
 at::Tensor npu_causal_conv1d_310_meta(
@@ -688,6 +703,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_gemma_rms_norm", &vllm_ascend::meta::npu_gemma_rms_norm_meta);
     // Masked input and mask meta implementation
     ops.impl("get_masked_input_and_mask", &vllm_ascend::meta::get_masked_input_and_mask_meta);
+    // Fused GDN prefill meta implementation
+    ops.impl("npu_chunk_gated_delta_rule", &vllm_ascend::meta::npu_chunk_gated_delta_rule_meta);
     // Launch host print from device
     ops.impl("device_print", &vllm_ascend::meta::device_print_meta);
     // launch host print from device for tensors
