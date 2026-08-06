@@ -53,8 +53,8 @@ static ge::graphStatus InferShapeChunkGatedDeltaRule(InferShapeContext *context)
     auto opName = context->GetNodeName();
     auto shapeValue = context->GetInputShape(VALUE_INDEX);
     auto shapeInitialState = context->GetInputShape(STATE_INDEX);
-    auto shapeOut = context->GetOutputShape(DIM_0);
-    auto shapeFinalState = context->GetOutputShape(DIM_1);
+    auto shapeOut = context->GetOutputShape(OUTPUT_OUT_IDX);
+    auto shapeFinalState = context->GetOutputShape(OUTPUT_FINAL_STATE_IDX);
     if (shapeValue == nullptr || shapeInitialState == nullptr || shapeOut == nullptr || shapeFinalState == nullptr) {
         OP_LOGE(opName, "[InferShape] shape is null");
         return ge::GRAPH_FAILED;

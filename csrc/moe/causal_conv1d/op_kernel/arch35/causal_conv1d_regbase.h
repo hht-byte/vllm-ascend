@@ -27,7 +27,7 @@ constexpr CastTrait castTraitB16ToB32 = {
 
 
 template <bool hasActivation>
-__aicore__ inline void ComputeFnRollingOutputRegbase(LocalTensor<float> ring, LocalTensor<float> currF, 
+__aicore__ inline void ComputeFnRollingOutputRegbase(LocalTensor<float> ring, LocalTensor<float> currF,
     LocalTensor<float> state0F, LocalTensor<float> weightF, uint32_t dataCount) 
 {
     __ubuf__ float* ringAddr = (__ubuf__ float*)ring.GetPhyAddr();

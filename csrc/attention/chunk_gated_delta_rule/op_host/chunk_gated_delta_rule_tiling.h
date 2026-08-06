@@ -40,7 +40,7 @@ public:
     explicit ChunkGatedDeltaRuleTiling(gert::TilingContext *context)
         : Ops::Transformer::OpTiling::TilingBaseClass(context)
     {
-        InitCompileInfo();
+        platformStatus_ = InitCompileInfo();
     };
     ~ChunkGatedDeltaRuleTiling() override = default;
 
@@ -71,7 +71,7 @@ protected:
     ge::graphStatus PostTiling() override;
 
 protected:
-    void InitCompileInfo();
+    ge::graphStatus InitCompileInfo();
     void PrintTilingData();
 
     ge::graphStatus CheckContext();
@@ -96,6 +96,7 @@ protected:
     ChunkGatedDeltaRule::ChunkGatedDeltaRuleTilingData tilingData_;
     ChunkGatedDeltaRuleInfo inputParams_;
     platform_ascendc::SocVersion socVersion_;
+    ge::graphStatus platformStatus_{ge::GRAPH_FAILED};
 };
 
 } // namespace optiling

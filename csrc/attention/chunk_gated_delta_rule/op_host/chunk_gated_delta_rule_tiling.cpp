@@ -61,12 +61,12 @@ constexpr uint32_t MASK_NUM = 4;
 constexpr int64_t P_NUM = 2;
 
 // 初始化编译信息，读取平台资源，并缓存核数到 tilingData_
-void ChunkGatedDeltaRuleTiling::InitCompileInfo()
+ge::graphStatus ChunkGatedDeltaRuleTiling::InitCompileInfo()
 {
     auto platformInfoPtr = context_->GetPlatformInfo();
     if (platformInfoPtr == nullptr) {
         OP_LOGE(context_->GetNodeName(), "platformInfoPtr is null");
-        return;
+        return ge::GRAPH_FAILED;
     }
     const auto &ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfoPtr);
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, compileInfo_.ubSize);
@@ -76,14 +76,15 @@ void ChunkGatedDeltaRuleTiling::InitCompileInfo()
 
     if (compileInfo_.aivNum <= 0 || compileInfo_.aicNum <= 0) {
         OP_LOGE(context_->GetNodeName(), "aivNum <= 0 or aicNum <= 0");
-        return;
+        return ge::GRAPH_FAILED;
     }
     tilingData_.aiCoreNum = compileInfo_.aicNum;
+    return ge::GRAPH_SUCCESS;
 }
 
 ge::graphStatus ChunkGatedDeltaRuleTiling::GetPlatformInfo()
 {
-    return ge::GRAPH_SUCCESS;
+    return platformStatus_;
 };
 
 // 获取输入输出信息，依次完成上下文、dtype、shape、属性、可选输入和 format 校验

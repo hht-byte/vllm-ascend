@@ -598,7 +598,7 @@
      constexpr int32_t w0Idx = MAX_WIDTH - kTemplateWidth;
 
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-    AdvanceFnLocalPartialsRegbase<kTemplateWidth>(ringF[slotCurr * MAX_BLOCK_DIM], weightF[w0Idx * MAX_BLOCK_DIM], 
+    AdvanceFnLocalPartialsRegbase<kTemplateWidth>(ringF[slotCurr * MAX_BLOCK_DIM], weightF[w0Idx * MAX_BLOCK_DIM],
         state0F, state1F, state2F, baseDim, MAX_BLOCK_DIM);
 #else
     if constexpr (kTemplateWidth == 2) {
@@ -729,10 +729,10 @@
          const int32_t slot = RetreatRingSlot(lastSlot, tap);
          Cast(ringT[slot * MAX_BLOCK_DIM * 2], ringF[slot * MAX_BLOCK_DIM], RoundMode::CAST_RINT, baseDim);
      }
- 
+
      SetFlag<HardEvent::V_MTE3>(stateWritebackVToMte3Event_);
      WaitFlag<HardEvent::V_MTE3>(stateWritebackVToMte3Event_);
- 
+
      for (int32_t pos = 0; pos < (width - 1); ++pos) {
          const int32_t tap = (width - 2) - pos;
          const int32_t slot = RetreatRingSlot(lastSlot, tap);
