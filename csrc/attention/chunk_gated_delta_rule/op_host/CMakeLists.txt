@@ -8,12 +8,56 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-add_op_to_compiled_list()
+add_ops_compile_options(
+    OP_NAME ChunkGatedDeltaRule
+    OPTIONS --cce-auto-sync=on
+            -Wno-deprecated-declarations
+            -Werror
+)
 
-if (BUILD_OPEN_PROJECT)
-    target_sources(op_host_aclnnExc PRIVATE
-        chunk_gated_delta_rule_def.cpp
+target_sources(op_host_aclnnExc PRIVATE
+    chunk_gated_delta_rule_def.cpp
+)
+
+target_sources(opapi PRIVATE
+    op_api/aclnn_chunk_gated_delta_rule.cpp
+    op_api/chunk_gated_delta_rule.cpp
+)
+
+if (NOT BUILD_OPEN_PROJECT)
+    target_sources(aclnn_ops_train PRIVATE
+        op_api/aclnn_chunk_gated_delta_rule.cpp
+        op_api/chunk_gated_delta_rule.cpp
+    )
+
+    target_sources(aclnn_ops_infer PRIVATE
+        op_api/aclnn_chunk_gated_delta_rule.cpp
+        op_api/chunk_gated_delta_rule.cpp
     )
 endif()
 
-add_modules_sources(OPTYPE chunk_gated_delta_rule ACLNNTYPE aclnn_exclude)
+target_sources(optiling PRIVATE
+    chunk_gated_delta_rule_tiling.cpp
+)
+
+target_include_directories(optiling PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+
+target_sources(opsproto PRIVATE
+    chunk_gated_delta_rule_infershape.cpp
+)
+
+target_include_directories(opsproto PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+
+file(GLOB _CGDR_Aclnn_header
+    "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_chunk_gated_delta_rule.h"
+)
+
+install(FILES ${_CGDR_Aclnn_header}
+    DESTINATION ${ACLNN_INC_INSTALL_DIR} OPTIONAL
+)
