@@ -43,7 +43,10 @@ function(op_add_subdirectory OP_LIST OP_DIR_LIST)
     set(_OP_LIST)
     set(_OP_DIR_LIST)
 
-    file(GLOB OP_HOST_CMAKE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/**/op_host/CMakeLists.txt")
+    file(GLOB OP_HOST_CMAKE_FILES
+            "${CMAKE_CURRENT_SOURCE_DIR}/**/op_host/CMakeLists.txt"
+            "${CMAKE_CURRENT_SOURCE_DIR}/attention/**/op_host/CMakeLists.txt"
+    )
 
     foreach(OP_CMAKE_FILE ${OP_HOST_CMAKE_FILES})
         get_filename_component(OP_HOST_DIR "${OP_CMAKE_FILE}" DIRECTORY)
