@@ -12,7 +12,6 @@
 #define OP_API_ACLNN_CHUNK_GATED_DELTA_RULE_H
 
 #include "aclnn/aclnn_base.h"
-#include "aclnn_util.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,7 +33,7 @@ extern "C" {
  * @param [out] executor: 返回op执行器，包含了算子计算流程。
  * @return aclnnStatus: 返回状态码
  */
-ACLNN_API aclnnStatus aclnnChunkGatedDeltaRuleGetWorkspaceSize(
+__attribute__((visibility("default"))) aclnnStatus aclnnChunkGatedDeltaRuleGetWorkspaceSize(
     const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *beta,
     const aclTensor *initialState, const aclTensor *actualSeqLengths, const aclTensor *gOptional, float scaleValue,
     const aclTensor *out, const aclTensor *finalState, uint64_t *workspaceSize, aclOpExecutor **executor);
@@ -48,8 +47,8 @@ ACLNN_API aclnnStatus aclnnChunkGatedDeltaRuleGetWorkspaceSize(
  * @param [in] stream: acl stream流。
  * @return aclnnStatus: 返回状态码
  */
-ACLNN_API aclnnStatus aclnnChunkGatedDeltaRule(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
-                                               aclrtStream stream);
+__attribute__((visibility("default"))) aclnnStatus aclnnChunkGatedDeltaRule(
+    void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream);
 
 #ifdef __cplusplus
 }

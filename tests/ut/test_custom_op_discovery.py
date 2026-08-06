@@ -24,9 +24,72 @@ OP_DISCOVERY_CMAKE = ROOT_DIR / "csrc" / "cmake" / "func.cmake"
 CHUNK_GATED_DELTA_RULE_OP_HOST = (
     ROOT_DIR / "csrc" / "attention" / "chunk_gated_delta_rule" / "op_host"
 )
+CHUNK_GATED_DELTA_RULE_ACLNN_HEADER = (
+    CHUNK_GATED_DELTA_RULE_OP_HOST
+    / "op_api"
+    / "aclnn_chunk_gated_delta_rule.h"
+)
 
 
 class TestCustomOpDiscovery(unittest.TestCase):
+    def test_chunk_gated_delta_rule_aclnn_header_is_self_contained(self) -> None:
+        cmake = os.environ.get("CMAKE_EXECUTABLE") or shutil.which("cmake")
+        if cmake is None:
+            self.skipTest("cmake is required to compile the ACLNN header")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_dir = Path(tmp_dir)
+            fake_aclnn_dir = source_dir / "include" / "aclnn"
+            fake_aclnn_dir.mkdir(parents=True)
+            (fake_aclnn_dir / "aclnn_base.h").write_text(
+                """
+#pragma once
+#include <cstdint>
+using aclnnStatus = int;
+struct aclTensor;
+struct aclOpExecutor;
+using aclrtStream = void*;
+""",
+                encoding="utf-8",
+            )
+            (source_dir / "header_smoke.cpp").write_text(
+                f"""
+#ifdef _MSC_VER
+#define __attribute__(value)
+#endif
+#include \"{CHUNK_GATED_DELTA_RULE_ACLNN_HEADER.as_posix()}\"
+""",
+                encoding="utf-8",
+            )
+            (source_dir / "CMakeLists.txt").write_text(
+                """
+cmake_minimum_required(VERSION 3.16)
+project(aclnn_header_smoke LANGUAGES CXX)
+add_library(aclnn_header_smoke STATIC header_smoke.cpp)
+target_include_directories(aclnn_header_smoke PRIVATE include)
+""",
+                encoding="utf-8",
+            )
+
+            build_dir = source_dir / "build"
+            configure = subprocess.run(
+                [cmake, "-S", str(source_dir), "-B", str(build_dir)],
+                check=False,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.assertEqual(configure.returncode, 0, configure.stdout + configure.stderr)
+
+            build = subprocess.run(
+                [cmake, "--build", str(build_dir)],
+                check=False,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+
     def test_nested_attention_custom_op_is_discovered(self) -> None:
         cmake = os.environ.get("CMAKE_EXECUTABLE") or shutil.which("cmake")
         if cmake is None:
