@@ -263,6 +263,25 @@
 #       Remove this patch once the vLLM fix is included in the supported vLLM
 #       version.
 #
+# ** 12. File: platform/patch_marconi_hybrid_cache.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.kv_cache_coordinator.HybridKVCacheCoordinator`
+#      `vllm.v1.core.sched.scheduler.Scheduler`
+#    Why:
+#       vLLM 0.19.1 can find a long full-attention prefix while finding no
+#       reusable Mamba state. Without an admission boundary, align mode may
+#       recompute past that shared prefix and miss the next reusable Mamba block.
+#    How:
+#       Track the gap between the longest per-group hit and the common hybrid
+#       hit, then limit a new prefill chunk to that gap rounded down to the
+#       configured cache block size. Skip the patch when the scheduler already
+#       exposes the upstream Marconi admission parameter.
+#    Related PR (if no, explain why):
+#       https://github.com/vllm-project/vllm/pull/37898
+#    Future Plan:
+#       Remove this capability-gated backport after vLLM 0.19.1 support is
+#       dropped.
+#
 # * Worker Patch:
 # ===============
 #
