@@ -297,7 +297,6 @@ Adapter 只保存小型 CPU 元数据：
   -> window_sec
   -> model_fingerprint
   -> last_sample_count
-  -> last_inference_seq
   -> finished
 ```
 
@@ -305,10 +304,10 @@ Adapter 只保存小型 CPU 元数据：
 
 规则：
 
-- 同一 Session/epoch 最多一个 `AsyncLLM` 请求执行；
-- 请求 ID 格式为 `session_id:utterance_epoch:inference_seq`；
+- 同一 Session/epoch 最多一个 `AsyncLLM` 请求执行；该串行约束继续由现有 Session API 服务保证；
+- `inference_seq` 和请求 ID 继续由现有 Session API 服务生成，推荐请求 ID 格式为 `session_id:utterance_epoch:inference_seq`；Adapter 不生成请求 ID，也不负责任务结果排序；
 - 幂等重试允许相同累计长度和内容；
-- 旧结果只有在 `inference_seq` 仍为最新时才由上层接受；
+- 旧结果只有在 `inference_seq` 仍为最新时才由现有 Session API 服务接受；
 - `is_final=true` 后状态标记为已结束；完全相同的 final 请求允许幂等重试，任何音频追加都被拒绝；
 - 现有服务收到最终结果后调用 `release_session` 删除 Adapter CPU 元数据；vLLM 缓存条目留在 LRU 中自然淘汰；
 - vLLM 缓存淘汰只能导致重算，不能导致错误命中。
@@ -343,6 +342,8 @@ limit_mm_per_prompt.audio = 5
 
 5 个音频项覆盖最大 10 秒音频和最小 2 秒窗口。模型 architecture 保持原生 `Qwen3ASRForConditionalGeneration`，不修改 checkpoint 的 `config.json`。
 
+vLLM 0.23.0 的 `CacheConfig` 已包含 `hash_block_size`，但 `AsyncEngineArgs` 没有暴露对应字段，也不会在 `create_engine_config()` 时传入该值。独立包因此提供一个 Engine 配置辅助函数：先由现有 `AsyncEngineArgs` 创建 `VllmConfig`，再在 Engine 启动前设置 `vllm_config.cache_config.hash_block_size`，最后调用原生 `AsyncLLM.from_vllm_config(vllm_config)`。这只使用公开配置对象和公开构造入口，不修改 vLLM 或 vLLM-Ascend 源码。
+
 目标环境的推荐版本矩阵遵循 vLLM-Ascend 0.23.0 官方兼容说明。`hash_block_size=32` 是 310P 验收项；若不通过则使用 128。
 
 ## 15. 可观测性
@@ -358,7 +359,7 @@ limit_mm_per_prompt.audio = 5
 - `prefix_cache_hit_tokens`；
 - `prefill_computed_tokens`；
 - `request_latency_ms`；
-- `inference_seq`。
+- `inference_seq`（由现有 Session API 服务附加）。
 
 指标区分“根据稳定窗口推导的预期命中”和“缓存未被淘汰后的实际命中”。
 
@@ -375,6 +376,7 @@ qwen3-asr-window-cache/
 │   ├── prompt_builder.py
 │   ├── request_adapter.py
 │   ├── compatibility.py
+│   ├── engine_config.py
 │   ├── metrics.py
 │   └── errors.py
 ├── tests/
