@@ -1,5 +1,6 @@
 import hashlib
 from dataclasses import replace
+from typing import TypedDict
 
 import cbor2
 import numpy as np
@@ -11,6 +12,15 @@ from qwen3_asr_window_cache.identity import (
     canonical_pcm_digest,
 )
 from qwen3_asr_window_cache.windowing import AudioWindow, split_audio_windows
+
+
+class WindowIdArguments(TypedDict):
+    namespace: str
+    window: AudioWindow
+    window_sec: int
+    feature_extractor_fingerprint: str
+    audio_encoder_fingerprint: str
+    adapter_schema_version: str
 
 
 def pcm(seconds: int) -> np.ndarray:
@@ -85,7 +95,7 @@ def test_each_window_identity_dimension_invalidates(
     window = split_audio_windows(
         audio, window_sec=4, sample_rate=16_000, is_final=False
     )[0]
-    kwargs = {
+    kwargs: WindowIdArguments = {
         "namespace": namespace,
         "window": window,
         "window_sec": 4,
@@ -104,11 +114,11 @@ def test_each_window_identity_dimension_invalidates(
     elif dimension == "end_sample":
         kwargs["window"] = replace(window, end_sample=window.end_sample - 1)
     elif dimension == "feature_extractor_fingerprint":
-        kwargs[dimension] = "feature-b"
+        kwargs["feature_extractor_fingerprint"] = "feature-b"
     elif dimension == "audio_encoder_fingerprint":
-        kwargs[dimension] = "encoder-b"
+        kwargs["audio_encoder_fingerprint"] = "encoder-b"
     else:
-        kwargs[dimension] = "schema-b"
+        kwargs["adapter_schema_version"] = "schema-b"
 
     assert build_window_id(**kwargs) != baseline
 
@@ -124,7 +134,8 @@ def test_window_id_changes_when_namespace_changes() -> None:
     other_namespace = build_session_namespace(
         session_id="u1", utterance_epoch=7, model_fingerprint="model-b"
     )
-    kwargs = {
+    kwargs: WindowIdArguments = {
+        "namespace": namespace,
         "window": window,
         "window_sec": 4,
         "feature_extractor_fingerprint": "feature-a",
@@ -132,9 +143,9 @@ def test_window_id_changes_when_namespace_changes() -> None:
         "adapter_schema_version": "schema-a",
     }
 
-    assert build_window_id(namespace=namespace, **kwargs) != build_window_id(
-        namespace=other_namespace, **kwargs
-    )
+    baseline = build_window_id(**kwargs)
+    kwargs["namespace"] = other_namespace
+    assert build_window_id(**kwargs) != baseline
 
 
 def test_session_namespace_is_sha256_of_versioned_canonical_tuple() -> None:

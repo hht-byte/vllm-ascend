@@ -1,15 +1,19 @@
 """Stable public domain API for Qwen3-ASR window caching."""
 
+from .compatibility import validate_runtime_versions
 from .config import WindowCacheConfig
+from .engine_config import prepare_vllm_config
 from .errors import (
     AudioLengthRegressed,
     AudioTooLong,
     InvalidAudioFormat,
+    InvalidEngineConfiguration,
     InvalidPromptPlaceholder,
     InvalidSampleRate,
     InvalidWindowSize,
     SessionAlreadyFinished,
     TooManyAudioWindows,
+    UnsupportedRuntimeVersion,
     WindowCacheError,
     WindowConfigChanged,
 )
@@ -33,11 +37,13 @@ __all__ = [
     "AudioTooLong",
     "AudioWindow",
     "InvalidAudioFormat",
+    "InvalidEngineConfiguration",
     "InvalidPromptPlaceholder",
     "InvalidSampleRate",
     "InvalidWindowSize",
     "SessionAlreadyFinished",
     "TooManyAudioWindows",
+    "UnsupportedRuntimeVersion",
     "WindowCacheConfig",
     "WindowCacheError",
     "WindowConfigChanged",
@@ -46,5 +52,7 @@ __all__ = [
     "build_window_id",
     "build_windowed_prompt",
     "canonical_pcm_digest",
+    "prepare_vllm_config",
     "split_audio_windows",
+    "validate_runtime_versions",
 ]

@@ -5,6 +5,14 @@ class WindowCacheError(Exception):
     """Base class for recoverable window-cache domain failures."""
 
 
+class UnsupportedRuntimeVersion(WindowCacheError):
+    """Raised when the installed vLLM runtime is not exactly supported."""
+
+
+class InvalidEngineConfiguration(WindowCacheError):
+    """Raised when vLLM EngineArgs cannot preserve the cache contract."""
+
+
 class InvalidAudioFormat(WindowCacheError):
     """Raised when PCM is not a non-empty mono C-contiguous float32 array."""
 
