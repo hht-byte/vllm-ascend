@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen3-asr-window-cache"
+version = "0.1.0"
+description = "Stable-window cache adapter domain for Qwen3-ASR"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.26,<3",
+    "cbor2>=5.6,<6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<1",
+    "ruff>=0.9,<1",
+    "mypy>=1.14,<2",
+    "build>=1.2,<2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q -m 'not contract and not npu'"
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "contract: requires .upstream v0.23.0 source trees",
+    "npu: requires Qwen3-ASR model and Ascend 310P",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.ruff]
+target-version = "py312"
