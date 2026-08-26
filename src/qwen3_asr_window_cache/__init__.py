@@ -21,6 +21,7 @@ from .prompt_builder import (
     AUDIO_START,
     build_windowed_prompt,
 )
+from .request_adapter import WindowedRequestAdapter
 from .windowing import AudioWindow, split_audio_windows
 
 __all__ = [
@@ -40,6 +41,7 @@ __all__ = [
     "WindowCacheConfig",
     "WindowCacheError",
     "WindowConfigChanged",
+    "WindowedRequestAdapter",
     "build_session_namespace",
     "build_window_id",
     "build_windowed_prompt",
