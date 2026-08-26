@@ -13,6 +13,7 @@ from .errors import (
     WindowCacheError,
     WindowConfigChanged,
 )
+from .identity import build_session_namespace, build_window_id, canonical_pcm_digest
 from .windowing import AudioWindow, split_audio_windows
 
 __all__ = [
@@ -28,5 +29,8 @@ __all__ = [
     "WindowCacheConfig",
     "WindowCacheError",
     "WindowConfigChanged",
+    "build_session_namespace",
+    "build_window_id",
+    "canonical_pcm_digest",
     "split_audio_windows",
 ]
