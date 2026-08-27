@@ -10,6 +10,54 @@ from tests.fakes import FakeEmbedding, FakeLLM
 
 SAMPLE_RATE = 16_000
 PROMPT = "transcribe:" + AUDIO_PLACEHOLDER
+WINDOW_0_EMBEDDING = FakeEmbedding(
+    (
+        754_877_562,
+        856_564_845,
+        2_331_986_289,
+        2_980_104_974,
+        3_092_089_090,
+        840_695_093,
+        2_636_195_932,
+        4_258_176_761,
+    )
+)
+WINDOW_1_OPEN_EMBEDDING = FakeEmbedding(
+    (
+        449_590_485,
+        2_931_416_663,
+        3_041_717_679,
+        1_001_368_175,
+        412_235_671,
+        735_791_612,
+        3_683_413_941,
+        1_579_246_826,
+    )
+)
+WINDOW_1_SEALED_EMBEDDING = FakeEmbedding(
+    (
+        240_725_864,
+        2_985_508_870,
+        1_260_481_676,
+        3_127_733_307,
+        3_101_973_397,
+        636_470_997,
+        2_122_704_144,
+        3_028_504_037,
+    )
+)
+WINDOW_2_OPEN_EMBEDDING = FakeEmbedding(
+    (
+        471_895_186,
+        412_046_352,
+        337_618_696,
+        3_797_408_179,
+        2_987_980_674,
+        3_742_471_037,
+        1_052_270_972,
+        1_782_960_690,
+    )
+)
 
 
 def config() -> WindowCacheConfig:
@@ -56,6 +104,61 @@ def audio_ids(request: dict[str, object]) -> list[str]:
     return identifiers
 
 
+def test_equal_moment_permutation_exposes_deliberately_stale_encoder_reuse() -> None:
+    ordered = np.zeros(2 * SAMPLE_RATE, dtype=np.float32)
+    ordered[:4] = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    permuted = ordered.copy()
+    permuted[:4] = np.array([4.0, 3.0, 2.0, 1.0], dtype=np.float32)
+    assert ordered.size == permuted.size
+    assert np.sum(ordered, dtype=np.float64) == np.sum(
+        permuted,
+        dtype=np.float64,
+    )
+    assert np.dot(ordered.astype(np.float64), ordered.astype(np.float64)) == np.dot(
+        permuted.astype(np.float64),
+        permuted.astype(np.float64),
+    )
+
+    ordered_request = build(
+        WindowedRequestAdapter(config()),
+        ordered,
+        window_sec=2,
+        is_final=True,
+    )
+    permuted_request = build(
+        WindowedRequestAdapter(config()),
+        permuted,
+        window_sec=2,
+        is_final=True,
+    )
+    assert audio_ids(ordered_request) != audio_ids(permuted_request)
+
+    cached = FakeLLM(hash_block_size=4)
+    ordered_trace = cached.run(ordered_request)
+    normal = cached.run(permuted_request)
+    normal_full = FakeLLM(hash_block_size=4).run(
+        permuted_request,
+        force_full_recompute=True,
+    )
+    assert normal.encoder == ["miss"]
+    assert normal.embeddings == normal_full.embeddings
+    assert normal.token_ids == normal_full.token_ids
+
+    stale_key_request = dict(permuted_request)
+    stale_key_request["multi_modal_uuids"] = {
+        "audio": [audio_ids(ordered_request)[0]],
+    }
+    stale = cached.run(stale_key_request)
+    stale_full = FakeLLM(hash_block_size=4).run(
+        stale_key_request,
+        force_full_recompute=True,
+    )
+    assert stale.encoder == ["hit"]
+    assert stale.embeddings == ordered_trace.embeddings
+    assert stale.embeddings != stale_full.embeddings
+    assert stale.token_ids != stale_full.token_ids
+
+
 def test_four_second_stream_has_exact_reuse_trace_and_output_equivalence() -> None:
     adapter = WindowedRequestAdapter(config())
     audio = pcm()
@@ -85,21 +188,80 @@ def test_four_second_stream_has_exact_reuse_trace_and_output_equivalence() -> No
     assert traces[1].prefix == ["hit", "hit", "miss"]
     assert traces[2].prefix == ["hit", "hit", "hit", "miss"]
     assert traces[0].embeddings == [
-        FakeEmbedding(64_000, 96_000.0, 224_000.0),
-        FakeEmbedding(32_000, 144_000.0, 656_000.0),
+        WINDOW_0_EMBEDDING,
+        WINDOW_1_OPEN_EMBEDDING,
     ]
     assert traces[1].embeddings == [
-        FakeEmbedding(64_000, 96_000.0, 224_000.0),
-        FakeEmbedding(64_000, 352_000.0, 2_016_000.0),
+        WINDOW_0_EMBEDDING,
+        WINDOW_1_SEALED_EMBEDDING,
     ]
     assert traces[2].embeddings == [
-        FakeEmbedding(64_000, 96_000.0, 224_000.0),
-        FakeEmbedding(64_000, 352_000.0, 2_016_000.0),
-        FakeEmbedding(32_000, 272_000.0, 2_320_000.0),
+        WINDOW_0_EMBEDDING,
+        WINDOW_1_SEALED_EMBEDDING,
+        WINDOW_2_OPEN_EMBEDDING,
     ]
-    assert traces[0].token_ids == [155, 502]
-    assert traces[1].token_ids == [155, 317]
-    assert traces[2].token_ids == [155, 317, 893]
+    assert traces[0].token_ids == [
+        754_877_562,
+        856_564_845,
+        2_331_986_289,
+        2_980_104_974,
+        3_092_089_090,
+        840_695_093,
+        2_636_195_932,
+        4_258_176_761,
+        449_590_485,
+        2_931_416_663,
+        3_041_717_679,
+        1_001_368_175,
+        412_235_671,
+        735_791_612,
+        3_683_413_941,
+        1_579_246_826,
+    ]
+    assert traces[1].token_ids == [
+        754_877_562,
+        856_564_845,
+        2_331_986_289,
+        2_980_104_974,
+        3_092_089_090,
+        840_695_093,
+        2_636_195_932,
+        4_258_176_761,
+        240_725_864,
+        2_985_508_870,
+        1_260_481_676,
+        3_127_733_307,
+        3_101_973_397,
+        636_470_997,
+        2_122_704_144,
+        3_028_504_037,
+    ]
+    assert traces[2].token_ids == [
+        754_877_562,
+        856_564_845,
+        2_331_986_289,
+        2_980_104_974,
+        3_092_089_090,
+        840_695_093,
+        2_636_195_932,
+        4_258_176_761,
+        240_725_864,
+        2_985_508_870,
+        1_260_481_676,
+        3_127_733_307,
+        3_101_973_397,
+        636_470_997,
+        2_122_704_144,
+        3_028_504_037,
+        471_895_186,
+        412_046_352,
+        337_618_696,
+        3_797_408_179,
+        2_987_980_674,
+        3_742_471_037,
+        1_052_270_972,
+        1_782_960_690,
+    ]
 
 
 @pytest.mark.parametrize(

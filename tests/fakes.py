@@ -19,9 +19,7 @@ _SUFFIX_TOKEN_IDS = (31,)
 class FakeEmbedding:
     """Numeric audio-tower output derived only from one PCM window."""
 
-    sample_count: int
-    sample_sum: float
-    sample_energy: float
+    digest_words: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,11 +46,12 @@ class FakeAudioTower:
             raise ValueError(
                 "audio windows must be non-empty contiguous float32 vectors"
             )
-        numeric = samples.astype(np.float64, copy=False)
+        digest = hashlib.sha256(memoryview(samples).cast("B").toreadonly()).digest()
         return FakeEmbedding(
-            sample_count=int(samples.size),
-            sample_sum=float(np.sum(numeric)),
-            sample_energy=float(np.dot(numeric, numeric)),
+            digest_words=tuple(
+                int.from_bytes(digest[offset : offset + 4], byteorder="big")
+                for offset in range(0, len(digest), 4)
+            )
         )
 
 
@@ -180,15 +179,9 @@ class FakeLLM:
             force_full_recompute=force_full_recompute,
         )
         token_ids = [
-            int(
-                (
-                    embedding.sample_count
-                    + round(embedding.sample_sum)
-                    + round(embedding.sample_energy)
-                )
-                % 997
-            )
+            word
             for embedding in embeddings
+            for word in embedding.digest_words
         ]
         return FakeRunTrace(
             encoder=encoder_trace,
