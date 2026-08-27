@@ -22,6 +22,7 @@ PROCESSOR_INPUTS = Path("vllm/multimodal/processing/inputs.py")
 RENDERER_BASE = Path("vllm/renderers/base.py")
 RENDERER_PREPROCESS = Path("vllm/renderers/inputs/preprocess.py")
 INPUTS_PREPROCESS = Path("vllm/inputs/preprocess.py")
+INPUTS_ENGINE = Path("vllm/inputs/engine.py")
 PROCESSOR = Path("vllm/multimodal/processing/processor.py")
 
 
@@ -114,6 +115,18 @@ def _assignment_values(container: ast.AST, target_name: str) -> list[ast.expr]:
     return values
 
 
+def _assignments_to_name(container: ast.AST, target_name: str) -> list[ast.Assign]:
+    return [
+        node
+        for node in ast.walk(container)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == target_name
+            for target in node.targets
+        )
+    ]
+
+
 def _union_members(annotation: ast.expr) -> list[ast.expr]:
     assert isinstance(annotation, ast.Subscript)
     assert _dotted_name(annotation.value) == "Union"
@@ -200,15 +213,17 @@ def _assert_qwen3_omni_audio_padding_dataflow(module: ast.Module) -> None:
         )
     )
     assert audio_assignment.lineno < final_if.lineno
-    frame_loop = next(
+    frame_loops = [
         node
-        for node in ast.walk(final_if)
+        for node in final_if.body
         if isinstance(node, ast.For)
         and isinstance(node.iter, ast.Call)
         and _dotted_name(node.iter.func) == "enumerate"
         and len(node.iter.args) == 1
         and ast.unparse(node.iter.args[0]) == "audios"
-    )
+    ]
+    assert len(frame_loops) == 1
+    frame_loop = frame_loops[0]
     audio_length = next(
         node
         for node in frame_loop.body
@@ -236,16 +251,25 @@ def _assert_qwen3_omni_audio_padding_dataflow(module: ast.Module) -> None:
         and node.targets[0].id == "num_frame"
     )
     assert {"audio_length", "hop_length"} <= _names(num_frame.value)
-    append = next(
+    append_statements = [
         node
-        for node in ast.walk(frame_loop)
-        if isinstance(node, ast.Call)
-        and _dotted_name(node.func) == "audio_num_frames.append"
-    )
+        for node in frame_loop.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and _dotted_name(node.value.func) == "audio_num_frames.append"
+    ]
+    assert len(append_statements) == 1
+    append_statement = append_statements[0]
+    append = append_statement.value
     assert len(append.args) == 1
     assert isinstance(append.args[0], ast.Name)
     assert append.args[0].id == "num_frame"
-    feature_length = next(
+    assert (
+        frame_loop.body.index(audio_length)
+        < frame_loop.body.index(num_frame)
+        < frame_loop.body.index(append_statement)
+    )
+    feature_lengths = [
         node
         for node in ast.walk(final_if)
         if isinstance(node, ast.Assign)
@@ -254,7 +278,11 @@ def _assert_qwen3_omni_audio_padding_dataflow(module: ast.Module) -> None:
         and _dotted_name(node.targets[0].value) == "hf_inputs"
         and isinstance(node.targets[0].slice, ast.Constant)
         and node.targets[0].slice.value == "audio_feature_lengths"
-    )
+    ]
+    assert len(feature_lengths) == 1
+    feature_length = feature_lengths[0]
+    assert feature_length in final_if.body
+    assert final_if.body.index(frame_loop) < final_if.body.index(feature_length)
     assert isinstance(feature_length.value, ast.Call)
     assert _dotted_name(feature_length.value.func) == "torch.tensor"
     assert len(feature_length.value.args) == 1
@@ -269,6 +297,7 @@ def _assert_supplied_uuid_dataflow(
     processor_inputs: ast.Module,
     processor: ast.Module,
     input_processor: ast.Module,
+    inputs_engine: ast.Module,
     cache: ast.Module,
 ) -> None:
     process_tokens = _direct_function(
@@ -303,6 +332,11 @@ def _assert_supplied_uuid_dataflow(
     processor_input_call = _calls(process_mm, "MMProcessorInputs")
     assert len(processor_input_call) == 1
     assert ast.unparse(processor_input_call[0].args[2]) == "mm_uuid_items"
+    processor_input_assignments = _assignments_to_name(
+        process_mm, "mm_processor_inputs"
+    )
+    assert len(processor_input_assignments) == 1
+    assert processor_input_assignments[0].value is processor_input_call[0]
 
     parse_uuids = _direct_function(parse, "parse_mm_uuids")
     assert any(
@@ -353,13 +387,133 @@ def _assert_supplied_uuid_dataflow(
     apply_hf = _direct_function(
         _class(processor, "BaseMultiModalProcessor"), "_apply_hf_processor"
     )
-    processing_info = _calls(apply_hf, "MultiModalProcessingInfo")
-    assert len(processing_info) == 1
-    assert ast.unparse(_keyword(processing_info[0], "hashes")) == "mm_hashes"
+    cached_apply_hf = _direct_function(
+        _class(processor, "BaseMultiModalProcessor"), "_cached_apply_hf_processor"
+    )
+    for apply_method in (apply_hf, cached_apply_hf):
+        mm_hash_assignments = _assignments_to_name(apply_method, "mm_hashes")
+        assert len(mm_hash_assignments) == 1
+        mm_hash_call = mm_hash_assignments[0].value
+        assert isinstance(mm_hash_call, ast.Call)
+        assert _dotted_name(mm_hash_call.func) == "inputs.get_mm_hashes"
+        assert len(mm_hash_call.args) == 1
+        assert ast.unparse(mm_hash_call.args[0]) == "self.info.model_id"
+
+        mm_info_assignments = _assignments_to_name(apply_method, "mm_info")
+        assert len(mm_info_assignments) == 1
+        processing_info = mm_info_assignments[0].value
+        assert isinstance(processing_info, ast.Call)
+        assert _dotted_name(processing_info.func) == "MultiModalProcessingInfo"
+        assert ast.unparse(_keyword(processing_info, "hashes")) == "mm_hashes"
+        mm_info_returns = [
+            node
+            for node in ast.walk(apply_method)
+            if isinstance(node, ast.Return)
+            and isinstance(node.value, ast.Tuple)
+            and [ast.unparse(item) for item in node.value.elts]
+            == ["prompt_ids", "mm_info", "is_update_applied"]
+        ]
+        assert len(mm_info_returns) == 1
+
+    apply = _direct_function(_class(processor, "BaseMultiModalProcessor"), "apply")
+    cached_result_assignments = [
+        node
+        for node in ast.walk(apply)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Tuple)
+        and [ast.unparse(item) for item in node.targets[0].elts]
+        == ["prompt_ids", "mm_info", "is_update_applied"]
+        and isinstance(node.value, ast.Call)
+        and _dotted_name(node.value.func) == "self._cached_apply_hf_processor"
+        and [ast.unparse(arg) for arg in node.value.args] == ["inputs", "timing_ctx"]
+    ]
+    assert len(cached_result_assignments) == 1
+    mm_input_returns = [
+        node.value
+        for node in ast.walk(apply)
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Call)
+        and _dotted_name(node.value.func) == "mm_input"
+    ]
+    assert len(mm_input_returns) == 1
+    assert ast.unparse(_keyword(mm_input_returns[0], "mm_hashes")) == "mm_info.hashes"
+
+    mm_inputs_assignments = _assignments_to_name(process_mm, "mm_inputs")
+    assert len(mm_inputs_assignments) == 1
+    processor_apply = mm_inputs_assignments[0].value
+    assert isinstance(processor_apply, ast.Call)
+    assert _dotted_name(processor_apply.func) == "mm_processor.apply"
+    assert [ast.unparse(arg) for arg in processor_apply.args] == [
+        "mm_processor_inputs",
+        "mm_timing_ctx",
+    ]
+    renderer_returns = [
+        node
+        for node in ast.walk(process_mm)
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "mm_inputs"
+    ]
+    assert len(renderer_returns) == 1
+
+    renderer_process_tokens = _direct_function(
+        _class(renderer, "BaseRenderer"), "_process_tokens"
+    )
+    multimodal_branch = next(
+        node
+        for node in renderer_process_tokens.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.NamedExpr)
+        and isinstance(node.test.target, ast.Name)
+        and node.test.target.id == "multi_modal_data"
+    )
+    renderer_outputs = [
+        node
+        for node in multimodal_branch.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "engine_input"
+            for target in node.targets
+        )
+    ]
+    assert len(renderer_outputs) == 1
+    assert isinstance(renderer_outputs[0].value, ast.Call)
+    assert _dotted_name(renderer_outputs[0].value.func) == "self._process_multimodal"
+    assert any(
+        isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "engine_input"
+        for node in renderer_process_tokens.body
+    )
 
     process_inputs = _direct_function(
         _class(input_processor, "InputProcessor"), "process_inputs"
     )
+    processed_inputs = _assignment_values(process_inputs, "processed_inputs")
+    assert "prompt" in [ast.unparse(value) for value in processed_inputs]
+    decoder_split = [
+        node
+        for node in ast.walk(process_inputs)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Tuple)
+        and [ast.unparse(item) for item in node.targets[0].elts]
+        == ["encoder_inputs", "decoder_inputs"]
+        and isinstance(node.value, ast.Call)
+        and _dotted_name(node.value.func) == "split_enc_dec_input"
+        and [ast.unparse(arg) for arg in node.value.args] == ["processed_inputs"]
+    ]
+    assert len(decoder_split) == 1
+    split_input = _direct_function(inputs_engine, "split_enc_dec_input")
+    decoder_only_returns = [
+        node
+        for node in split_input.body
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Tuple)
+        and [ast.unparse(item) for item in node.value.elts] == ["None", "inputs"]
+    ]
+    assert len(decoder_only_returns) == 1
     decoder_hashes = _assignment_values(process_inputs, "decoder_mm_hashes")
     assert [ast.unparse(value) for value in decoder_hashes] == [
         "decoder_inputs['mm_hashes']"
@@ -509,6 +663,45 @@ def test_qwen3_omni_padding_dataflow_rejects_disconnected_frame_append(
         break
     else:
         raise AssertionError("frame append mutation target was not found")
+    with pytest.raises(AssertionError):
+        _assert_qwen3_omni_audio_padding_dataflow(module)
+
+
+def test_qwen3_omni_padding_dataflow_rejects_feature_lengths_before_append(
+    vllm_source_root: Path,
+) -> None:
+    module = _parse(vllm_source_root, QWEN3_OMNI_THINKER)
+    processor = _class(module, "Qwen3OmniMoeThinkerMultiModalProcessor")
+    call_hf = _direct_function(processor, "_call_hf_processor")
+    final_if = next(
+        node
+        for node in ast.walk(call_hf)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(named, ast.NamedExpr)
+            and isinstance(named.target, ast.Name)
+            and named.target.id == "audios"
+            for named in ast.walk(node.test)
+        )
+    )
+    frame_loop = next(node for node in final_if.body if isinstance(node, ast.For))
+    feature_length_index = next(
+        index
+        for index, node in enumerate(final_if.body)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Subscript)
+        and ast.unparse(node.targets[0]) == "hf_inputs['audio_feature_lengths']"
+    )
+    feature_length = final_if.body.pop(feature_length_index)
+    append_index = next(
+        index
+        for index, node in enumerate(frame_loop.body)
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and _dotted_name(node.value.func) == "audio_num_frames.append"
+    )
+    frame_loop.body.insert(append_index, feature_length)
+
     with pytest.raises(AssertionError):
         _assert_qwen3_omni_audio_padding_dataflow(module)
 
@@ -705,6 +898,7 @@ def test_supplied_multimodal_uuid_flows_from_prompt_to_processor_hash(
         processor_inputs=_parse(vllm_source_root, PROCESSOR_INPUTS),
         processor=_parse(vllm_source_root, PROCESSOR),
         input_processor=_parse(vllm_source_root, INPUT_PROCESSOR),
+        inputs_engine=_parse(vllm_source_root, INPUTS_ENGINE),
         cache=_parse(vllm_source_root, ENCODER_CACHE_MANAGER),
     )
 
@@ -728,6 +922,7 @@ def test_supplied_uuid_contract_rejects_disconnected_renderer_argument(
             processor_inputs=_parse(vllm_source_root, PROCESSOR_INPUTS),
             processor=_parse(vllm_source_root, PROCESSOR),
             input_processor=_parse(vllm_source_root, INPUT_PROCESSOR),
+            inputs_engine=_parse(vllm_source_root, INPUTS_ENGINE),
             cache=_parse(vllm_source_root, ENCODER_CACHE_MANAGER),
         )
 
@@ -755,6 +950,106 @@ def test_supplied_uuid_contract_rejects_constant_hash_replacement(
             processor_inputs=processor_inputs,
             processor=_parse(vllm_source_root, PROCESSOR),
             input_processor=_parse(vllm_source_root, INPUT_PROCESSOR),
+            inputs_engine=_parse(vllm_source_root, INPUTS_ENGINE),
+            cache=_parse(vllm_source_root, ENCODER_CACHE_MANAGER),
+        )
+
+
+def test_supplied_uuid_contract_rejects_constant_processor_hashes(
+    vllm_source_root: Path,
+) -> None:
+    processor = _parse(vllm_source_root, PROCESSOR)
+    apply_hf = _direct_function(
+        _class(processor, "BaseMultiModalProcessor"), "_apply_hf_processor"
+    )
+    mm_hashes = next(
+        node
+        for node in ast.walk(apply_hf)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "mm_hashes"
+            for target in node.targets
+        )
+    )
+    mm_hashes.value = ast.Constant(value="constant")
+
+    with pytest.raises(AssertionError):
+        _assert_supplied_uuid_dataflow(
+            preprocess=_parse(vllm_source_root, INPUTS_PREPROCESS),
+            renderer=_parse(vllm_source_root, RENDERER_BASE),
+            parse=_parse(vllm_source_root, MM_PARSE),
+            processor_inputs=_parse(vllm_source_root, PROCESSOR_INPUTS),
+            processor=processor,
+            input_processor=_parse(vllm_source_root, INPUT_PROCESSOR),
+            inputs_engine=_parse(vllm_source_root, INPUTS_ENGINE),
+            cache=_parse(vllm_source_root, ENCODER_CACHE_MANAGER),
+        )
+
+
+def test_supplied_uuid_contract_rejects_disconnected_processor_output(
+    vllm_source_root: Path,
+) -> None:
+    renderer = _parse(vllm_source_root, RENDERER_BASE)
+    process_mm = _direct_function(
+        _class(renderer, "BaseRenderer"), "_process_multimodal"
+    )
+    mm_inputs = next(
+        node
+        for node in ast.walk(process_mm)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "mm_inputs"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Call)
+        and _dotted_name(node.value.func) == "mm_processor.apply"
+    )
+    mm_inputs.targets = [ast.Name(id="disconnected_mm_inputs", ctx=ast.Store())]
+
+    with pytest.raises(AssertionError):
+        _assert_supplied_uuid_dataflow(
+            preprocess=_parse(vllm_source_root, INPUTS_PREPROCESS),
+            renderer=renderer,
+            parse=_parse(vllm_source_root, MM_PARSE),
+            processor_inputs=_parse(vllm_source_root, PROCESSOR_INPUTS),
+            processor=_parse(vllm_source_root, PROCESSOR),
+            input_processor=_parse(vllm_source_root, INPUT_PROCESSOR),
+            inputs_engine=_parse(vllm_source_root, INPUTS_ENGINE),
+            cache=_parse(vllm_source_root, ENCODER_CACHE_MANAGER),
+        )
+
+
+def test_supplied_uuid_contract_rejects_disconnected_processor_inputs(
+    vllm_source_root: Path,
+) -> None:
+    renderer = _parse(vllm_source_root, RENDERER_BASE)
+    process_mm = _direct_function(
+        _class(renderer, "BaseRenderer"), "_process_multimodal"
+    )
+    processor_inputs = next(
+        node
+        for node in ast.walk(process_mm)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "mm_processor_inputs"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Call)
+        and _dotted_name(node.value.func) == "MMProcessorInputs"
+    )
+    processor_inputs.targets = [
+        ast.Name(id="disconnected_processor_inputs", ctx=ast.Store())
+    ]
+
+    with pytest.raises(AssertionError):
+        _assert_supplied_uuid_dataflow(
+            preprocess=_parse(vllm_source_root, INPUTS_PREPROCESS),
+            renderer=renderer,
+            parse=_parse(vllm_source_root, MM_PARSE),
+            processor_inputs=_parse(vllm_source_root, PROCESSOR_INPUTS),
+            processor=_parse(vllm_source_root, PROCESSOR),
+            input_processor=_parse(vllm_source_root, INPUT_PROCESSOR),
+            inputs_engine=_parse(vllm_source_root, INPUTS_ENGINE),
             cache=_parse(vllm_source_root, ENCODER_CACHE_MANAGER),
         )
 
