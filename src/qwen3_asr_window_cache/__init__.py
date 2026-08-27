@@ -18,6 +18,7 @@ from .errors import (
     WindowConfigChanged,
 )
 from .identity import build_session_namespace, build_window_id, canonical_pcm_digest
+from .metrics import ReuseExpectation, floor_reusable_prefix_tokens
 from .prompt_builder import (
     AUDIO_END,
     AUDIO_PAD,
@@ -41,6 +42,7 @@ __all__ = [
     "InvalidPromptPlaceholder",
     "InvalidSampleRate",
     "InvalidWindowSize",
+    "ReuseExpectation",
     "SessionAlreadyFinished",
     "TooManyAudioWindows",
     "UnsupportedRuntimeVersion",
@@ -52,6 +54,7 @@ __all__ = [
     "build_window_id",
     "build_windowed_prompt",
     "canonical_pcm_digest",
+    "floor_reusable_prefix_tokens",
     "prepare_vllm_config",
     "split_audio_windows",
     "validate_runtime_versions",
