@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from benchmarks.benchmark_310p import assert_equivalent, run_equivalence_validation
+from benchmarks.benchmark_310p import (
+    assert_equivalent,
+    load_manifest,
+    run_equivalence_validation,
+)
 
 
 @pytest.mark.npu
@@ -31,12 +35,26 @@ def test_310p_cache_reuse_matches_full_recompute_after_lifecycle_events(
         )
     )
     assert pairs
-    assert {reuse.scenario for _, reuse in pairs} == {
+    records = load_manifest(Path(manifest))
+    full_checkpoint_scenarios = {
         "steady",
         "after_cache_reset",
         "after_lru_pressure",
         "after_session_recreate",
     }
+    for window_seconds in (2, 4, 8):
+        for record in records:
+            observed = {
+                (reuse.scenario, reuse.checkpoint_seconds)
+                for _, reuse in pairs
+                if reuse.window_seconds == window_seconds and reuse.record_id == record.id
+            }
+            assert {
+                (scenario, checkpoint)
+                for scenario in full_checkpoint_scenarios
+                for checkpoint in record.checkpoints_seconds
+            } <= observed
+            assert ("exact_final_retry", record.checkpoints_seconds[-1]) in observed
     assert_equivalent(
         pairs,
         reproducer_path=tmp_path / "310p-equivalence-reproducer.json",

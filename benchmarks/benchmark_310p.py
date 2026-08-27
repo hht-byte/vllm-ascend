@@ -418,15 +418,16 @@ def _counter_deltas(before: str, after: str) -> _CounterDeltaSnapshot:
 
 
 def _peak_npu_memory() -> tuple[int | None, str | None, str | None]:
-    try:
-        torch = importlib.import_module("torch")
-        npu = torch.npu
-        if not npu.is_available():
-            return None, None, "peak NPU memory unavailable: torch.npu is not available"
-        value = int(npu.max_memory_allocated())
-    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError) as error:
-        return None, None, f"peak NPU memory unavailable: {error}"
-    return value, "torch.npu.max_memory_allocated", None
+    """Avoid attributing frontend-process memory to EngineCore workers."""
+
+    return (
+        None,
+        None,
+        (
+            "peak NPU memory unavailable from AsyncLLM frontend; collect a "
+            "supported worker-side or external npu-smi/msprof measurement"
+        ),
+    )
 
 
 def _load_audio(record: ManifestRecord) -> np.ndarray:
@@ -531,9 +532,7 @@ async def _run_record_stream(
     session_suffix: str,
 ) -> list[BenchmarkResult]:
     audio = _load_audio(record)
-    session_id = (
-        f"benchmark:{record.id}:{window_seconds}:{options.iteration}:{session_suffix}"
-    )
+    session_id = _session_id(record, window_seconds, options, session_suffix)
     results: list[BenchmarkResult] = []
     for index, checkpoint in enumerate(record.checkpoints_seconds):
         request_id = f"{mode}:{session_id}:{index}:{time.perf_counter_ns()}"
@@ -557,6 +556,49 @@ async def _run_record_stream(
     return results
 
 
+def _session_id(
+    record: ManifestRecord,
+    window_seconds: int,
+    options: _RunOptions,
+    session_suffix: str,
+) -> str:
+    return f"benchmark:{record.id}:{window_seconds}:{options.iteration}:{session_suffix}"
+
+
+async def _run_exact_final_retry(
+    *,
+    engine: _Engine,
+    sampling: object,
+    adapter: _WindowedAdapter,
+    record: ManifestRecord,
+    window_seconds: int,
+    mode: str,
+    options: _RunOptions,
+    session_suffix: str,
+) -> BenchmarkResult:
+    """Retry the exact final request with a distinct request ID."""
+
+    audio = _load_audio(record)
+    session_id = _session_id(record, window_seconds, options, session_suffix)
+    checkpoint = record.checkpoints_seconds[-1]
+    request_id = f"{mode}:{session_id}:retry:{time.perf_counter_ns()}"
+    return await _generate_one(
+        engine=engine,
+        sampling=sampling,
+        adapter=adapter,
+        record=record,
+        audio=audio,
+        checkpoint=checkpoint,
+        window_seconds=window_seconds,
+        mode=mode,
+        scenario="exact_final_retry",
+        options=options,
+        session_id=session_id,
+        request_id=request_id,
+        is_final=True,
+    )
+
+
 async def _run_mode(
     records: Sequence[ManifestRecord],
     *,
@@ -568,35 +610,35 @@ async def _run_mode(
 ) -> list[BenchmarkResult]:
     runtime = _load_runtime()
     engine = _create_engine(runtime, options, mode=mode)
-    sampling = runtime.sampling_params(
-        temperature=0.0,
-        top_p=1.0,
-        max_tokens=options.max_tokens,
-    )
-    adapter = _adapter(options.model, window_seconds)
-    semaphore = asyncio.Semaphore(options.concurrency)
-
-    async def run(
-        record: ManifestRecord,
-        *,
-        iteration: int,
-        phase: str,
-    ) -> list[BenchmarkResult]:
-        async with semaphore:
-            iteration_options = replace(options, iteration=iteration)
-            return await _run_record_stream(
-                engine=engine,
-                sampling=sampling,
-                adapter=adapter,
-                record=record,
-                window_seconds=window_seconds,
-                mode=mode,
-                scenario="steady",
-                options=iteration_options,
-                session_suffix=f"{phase}-{iteration}",
-            )
-
     try:
+        sampling = runtime.sampling_params(
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=options.max_tokens,
+        )
+        adapter = _adapter(options.model, window_seconds)
+        semaphore = asyncio.Semaphore(options.concurrency)
+
+        async def run(
+            record: ManifestRecord,
+            *,
+            iteration: int,
+            phase: str,
+        ) -> list[BenchmarkResult]:
+            async with semaphore:
+                iteration_options = replace(options, iteration=iteration)
+                return await _run_record_stream(
+                    engine=engine,
+                    sampling=sampling,
+                    adapter=adapter,
+                    record=record,
+                    window_seconds=window_seconds,
+                    mode=mode,
+                    scenario="steady",
+                    options=iteration_options,
+                    session_suffix=f"{phase}-{iteration}",
+                )
+
         for warmup_iteration in range(warmup_iterations):
             await asyncio.gather(
                 *(
@@ -701,12 +743,12 @@ async def _run_validation_mode(
 ) -> list[BenchmarkResult]:
     runtime = _load_runtime()
     engine = _create_engine(runtime, options, mode=mode)
-    sampling = runtime.sampling_params(
-        temperature=0.0, top_p=1.0, max_tokens=options.max_tokens
-    )
-    adapter = _adapter(options.model, window_seconds)
-    results: list[BenchmarkResult] = []
     try:
+        sampling = runtime.sampling_params(
+            temperature=0.0, top_p=1.0, max_tokens=options.max_tokens
+        )
+        adapter = _adapter(options.model, window_seconds)
+        results: list[BenchmarkResult] = []
         for record in records:
             steady = await _run_record_stream(
                 engine=engine,
@@ -720,6 +762,17 @@ async def _run_validation_mode(
                 session_suffix="steady",
             )
             results.extend(steady)
+            retry = await _run_exact_final_retry(
+                engine=engine,
+                sampling=sampling,
+                adapter=adapter,
+                record=record,
+                window_seconds=window_seconds,
+                mode=mode,
+                options=options,
+                session_suffix="steady",
+            )
+            results.append(retry)
 
             if mode == "reuse":
                 await engine.reset_prefix_cache()
@@ -735,10 +788,12 @@ async def _run_validation_mode(
                 options=options,
                 session_suffix="reset",
             )
-            results.append(replace(reset_result[-1], scenario="after_cache_reset"))
+            results.extend(
+                replace(item, scenario="after_cache_reset") for item in reset_result
+            )
 
             for pressure_index in range(lru_pressure_requests):
-                pressure = await _run_record_stream(
+                await _run_record_stream(
                     engine=engine,
                     sampling=sampling,
                     adapter=adapter,
@@ -750,10 +805,14 @@ async def _run_validation_mode(
                     session_suffix=f"pressure-{pressure_index}",
                 )
                 adapter.release_session(
-                    f"benchmark:{record.id}:{window_seconds}:{options.iteration}:pressure-{pressure_index}",
+                    _session_id(
+                        record,
+                        window_seconds,
+                        options,
+                        f"pressure-{pressure_index}",
+                    ),
                     options.iteration,
                 )
-                del pressure
             pressure_result = await _run_record_stream(
                 engine=engine,
                 sampling=sampling,
@@ -765,12 +824,15 @@ async def _run_validation_mode(
                 options=options,
                 session_suffix="post-pressure",
             )
-            results.append(replace(pressure_result[-1], scenario="after_lru_pressure"))
+            results.extend(
+                replace(item, scenario="after_lru_pressure")
+                for item in pressure_result
+            )
 
             recreated_session = (
                 f"benchmark:{record.id}:{window_seconds}:{options.iteration}:recreated"
             )
-            recreated = await _run_record_stream(
+            await _run_record_stream(
                 engine=engine,
                 sampling=sampling,
                 adapter=adapter,
@@ -793,9 +855,9 @@ async def _run_validation_mode(
                 options=options,
                 session_suffix="recreated",
             )
-            del recreated
-            results.append(
-                replace(recreated_again[-1], scenario="after_session_recreate")
+            results.extend(
+                replace(item, scenario="after_session_recreate")
+                for item in recreated_again
             )
         return results
     finally:

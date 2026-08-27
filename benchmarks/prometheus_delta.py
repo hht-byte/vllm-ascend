@@ -13,7 +13,7 @@ CACHE_COUNTERS = (
 )
 
 _SAMPLE_RE = re.compile(
-    r"^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)(?:\{[^}]*\})?\s+"
+    r"^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)(?P<labels>\{[^}]*\})?\s+"
     r"(?P<value>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
     r"(?:\s+\d+)?$"
 )
@@ -27,9 +27,11 @@ class CounterDeltaSnapshot:
     warnings: tuple[str, ...]
 
 
-def _counter_totals(text: str, metric_names: Iterable[str]) -> dict[str, float]:
+def _counter_series(
+    text: str, metric_names: Iterable[str]
+) -> dict[str, dict[str, float]]:
     wanted = {f"{name}_total": name for name in metric_names}
-    totals: dict[str, float] = {}
+    series: dict[str, dict[str, float]] = {}
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -43,8 +45,9 @@ def _counter_totals(text: str, metric_names: Iterable[str]) -> dict[str, float]:
         value = float(match.group("value"))
         if not math.isfinite(value):
             continue
-        totals[family] = totals.get(family, 0.0) + value
-    return totals
+        labels = match.group("labels") or ""
+        series.setdefault(family, {})[labels] = value
+    return series
 
 
 def counter_deltas(
@@ -59,12 +62,14 @@ def counter_deltas(
     """
 
     names = tuple(metric_names)
-    before = _counter_totals(before_text, names)
-    after = _counter_totals(after_text, names)
+    before = _counter_series(before_text, names)
+    after = _counter_series(after_text, names)
     values: dict[str, float | None] = {}
     warnings: list[str] = []
     for name in names:
-        if name not in before or name not in after:
+        before_series = before.get(name)
+        after_series = after.get(name)
+        if before_series is None or after_series is None:
             missing = []
             if name not in before:
                 missing.append("before")
@@ -73,9 +78,35 @@ def counter_deltas(
             values[name] = None
             warnings.append(f"{name} missing from {' and '.join(missing)} snapshot")
             continue
-        if after[name] < before[name]:
+        before_labels = set(before_series)
+        after_labels = set(after_series)
+        if before_labels != after_labels:
+            missing_labels = sorted(before_labels - after_labels)
+            added_labels = sorted(after_labels - before_labels)
+            details: list[str] = []
+            if missing_labels:
+                details.append(f"missing={missing_labels}")
+            if added_labels:
+                details.append(f"added={added_labels}")
             values[name] = None
-            warnings.append(f"{name} counter reset detected; delta is unavailable")
+            warnings.append(
+                f"{name} counter series changed; delta is unavailable ({'; '.join(details)})"
+            )
             continue
-        values[name] = after[name] - before[name]
+        reset_labels = sorted(
+            label
+            for label in before_labels
+            if after_series[label] < before_series[label]
+        )
+        if reset_labels:
+            values[name] = None
+            warnings.append(
+                f"{name} counter reset detected for series {reset_labels}; "
+                "delta is unavailable"
+            )
+            continue
+        values[name] = sum(
+            after_series[label] - before_series[label]
+            for label in sorted(before_labels)
+        )
     return CounterDeltaSnapshot(values=values, warnings=tuple(warnings))

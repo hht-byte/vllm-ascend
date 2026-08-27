@@ -58,6 +58,43 @@ def test_counter_reset_is_null_instead_of_negative_or_zero() -> None:
     assert all("reset" in warning for warning in snapshot.warnings)
 
 
+def test_labeled_reset_is_not_masked_by_an_increased_family_total() -> None:
+    before = """
+vllm:mm_cache_queries_total{worker="0"} 10
+vllm:mm_cache_queries_total{worker="1"} 0
+"""
+    after = """
+vllm:mm_cache_queries_total{worker="0"} 0
+vllm:mm_cache_queries_total{worker="1"} 20
+"""
+
+    snapshot = counter_deltas(before, after, ("vllm:mm_cache_queries",))
+
+    assert snapshot.values == {"vllm:mm_cache_queries": None}
+    assert len(snapshot.warnings) == 1
+    assert "reset" in snapshot.warnings[0]
+    assert 'worker="0"' in snapshot.warnings[0]
+
+
+def test_added_or_missing_labeled_series_is_null_instead_of_a_partial_delta() -> None:
+    before = """
+vllm:mm_cache_queries_total{worker="0"} 10
+vllm:mm_cache_queries_total{worker="1"} 4
+"""
+    after = """
+vllm:mm_cache_queries_total{worker="0"} 14
+vllm:mm_cache_queries_total{worker="2"} 9
+"""
+
+    snapshot = counter_deltas(before, after, ("vllm:mm_cache_queries",))
+
+    assert snapshot.values == {"vllm:mm_cache_queries": None}
+    assert len(snapshot.warnings) == 1
+    assert "series changed" in snapshot.warnings[0]
+    assert 'worker="1"' in snapshot.warnings[0]
+    assert 'worker="2"' in snapshot.warnings[0]
+
+
 def test_non_counter_suffix_samples_do_not_pollute_family_sum() -> None:
     before = """
 vllm:mm_cache_queries_total 1

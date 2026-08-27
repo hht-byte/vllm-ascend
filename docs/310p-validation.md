@@ -58,7 +58,11 @@ python benchmarks/benchmark_310p.py \
 
 Prometheus counter 按完整 metric family 汇总所有 label sample。before/after 缺失时写 `null` 和 warning；after 小于 before 视为进程/counter reset，同样写 `null`，不伪造 0 或负数。并发测量中的进程级 counter delta 可能包含同一时段其他请求，应结合整组汇总解释。
 
-峰值 NPU 内存优先来自 `torch.npu.max_memory_allocated`，字段同时写 provenance；运行时不提供 sampler 时写 `null` 和 warning。不得用主机 RSS 或常量代替 NPU 内存。
+AsyncLLM 0.23 的 EngineCore 在后台 worker 进程拥有模型分配，前端进程的
+`torch.npu.max_memory_allocated` 不是模型峰值，不能写入本报告。当前脚本固定将
+峰值 NPU 内存写为 `null` 和 warning；使用受支持的 worker-side 采集或外部
+`npu-smi`/`msprof` 在同一测量窗口单独采集后，才可填入带 provenance 的真实值。
+不得用前端 torch 值、主机 RSS 或常量代替 NPU 内存。
 
 ## 5. Audio Tower 与 LLM prefill 分段
 

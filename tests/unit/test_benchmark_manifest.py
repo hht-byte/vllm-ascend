@@ -1,11 +1,14 @@
+import asyncio
 import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+import benchmarks.benchmark_310p as benchmark
 from benchmarks.benchmark_310p import (
     BenchmarkResult,
     EquivalenceMismatch,
@@ -272,3 +275,160 @@ def test_equivalence_mismatch_saves_minimal_non_sensitive_reproducer(
             "manifest_language": "zh",
         },
     }
+
+
+def test_npu_memory_is_explicitly_unavailable_from_the_asyncllm_frontend() -> None:
+    value, provenance, warning = benchmark._peak_npu_memory()
+
+    assert value is None
+    assert provenance is None
+    assert warning is not None
+    assert "worker-side" in warning
+    assert "npu-smi" in warning
+    assert "msprof" in warning
+
+
+class FakeEngine:
+    def __init__(self) -> None:
+        self.requests: list[tuple[dict[str, object], str]] = []
+        self.shutdown_calls = 0
+
+    async def generate(
+        self,
+        request: object,
+        sampling: object,
+        request_id: str,
+    ) -> object:
+        assert isinstance(request, dict)
+        self.requests.append((request, request_id))
+        yield SimpleNamespace(
+            outputs=[SimpleNamespace(token_ids=[101], text="language Chinese<asr_text>测试")],
+            num_cached_tokens=0,
+        )
+
+    async def reset_prefix_cache(self) -> bool:
+        return True
+
+    async def reset_encoder_cache(self) -> None:
+        return None
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        del timeout
+        self.shutdown_calls += 1
+
+
+def _options() -> object:
+    return benchmark._RunOptions(
+        model="model-fingerprint",
+        prompt="<|audio_start|><|audio_pad|><|audio_end|>",
+        dtype="auto",
+        quantization=None,
+        max_tokens=8,
+        concurrency=1,
+        iteration=0,
+    )
+
+
+def _fake_runtime() -> object:
+    return SimpleNamespace(sampling_params=lambda **_: object())
+
+
+@pytest.mark.parametrize("runner_name", ("_run_mode", "_run_validation_mode"))
+def test_engine_is_shutdown_when_adapter_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    runner_name: str,
+) -> None:
+    engine = FakeEngine()
+    monkeypatch.setattr(benchmark, "_load_runtime", _fake_runtime)
+    monkeypatch.setattr(benchmark, "_create_engine", lambda *args, **kwargs: engine)
+
+    def fail_adapter(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("adapter setup failed")
+
+    monkeypatch.setattr(benchmark, "_adapter", fail_adapter)
+    runner = getattr(benchmark, runner_name)
+    kwargs: dict[str, object] = {
+        "records": (),
+        "window_seconds": 2,
+        "mode": "reuse",
+        "options": _options(),
+    }
+    if runner_name == "_run_mode":
+        kwargs.update(iterations=1, warmup_iterations=0)
+    else:
+        kwargs.update(lru_pressure_requests=0)
+
+    with pytest.raises(RuntimeError, match="adapter setup failed"):
+        asyncio.run(runner(**kwargs))
+
+    assert engine.shutdown_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "retry_uuid_matches_final"),
+    (("reuse", True), ("cache-off", False)),
+)
+def test_validation_retains_all_checkpoints_and_retries_the_exact_final_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    retry_uuid_matches_final: bool,
+) -> None:
+    audio = write_audio(tmp_path / "audio.npy", seconds=8)
+    record = benchmark.ManifestRecord(
+        id="zh-001",
+        audio_npy=audio,
+        sample_rate=16_000,
+        checkpoints_seconds=(6.0, 8.0),
+        language="zh",
+        reference="测试",
+        duration_seconds=8.0,
+    )
+    engine = FakeEngine()
+    monkeypatch.setattr(benchmark, "_load_runtime", _fake_runtime)
+    monkeypatch.setattr(benchmark, "_create_engine", lambda *args, **kwargs: engine)
+
+    results = asyncio.run(
+        benchmark._run_validation_mode(
+            (record,),
+            window_seconds=2,
+            mode=mode,
+            options=_options(),
+            lru_pressure_requests=1,
+        )
+    )
+
+    expected_full_scenarios = {
+        "steady",
+        "after_cache_reset",
+        "after_lru_pressure",
+        "after_session_recreate",
+    }
+    for scenario in expected_full_scenarios:
+        assert [item.checkpoint_seconds for item in results if item.scenario == scenario] == [
+            6.0,
+            8.0,
+        ]
+    assert [item.checkpoint_seconds for item in results if item.scenario == "exact_final_retry"] == [8.0]
+
+    retry_index = next(
+        index for index, (_, request_id) in enumerate(engine.requests) if "retry" in request_id
+    )
+    retry_request, retry_id = engine.requests[retry_index]
+    steady_final_request, steady_final_id = engine.requests[1]
+    assert retry_id != steady_final_id
+    assert retry_request["prompt"] == steady_final_request["prompt"]
+    assert retry_request["cache_salt"] == steady_final_request["cache_salt"]
+    retry_audio = retry_request["multi_modal_data"]
+    steady_final_audio = steady_final_request["multi_modal_data"]
+    assert isinstance(retry_audio, dict)
+    assert isinstance(steady_final_audio, dict)
+    assert all(
+        np.array_equal(left, right)
+        for left, right in zip(retry_audio["audio"], steady_final_audio["audio"], strict=True)
+    )
+    assert (
+        retry_request["multi_modal_uuids"] == steady_final_request["multi_modal_uuids"]
+    ) is retry_uuid_matches_final
+    assert engine.shutdown_calls == 1
