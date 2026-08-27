@@ -25,7 +25,10 @@ def _verification_command() -> list[str]:
     ]
 
 
-def test_upstream_trees_have_no_tracked_staged_or_untracked_changes() -> None:
+def test_upstream_trees_have_no_tracked_staged_or_untracked_changes(
+    vllm_source_root: Path,
+    vllm_ascend_source_root: Path,
+) -> None:
     result = subprocess.run(
         _verification_command(),
         cwd=PROJECT_ROOT,
