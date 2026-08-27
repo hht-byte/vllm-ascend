@@ -8,6 +8,7 @@ pytestmark = pytest.mark.contract
 type FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
 
 QWEN3_ASR_MODEL = Path("vllm/model_executor/models/qwen3_asr.py")
+QWEN3_OMNI_THINKER = Path("vllm/model_executor/models/qwen3_omni_moe_thinker.py")
 MULTIMODAL_INPUTS = Path("vllm/multimodal/inputs.py")
 PROMPT_INPUTS = Path("vllm/inputs/llm.py")
 KV_CACHE_UTILS = Path("vllm/v1/core/kv_cache_utils.py")
@@ -16,6 +17,10 @@ ENGINE_ARGS = Path("vllm/engine/arg_utils.py")
 ASYNC_LLM = Path("vllm/v1/engine/async_llm.py")
 INPUT_PROCESSOR = Path("vllm/v1/engine/input_processor.py")
 ENCODER_CACHE_MANAGER = Path("vllm/v1/core/encoder_cache_manager.py")
+MM_PARSE = Path("vllm/multimodal/parse.py")
+PROCESSOR_INPUTS = Path("vllm/multimodal/processing/inputs.py")
+RENDERER_BASE = Path("vllm/renderers/base.py")
+RENDERER_PREPROCESS = Path("vllm/renderers/inputs/preprocess.py")
 
 
 def _parse(source_root: Path, relative_path: Path) -> ast.Module:
@@ -194,6 +199,49 @@ def test_qwen3_asr_audio_token_length_formula_remains_pinned(
     )
 
 
+def test_qwen3_omni_pads_pcm_before_deriving_audio_feature_lengths(
+    vllm_source_root: Path,
+) -> None:
+    module = _parse(vllm_source_root, QWEN3_OMNI_THINKER)
+    processor = _class(module, "Qwen3OmniMoeThinkerMultiModalProcessor")
+    call_hf = _direct_function(processor, "_call_hf_processor")
+    pad = _nested_function(call_hf, "pad_to_hop_length")
+    assert any(
+        isinstance(node, ast.Call)
+        and _dotted_name(node.func) == "np.pad"
+        and any(
+            keyword.arg == "mode"
+            and ast.literal_eval(keyword.value) == "constant"
+            for keyword in node.keywords
+        )
+        for node in ast.walk(pad)
+        if isinstance(node, ast.Call)
+    )
+    assert any(
+        isinstance(node, ast.Compare)
+        and ast.unparse(node.left) == "length % hop_length"
+        for node in ast.walk(pad)
+    )
+    audio_list_comprehensions = [
+        node
+        for node in ast.walk(call_hf)
+        if isinstance(node, ast.ListComp)
+        and any(
+            isinstance(call, ast.Call)
+            and _dotted_name(call.func) == "pad_to_hop_length"
+            for call in ast.walk(node)
+        )
+    ]
+    assert len(audio_list_comprehensions) == 1
+    frame_assignments = _assignment_values(call_hf, "num_frame")
+    assert any(
+        isinstance(value, ast.IfExp)
+        and ast.unparse(value.body) == "audio_length // hop_length"
+        and ast.unparse(value.orelse) == "audio_length // hop_length - 1"
+        for value in frame_assignments
+    )
+
+
 def test_qwen3_asr_preserves_audio_embedding_order_and_mrope_continuity(
     vllm_source_root: Path,
 ) -> None:
@@ -329,6 +377,84 @@ def test_prompt_type_carries_multimodal_uuids_and_cache_salt(
     assert {"DecoderOnlyPrompt", "EncoderDecoderPrompt"} == _names(prompt_type.value)
 
 
+def test_supplied_multimodal_uuid_flows_from_prompt_to_processor_hash(
+    vllm_source_root: Path,
+) -> None:
+    prompt_module = _parse(vllm_source_root, PROMPT_INPUTS)
+    prompt_options = _class(prompt_module, "_PromptOptions")
+    assert _annotated_assignment(prompt_options, "multi_modal_uuids")
+
+    preprocess = _parse(vllm_source_root, RENDERER_PREPROCESS)
+    parse_dec_only = _direct_function(preprocess, "parse_dec_only_prompt")
+    assert any(
+        isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "prompt"
+        for node in ast.walk(parse_dec_only)
+    )
+    renderer = _parse(vllm_source_root, RENDERER_BASE)
+    process_mm = _direct_function(_class(renderer, "BaseRenderer"), "_process_multimodal")
+    parse_calls = _calls(process_mm, "parse_mm_uuids")
+    assert len(parse_calls) == 1
+    assert ast.unparse(parse_calls[0].args[0]) == "mm_uuids"
+    uuid_assignment = next(
+        node
+        for node in ast.walk(process_mm)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "mm_uuid_items"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Call)
+        and _dotted_name(node.value.func) == "parse_mm_uuids"
+    )
+    assert ast.unparse(uuid_assignment.value.args[0]) == "mm_uuids"
+    process_uuid_calls = _calls(process_mm, "self._process_mm_uuids")
+    assert len(process_uuid_calls) == 1
+    assert ast.unparse(process_uuid_calls[0].args[2]) == "mm_uuid_items"
+
+    parse_module = _parse(vllm_source_root, MM_PARSE)
+    parse_uuids = _direct_function(parse_module, "parse_mm_uuids")
+    assert any(
+        isinstance(node, ast.IfExp)
+        and ast.unparse(node.test) == "isinstance(uuids, str)"
+        and ast.unparse(node.body) == "[uuids]"
+        and ast.unparse(node.orelse) == "uuids"
+        for node in ast.walk(parse_uuids)
+    )
+    processor_inputs = _parse(vllm_source_root, PROCESSOR_INPUTS)
+    get_hashes = _class(processor_inputs, "ProcessorInputs")
+    get_hashes_fn = _direct_function(get_hashes, "get_mm_hashes")
+    assert any(
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "mm_uuid_items"
+            for target in node.targets
+        )
+        and ast.unparse(node.value) == "self.mm_uuid_items or {}"
+        for node in ast.walk(get_hashes_fn)
+    )
+    assert any(
+        isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and ast.unparse(node.test.left) == "modality"
+        and any(ast.unparse(comparator) == "mm_uuid_items" for comparator in node.test.comparators)
+        for node in ast.walk(get_hashes_fn)
+    )
+    assert any(
+        isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "uuid_item" for target in node.targets)
+        and isinstance(node.value, ast.Subscript)
+        and ast.unparse(node.value.value) == "uuid_items"
+        for node in ast.walk(get_hashes_fn)
+    )
+    assert any(
+        isinstance(node, ast.If)
+        and ast.unparse(node.test) == "uuid_item is None or hf_processor_mm_kwargs"
+        for node in ast.walk(get_hashes_fn)
+    )
+
+
 def test_multimodal_uuid_becomes_encoder_cache_identifier_for_lookup_and_store(
     vllm_source_root: Path,
 ) -> None:
@@ -363,6 +489,23 @@ def test_multimodal_uuid_becomes_encoder_cache_identifier_for_lookup_and_store(
             and node.slice.id == "mm_hash"
         ]
         assert cached_accesses
+
+
+def test_decoder_hash_is_the_supplied_uuid_hash_used_for_feature_identifier(
+    vllm_source_root: Path,
+) -> None:
+    input_module = _parse(vllm_source_root, INPUT_PROCESSOR)
+    processor = _class(input_module, "InputProcessor")
+    process_inputs = _direct_function(processor, "process_inputs")
+    decoder_hashes = _assignment_values(process_inputs, "decoder_mm_hashes")
+    assert decoder_hashes
+    base_hash_values = _assignment_values(process_inputs, "base_mm_hash")
+    assert [ast.unparse(value) for value in base_hash_values] == [
+        "decoder_mm_hashes[modality][idx]"
+    ]
+    specs = _calls(process_inputs, "MultiModalFeatureSpec")
+    assert len(specs) == 1
+    assert ast.unparse(_keyword(specs[0], "mm_hash")) == "base_mm_hash"
 
 
 def test_block_hash_uses_multimodal_position_parent_and_first_block_salt(

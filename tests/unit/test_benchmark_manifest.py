@@ -313,6 +313,35 @@ def test_expected_reusable_audio_tokens_use_pinned_qwen3_asr_lengths(
     ) == expected_tokens
 
 
+@pytest.mark.parametrize(
+    ("tail_samples", "expected_tail_tokens"),
+    ((1, 1), (159, 1), (160, 1), (161, 1)),
+)
+def test_final_retry_counts_padded_audio_tail_tokens(
+    tail_samples: int, expected_tail_tokens: int
+) -> None:
+    assert benchmark.expected_reusable_audio_tokens(
+        sample_count=2 * 16_000 + tail_samples,
+        sample_rate=16_000,
+        window_seconds=2,
+        is_final=True,
+    ) == 26 + expected_tail_tokens
+
+
+@pytest.mark.parametrize(
+    ("window_seconds", "expected_tokens"), ((2, 26), (4, 52), (8, 104))
+)
+def test_exact_window_audio_token_invariants_remain_pinned(
+    window_seconds: int, expected_tokens: int
+) -> None:
+    assert benchmark.expected_reusable_audio_tokens(
+        sample_count=window_seconds * 16_000,
+        sample_rate=16_000,
+        window_seconds=window_seconds,
+        is_final=True,
+    ) == expected_tokens
+
+
 def test_request_telemetry_derives_cache_and_prefill_values_without_fabrication() -> None:
     telemetry = benchmark.derive_request_telemetry(
         sample_count=96_000,

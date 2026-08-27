@@ -239,7 +239,7 @@ def _qwen3_asr_audio_token_length(sample_count: int) -> int:
 
     if type(sample_count) is not int or sample_count <= 0:
         raise ValueError("sample_count must be a positive integer")
-    feature_length = sample_count // _AUDIO_FEATURE_HOP_SAMPLES
+    feature_length = math.ceil(sample_count / _AUDIO_FEATURE_HOP_SAMPLES)
     remainder = feature_length % 100
     feature_remainder_length = (remainder - 1) // 2 + 1
     return (
