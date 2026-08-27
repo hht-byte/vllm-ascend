@@ -288,6 +288,163 @@ def test_npu_memory_is_explicitly_unavailable_from_the_asyncllm_frontend() -> No
     assert "msprof" in warning
 
 
+@pytest.mark.parametrize(
+    ("window_seconds", "checkpoint_seconds", "is_final", "expected_tokens"),
+    (
+        (2, 6, False, 78),
+        (4, 6, False, 52),
+        (8, 6, False, 0),
+        (2, 6, True, 78),
+        (4, 6, True, 78),
+        (8, 6, True, 78),
+    ),
+)
+def test_expected_reusable_audio_tokens_use_pinned_qwen3_asr_lengths(
+    window_seconds: int,
+    checkpoint_seconds: int,
+    is_final: bool,
+    expected_tokens: int,
+) -> None:
+    assert benchmark.expected_reusable_audio_tokens(
+        sample_count=checkpoint_seconds * 16_000,
+        sample_rate=16_000,
+        window_seconds=window_seconds,
+        is_final=is_final,
+    ) == expected_tokens
+
+
+def test_request_telemetry_derives_cache_and_prefill_values_without_fabrication() -> None:
+    telemetry = benchmark.derive_request_telemetry(
+        sample_count=96_000,
+        sample_rate=16_000,
+        window_seconds=4,
+        is_final=False,
+        prompt_token_ids=tuple(range(100)),
+        num_cached_tokens=40,
+        counter_delta=SimpleNamespace(
+            values={
+                "vllm:mm_cache_queries": 7.0,
+                "vllm:mm_cache_hits": 5.0,
+                "vllm:prefix_cache_queries": 11.0,
+                "vllm:prefix_cache_hits": 8.0,
+            },
+            warnings=(),
+        ),
+    )
+
+    assert telemetry.open_window_duration_seconds == 2.0
+    assert telemetry.expected_reusable_audio_tokens == 52
+    assert telemetry.actual_encoder_cache_hits == 5.0
+    assert telemetry.actual_encoder_cache_misses == 2.0
+    assert telemetry.prefix_cache_hit_tokens == 40
+    assert telemetry.prefill_computed_tokens == 60
+    assert telemetry.warnings == ()
+
+
+def test_request_telemetry_marks_missing_or_impossible_values_unavailable() -> None:
+    telemetry = benchmark.derive_request_telemetry(
+        sample_count=96_000,
+        sample_rate=16_000,
+        window_seconds=4,
+        is_final=True,
+        prompt_token_ids=(1, 2),
+        num_cached_tokens=3,
+        counter_delta=SimpleNamespace(
+            values={
+                "vllm:mm_cache_queries": None,
+                "vllm:mm_cache_hits": 1.0,
+            },
+            warnings=("counter unavailable",),
+        ),
+    )
+
+    assert telemetry.open_window_duration_seconds == 0.0
+    assert telemetry.expected_reusable_audio_tokens == 78
+    assert telemetry.actual_encoder_cache_hits is None
+    assert telemetry.actual_encoder_cache_misses is None
+    assert telemetry.prefix_cache_hit_tokens == 3
+    assert telemetry.prefill_computed_tokens is None
+    assert "counter unavailable" in telemetry.warnings
+    assert any("cached tokens exceed prompt length" in item for item in telemetry.warnings)
+
+
+def test_numeric_error_sidecar_requires_exact_finite_non_sensitive_schema(
+    tmp_path: Path,
+) -> None:
+    sidecar = tmp_path / "numeric-error.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "schema_version": "qwen3-asr-numeric-error-v1",
+                "dtype": "bfloat16",
+                "kernel_provenance": "target kernel metadata digest",
+                "capture_provenance": "supported external capture",
+                "embedding": {
+                    "max_absolute_error": 0.0,
+                    "max_relative_error": 0.25,
+                },
+                "logits": {
+                    "max_absolute_error": 0.01,
+                    "max_relative_error": 0.5,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = benchmark.load_numeric_error_report(sidecar)
+
+    assert report.dtype == "bfloat16"
+    assert report.embedding.max_relative_error == 0.25
+    assert report.logits.max_absolute_error == 0.01
+
+    sidecar.write_text(
+        json.dumps(
+            {
+                "schema_version": "qwen3-asr-numeric-error-v1",
+                "dtype": "bfloat16",
+                "kernel_provenance": "kernel",
+                "capture_provenance": "capture",
+                "embedding": {"max_absolute_error": -1, "max_relative_error": 0},
+                "logits": {"max_absolute_error": 0, "max_relative_error": 0},
+                "session_id": "forbidden",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="schema fields mismatch"):
+        benchmark.load_numeric_error_report(sidecar)
+
+
+def test_numeric_error_sidecar_cli_is_lazy_and_strict(tmp_path: Path) -> None:
+    sidecar = tmp_path / "numeric-error.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "schema_version": "qwen3-asr-numeric-error-v1",
+                "dtype": "float16",
+                "kernel_provenance": "kernel",
+                "capture_provenance": "external capture",
+                "embedding": {"max_absolute_error": 0.0, "max_relative_error": 0.0},
+                "logits": {"max_absolute_error": 0.0, "max_relative_error": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    script = Path(__file__).parents[2] / "benchmarks" / "benchmark_310p.py"
+
+    completed = subprocess.run(
+        [sys.executable, str(script), "--validate-numeric-sidecar", str(sidecar)],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "numeric error sidecar valid" in completed.stdout
+
+
 class FakeEngine:
     def __init__(self) -> None:
         self.requests: list[tuple[dict[str, object], str]] = []
@@ -303,6 +460,7 @@ class FakeEngine:
         self.requests.append((request, request_id))
         yield SimpleNamespace(
             outputs=[SimpleNamespace(token_ids=[101], text="language Chinese<asr_text>测试")],
+            prompt_token_ids=list(range(100)),
             num_cached_tokens=0,
         )
 
@@ -411,6 +569,13 @@ def test_validation_retains_all_checkpoints_and_retries_the_exact_final_request(
             8.0,
         ]
     assert [item.checkpoint_seconds for item in results if item.scenario == "exact_final_retry"] == [8.0]
+    first = next(item for item in results if item.scenario == "steady")
+    assert first.open_window_duration_seconds == 0.0
+    assert first.expected_reusable_audio_tokens == 78
+    assert first.prefix_cache_hit_tokens == 0
+    assert first.prefill_computed_tokens == 100
+    assert first.tail_character_completion_latency_ms == first.final_latency_ms
+    assert first.inference_seq is None
 
     retry_index = next(
         index for index, (_, request_id) in enumerate(engine.requests) if "retry" in request_id

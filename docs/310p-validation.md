@@ -32,6 +32,7 @@ manifest 是 UTF-8 JSONL，每行只能包含以下字段：
 ```bash
 export QWEN3_ASR_310P_MODEL=/models/Qwen3-ASR-1.7B
 export QWEN3_ASR_310P_MANIFEST=/data/asr-validation.jsonl
+export QWEN3_ASR_310P_NUMERIC_SIDECAR=/secure-validation/numeric-error.json
 python -m pytest -m npu tests/integration/test_310p_equivalence.py -vv
 ```
 
@@ -54,9 +55,11 @@ python benchmarks/benchmark_310p.py \
   --output benchmark-results/310p.jsonl
 ```
 
-输出每请求 JSONL 与每个 mode/window/concurrency 的 P50/P95 汇总，不内置“提升至少 X%”阈值。每请求包含音频/窗口/并发、request ID、sealed/open 窗口数、token IDs、文本、`RequestOutput.num_cached_tokens`、TTFT、最终时延、四个 cache counter delta 和峰值 NPU 内存。
+输出每请求 JSONL 与每个 mode/window/concurrency 的 P50/P95 汇总，不内置“提升至少 X%”阈值。每请求包含音频/窗口/并发、request ID、sealed/open 窗口数、开放窗口时长、按 vLLM 0.23 Qwen3-ASR 100 fps 特征长度公式计算的稳定音频 token 预期、token IDs、文本、`RequestOutput.num_cached_tokens`、`prefix_cache_hit_tokens`、`prefill_computed_tokens`、TTFT、最终输出完成时延和同义的 `tail_character_completion_latency_ms`、四个 cache counter delta、实际 encoder cache hit/miss、可选的外部 `inference_seq` 以及峰值 NPU 内存。`inference_seq` 由 Session API 负责；独立 benchmark 不生成它，因此写为 `null`。
 
 Prometheus counter 按完整 metric family 汇总所有 label sample。before/after 缺失时写 `null` 和 warning；after 小于 before 视为进程/counter reset，同样写 `null`，不伪造 0 或负数。并发测量中的进程级 counter delta 可能包含同一时段其他请求，应结合整组汇总解释。
+
+`actual_encoder_cache_hits` 和 `actual_encoder_cache_misses` 仅在 `vllm:mm_cache_queries` 与 `vllm:mm_cache_hits` 两个已验证 delta 都存在、非负且 hits 不超过 queries 时填入。`prefill_computed_tokens` 仅在公开的 `prompt_token_ids` 与 `num_cached_tokens` 都可用且后者不超过前者时按前者长度减后者填入；其余情况写 `null` 和 warning。它是 prompt token 工作量，不是 Audio Tower 或 LLM prefill 的时间拆分。
 
 AsyncLLM 0.23 的 EngineCore 在后台 worker 进程拥有模型分配，前端进程的
 `torch.npu.max_memory_allocated` 不是模型峰值，不能写入本报告。当前脚本固定将
@@ -73,23 +76,58 @@ AsyncLLM 0.23 的 EngineCore 在后台 worker 进程拥有模型分配，前端�
 
 不要从 TTFT 减法反推并宣称 Audio Tower 时间。msprof 会扰动绝对时延：功能/分段采集与无 profiler 的正式 P50/P95 分开运行。
 
-## 6. 多语言质量评估入口
+## 6. 数值误差 sidecar
+
+公开 `RequestOutput` 不提供 embedding 或 logits，基准工具不 monkey-patch 模型，也不直接捕获这些张量。若目标机通过受支持的外部采集得到数值误差，写入严格 JSON sidecar，只包含 dtype、kernel/capture provenance 以及 embedding/logits 的最大绝对和相对误差；不写入 PCM、Session ID、请求 ID、模型路径或 tensor 内容：
+
+```json
+{
+  "schema_version":"qwen3-asr-numeric-error-v1",
+  "dtype":"bfloat16",
+  "kernel_provenance":"approved target kernel metadata",
+  "capture_provenance":"supported external capture",
+  "embedding":{"max_absolute_error":0.0,"max_relative_error":0.0},
+  "logits":{"max_absolute_error":0.0,"max_relative_error":0.0}
+}
+```
+
+先独立校验 sidecar，再将其路径提供给 NPU 正确性门禁：
+
+```bash
+python benchmarks/benchmark_310p.py --validate-numeric-sidecar "$QWEN3_ASR_310P_NUMERIC_SIDECAR"
+python -m pytest -m npu tests/integration/test_310p_equivalence.py -vv
+```
+
+## 7. 目标机 profiling 与外部内存采集
+
+正式无 profiler 时延矩阵与 profiling 分开执行。以下命令以相同模型、manifest、窗口和并发矩阵运行代表性采集；采集目录不进入本仓库：
+
+```bash
+npu-smi info -t memory -i 0 > /secure-validation/npu-memory-before.txt
+msprof --application="python benchmarks/benchmark_310p.py --model /models/Qwen3-ASR-1.7B --manifest /data/asr-validation.jsonl --window-seconds 2 4 8 --concurrency 1 4 8 --warmup-iterations 3 --iterations 20 --output /secure-validation/profiled-310p.jsonl" --output=/secure-validation/msprof --analysis=on
+npu-smi info -t memory -i 0 > /secure-validation/npu-memory-after.txt
+```
+
+将 msprof timeline 中 Audio Tower/Fbank/CNN/AuT 与 LLM prefill kernel 区间分别聚合，并记录采集窗口、CANN 版本和 warmup 排除规则。外部 NPU 内存快照必须在同一测量窗口采集，并以 provenance 附加到交付报告；前端 torch 值、主机 RSS 或常量都不允许替代它。
+
+## 8. 多语言质量评估入口
 
 将两种模式 JSONL 按 `record_id/window_seconds/checkpoint_seconds` 对齐，用业务现有 scorer 对空格语言计算 WER、对中日韩等语言计算 CER。缓存正确性要求同窗口 cache-off/reuse token IDs、文本、语言和逐语言 CER/WER 完全一致；窗口 2/4/8 之间允许不同，但必须分别对 reference 报告，供业务选择默认窗口。
 
-## 7. 成功标准
+## 9. 成功标准
 
 - 所有 manifest 行、窗口、checkpoint、reset/LRU/recreate 场景的 greedy token IDs、语言与文本完全一致。
 - 报告覆盖 cache-off/reuse、2/4/8 秒、6/8/10 秒及并发 1/业务典型并发，无缺失矩阵项。
-- cache counter、`num_cached_tokens`、TTFT、最终时延、P50/P95、峰值内存都带真实值或明确的 `null` provenance/warning。
+- cache counter、`num_cached_tokens`、稳定音频 token 预期、TTFT、尾字完成时延、P50/P95、峰值内存都带真实值或明确的 `null` provenance/warning；Audio Tower/LLM prefill 分段和 NPU 内存只采纳外部采集证据。
+- 数值误差 sidecar 经严格校验，且其 embedding/logits 误差、dtype、kernel/capture provenance 与 token 等价性报告一同归档。
 - vLLM、vLLM-Ascend 和 checkpoint 零修改；Session/PCM 身份校验始终开启。
 - 性能结论只来自目标机测量；根据尾字时延、吞吐、内存与多语言质量共同选择窗口，不设置预设收益阈值。
 
-## 8. 32 → 128 回退
+## 10. 32 → 128 回退
 
 只有 `hash_block_size=32` 在 vLLM-Ascend/310P 初始化失败，或完整 token 等价性验收失败时，才改为 128。保留物理 `block_size=128`、Prefix Cache 和所有 PCM/Session/epoch 身份校验，重新运行完整正确性、质量和性能矩阵。若吞吐或尾字时延收益下降，解释为 prefix 命中粒度从 32 token 变粗到 128 token；不能改用 Session ID 强制命中，也不能绕过内容哈希。
 
-## 9. 故障定位顺序
+## 11. 故障定位顺序
 
 1. 先确认版本、模型 fingerprint、dtype/量化、prompt、窗口、sampling 参数和 manifest slice 完全相同。
 2. 再比较 Adapter audio item、anchor、UUID 与 cache salt；验证 cache-off UUID 每请求唯一、reuse UUID 内容稳定。

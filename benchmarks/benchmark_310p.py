@@ -33,8 +33,23 @@ _MANIFEST_FIELDS = frozenset(
     }
 )
 _SAMPLE_RATE = 16_000
+_AUDIO_FEATURE_HOP_SAMPLES = 160
 _MIN_SECONDS = 6.0
 _MAX_SECONDS = 10.0
+_NUMERIC_ERROR_SCHEMA_VERSION = "qwen3-asr-numeric-error-v1"
+_NUMERIC_ERROR_FIELDS = frozenset(
+    {
+        "schema_version",
+        "dtype",
+        "kernel_provenance",
+        "capture_provenance",
+        "embedding",
+        "logits",
+    }
+)
+_NUMERIC_ERROR_COMPONENT_FIELDS = frozenset(
+    {"max_absolute_error", "max_relative_error"}
+)
 _AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 _DEFAULT_PROMPT = (
     f"<|im_start|>user\n{_AUDIO_PLACEHOLDER}<|im_end|>\n<|im_start|>assistant\n"
@@ -86,6 +101,14 @@ class BenchmarkResult:
     peak_npu_memory_bytes: int | None
     peak_npu_memory_provenance: str | None
     warnings: tuple[str, ...]
+    open_window_duration_seconds: float = 0.0
+    expected_reusable_audio_tokens: int = 0
+    actual_encoder_cache_hits: float | None = None
+    actual_encoder_cache_misses: float | None = None
+    prefix_cache_hit_tokens: int | None = None
+    prefill_computed_tokens: int | None = None
+    tail_character_completion_latency_ms: float = 0.0
+    inference_seq: int | None = None
 
     def as_json(self) -> dict[str, object]:
         return cast(dict[str, object], asdict(self))
@@ -98,6 +121,7 @@ class _OutputChoice(Protocol):
 
 class _RequestOutput(Protocol):
     outputs: Sequence[_OutputChoice]
+    prompt_token_ids: Sequence[int] | None
     num_cached_tokens: int | None
 
 
@@ -153,6 +177,33 @@ class _RunOptions:
     max_tokens: int
     concurrency: int
     iteration: int
+    inference_seq: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RequestTelemetry:
+    open_window_duration_seconds: float
+    expected_reusable_audio_tokens: int
+    actual_encoder_cache_hits: float | None
+    actual_encoder_cache_misses: float | None
+    prefix_cache_hit_tokens: int | None
+    prefill_computed_tokens: int | None
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class NumericErrorComponent:
+    max_absolute_error: float
+    max_relative_error: float
+
+
+@dataclass(frozen=True, slots=True)
+class NumericErrorReport:
+    dtype: str
+    kernel_provenance: str
+    capture_provenance: str
+    embedding: NumericErrorComponent
+    logits: NumericErrorComponent
 
 
 def _line_error(line_number: int, message: str) -> ManifestError:
@@ -181,6 +232,176 @@ def _load_audio_metadata(audio_path: Path, line_number: int) -> tuple[Path, floa
     if not _MIN_SECONDS <= duration <= _MAX_SECONDS:
         raise _line_error(line_number, "audio duration must be 6 to 10 seconds")
     return audio_path.resolve(), duration
+
+
+def _qwen3_asr_audio_token_length(sample_count: int) -> int:
+    """Apply the vLLM 0.23 Qwen3-ASR output-length formula to PCM samples."""
+
+    if type(sample_count) is not int or sample_count <= 0:
+        raise ValueError("sample_count must be a positive integer")
+    feature_length = sample_count // _AUDIO_FEATURE_HOP_SAMPLES
+    remainder = feature_length % 100
+    feature_remainder_length = (remainder - 1) // 2 + 1
+    return (
+        ((feature_remainder_length - 1) // 2 + 1 - 1) // 2
+        + 1
+        + (feature_length // 100) * 13
+    )
+
+
+def expected_reusable_audio_tokens(
+    *,
+    sample_count: int,
+    sample_rate: int,
+    window_seconds: int,
+    is_final: bool,
+) -> int:
+    """Count immutable Qwen3-ASR audio tokens reusable by the next request.
+
+    A non-final call may reuse only complete fixed windows. A final call makes a
+    non-empty tail immutable too, so an exact final retry can reuse it.
+    """
+
+    if type(sample_rate) is not int or sample_rate != _SAMPLE_RATE:
+        raise ValueError("sample_rate must equal 16000")
+    if type(window_seconds) is not int or window_seconds not in (2, 4, 8):
+        raise ValueError("window_seconds must be one of 2, 4, or 8")
+    if type(sample_count) is not int or sample_count <= 0:
+        raise ValueError("sample_count must be a positive integer")
+    window_samples = window_seconds * sample_rate
+    full_windows, remainder = divmod(sample_count, window_samples)
+    tokens = full_windows * _qwen3_asr_audio_token_length(window_samples)
+    if is_final and remainder:
+        tokens += _qwen3_asr_audio_token_length(remainder)
+    return tokens
+
+
+def _nonnegative_counter(
+    values: Mapping[str, float | None], name: str
+) -> tuple[float | None, str | None]:
+    value = values.get(name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, f"{name} delta is unavailable"
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0:
+        return None, f"{name} delta is invalid"
+    return numeric, None
+
+
+def _nonnegative_token_count(value: int | None, name: str) -> tuple[int | None, str | None]:
+    if type(value) is not int or value < 0:
+        return None, f"{name} is unavailable"
+    return value, None
+
+
+def derive_request_telemetry(
+    *,
+    sample_count: int,
+    sample_rate: int,
+    window_seconds: int,
+    is_final: bool,
+    prompt_token_ids: Sequence[int] | None,
+    num_cached_tokens: int | None,
+    counter_delta: _CounterDeltaSnapshot,
+) -> RequestTelemetry:
+    """Derive request telemetry only from public output and validated counters."""
+
+    window_samples = window_seconds * sample_rate
+    remainder = sample_count % window_samples
+    open_window_duration_seconds = (
+        0.0 if is_final or not remainder else remainder / sample_rate
+    )
+    warnings = list(counter_delta.warnings)
+    queries, queries_warning = _nonnegative_counter(
+        counter_delta.values, "vllm:mm_cache_queries"
+    )
+    hits, hits_warning = _nonnegative_counter(
+        counter_delta.values, "vllm:mm_cache_hits"
+    )
+    if queries_warning is not None:
+        warnings.append(queries_warning)
+    if hits_warning is not None:
+        warnings.append(hits_warning)
+    if queries is None or hits is None or hits > queries:
+        if queries is not None and hits is not None and hits > queries:
+            warnings.append("vllm:mm_cache_hits exceeds vllm:mm_cache_queries")
+        actual_hits = None
+        actual_misses = None
+    else:
+        actual_hits = hits
+        actual_misses = queries - hits
+
+    prefix_cache_hit_tokens, cached_warning = _nonnegative_token_count(
+        num_cached_tokens, "num_cached_tokens"
+    )
+    if cached_warning is not None:
+        warnings.append(cached_warning)
+    if prompt_token_ids is None:
+        prefill_computed_tokens = None
+        warnings.append("prompt_token_ids is unavailable")
+    elif prefix_cache_hit_tokens is None:
+        prefill_computed_tokens = None
+    elif prefix_cache_hit_tokens > len(prompt_token_ids):
+        prefill_computed_tokens = None
+        warnings.append("cached tokens exceed prompt length")
+    else:
+        prefill_computed_tokens = len(prompt_token_ids) - prefix_cache_hit_tokens
+
+    return RequestTelemetry(
+        open_window_duration_seconds=open_window_duration_seconds,
+        expected_reusable_audio_tokens=expected_reusable_audio_tokens(
+            sample_count=sample_count,
+            sample_rate=sample_rate,
+            window_seconds=window_seconds,
+            is_final=is_final,
+        ),
+        actual_encoder_cache_hits=actual_hits,
+        actual_encoder_cache_misses=actual_misses,
+        prefix_cache_hit_tokens=prefix_cache_hit_tokens,
+        prefill_computed_tokens=prefill_computed_tokens,
+        warnings=tuple(warnings),
+    )
+
+
+def _numeric_component(value: object, field: str) -> NumericErrorComponent:
+    if not isinstance(value, dict) or set(value) != _NUMERIC_ERROR_COMPONENT_FIELDS:
+        raise ValueError(f"numeric error {field} fields mismatch")
+    parsed: dict[str, float] = {}
+    for name in _NUMERIC_ERROR_COMPONENT_FIELDS:
+        raw = value[name]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise TypeError(f"numeric error {field}.{name} must be numeric")
+        number = float(raw)
+        if not math.isfinite(number) or number < 0:
+            raise ValueError(f"numeric error {field}.{name} must be finite and non-negative")
+        parsed[name] = number
+    return NumericErrorComponent(**parsed)
+
+
+def load_numeric_error_report(path: Path) -> NumericErrorReport:
+    """Validate a non-sensitive numeric sidecar from an external supported capture."""
+
+    try:
+        decoded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read numeric error sidecar: {error}") from error
+    if not isinstance(decoded, dict) or set(decoded) != _NUMERIC_ERROR_FIELDS:
+        raise ValueError("numeric error sidecar schema fields mismatch")
+    if decoded["schema_version"] != _NUMERIC_ERROR_SCHEMA_VERSION:
+        raise ValueError("numeric error sidecar schema version is unsupported")
+    strings: dict[str, str] = {}
+    for field in ("dtype", "kernel_provenance", "capture_provenance"):
+        value = decoded[field]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"numeric error sidecar {field} must be non-empty")
+        strings[field] = value
+    return NumericErrorReport(
+        dtype=strings["dtype"],
+        kernel_provenance=strings["kernel_provenance"],
+        capture_provenance=strings["capture_provenance"],
+        embedding=_numeric_component(decoded["embedding"], "embedding"),
+        logits=_numeric_component(decoded["logits"], "logits"),
+    )
 
 
 def _checkpoints(value: object, duration: float, line_number: int) -> tuple[float, ...]:
@@ -481,9 +702,23 @@ async def _generate_one(
     after, after_warning = _prometheus_text()
     delta = _counter_deltas(before, after)
     peak, provenance, memory_warning = _peak_npu_memory()
+    telemetry = derive_request_telemetry(
+        sample_count=sample_count,
+        sample_rate=record.sample_rate,
+        window_seconds=window_seconds,
+        is_final=is_final,
+        prompt_token_ids=getattr(final, "prompt_token_ids", None),
+        num_cached_tokens=final.num_cached_tokens,
+        counter_delta=delta,
+    )
     warnings = tuple(
         warning
-        for warning in (before_warning, after_warning, memory_warning)
+        for warning in (
+            before_warning,
+            after_warning,
+            memory_warning,
+            *telemetry.warnings,
+        )
         if warning is not None
     )
     full_windows, remainder = divmod(sample_count, window_seconds * record.sample_rate)
@@ -516,6 +751,14 @@ async def _generate_one(
         peak_npu_memory_bytes=peak,
         peak_npu_memory_provenance=provenance,
         warnings=warnings,
+        open_window_duration_seconds=telemetry.open_window_duration_seconds,
+        expected_reusable_audio_tokens=telemetry.expected_reusable_audio_tokens,
+        actual_encoder_cache_hits=telemetry.actual_encoder_cache_hits,
+        actual_encoder_cache_misses=telemetry.actual_encoder_cache_misses,
+        prefix_cache_hit_tokens=telemetry.prefix_cache_hit_tokens,
+        prefill_computed_tokens=telemetry.prefill_computed_tokens,
+        tail_character_completion_latency_ms=(finished_ns - started_ns) / 1_000_000,
+        inference_seq=options.inference_seq,
     )
 
 
@@ -954,19 +1197,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Validate stable-window cache equivalence and latency on Ascend 310P"
     )
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument("--model")
+    parser.add_argument("--manifest", type=Path)
     parser.add_argument(
-        "--window-seconds", nargs="+", type=int, choices=(2, 4, 8), required=True
+        "--window-seconds", nargs="+", type=int, choices=(2, 4, 8)
     )
-    parser.add_argument("--concurrency", nargs="+", type=int, required=True)
+    parser.add_argument("--concurrency", nargs="+", type=int)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--warmup-iterations", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--quantization")
     parser.add_argument("--prompt", default=_DEFAULT_PROMPT)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--validate-numeric-sidecar", type=Path)
     return parser
 
 
@@ -977,6 +1221,31 @@ def _positive(values: Sequence[int], name: str) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.validate_numeric_sidecar is not None:
+        report = load_numeric_error_report(args.validate_numeric_sidecar)
+        print(
+            "numeric error sidecar valid "
+            f"(dtype={report.dtype}, schema={_NUMERIC_ERROR_SCHEMA_VERSION})"
+        )
+        return 0
+    missing = [
+        name
+        for name, value in (
+            ("--model", args.model),
+            ("--manifest", args.manifest),
+            ("--window-seconds", args.window_seconds),
+            ("--concurrency", args.concurrency),
+            ("--output", args.output),
+        )
+        if value is None
+    ]
+    if missing:
+        build_parser().error(f"the following arguments are required: {', '.join(missing)}")
+    assert args.model is not None
+    assert args.manifest is not None
+    assert args.window_seconds is not None
+    assert args.concurrency is not None
+    assert args.output is not None
     _positive(args.concurrency, "concurrency")
     _positive((args.iterations,), "iterations")
     _positive((args.warmup_iterations,), "warmup_iterations")

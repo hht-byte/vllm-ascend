@@ -7,6 +7,7 @@ import pytest
 from benchmarks.benchmark_310p import (
     assert_equivalent,
     load_manifest,
+    load_numeric_error_report,
     run_equivalence_validation,
 )
 
@@ -59,3 +60,6 @@ def test_310p_cache_reuse_matches_full_recompute_after_lifecycle_events(
         pairs,
         reproducer_path=tmp_path / "310p-equivalence-reproducer.json",
     )
+    sidecar = os.environ.get("QWEN3_ASR_310P_NUMERIC_SIDECAR")
+    assert sidecar, "set QWEN3_ASR_310P_NUMERIC_SIDECAR for numeric-error acceptance"
+    load_numeric_error_report(Path(sidecar))

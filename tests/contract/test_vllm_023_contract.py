@@ -14,6 +14,8 @@ KV_CACHE_UTILS = Path("vllm/v1/core/kv_cache_utils.py")
 CACHE_CONFIG = Path("vllm/config/cache.py")
 ENGINE_ARGS = Path("vllm/engine/arg_utils.py")
 ASYNC_LLM = Path("vllm/v1/engine/async_llm.py")
+INPUT_PROCESSOR = Path("vllm/v1/engine/input_processor.py")
+ENCODER_CACHE_MANAGER = Path("vllm/v1/core/encoder_cache_manager.py")
 
 
 def _parse(source_root: Path, relative_path: Path) -> ast.Module:
@@ -173,6 +175,25 @@ def test_qwen3_asr_supports_multiple_audio_items_and_per_item_replacement(
     assert _dotted_name(_keyword(prompt_replacement, "replacement")) == replacement.name
 
 
+def test_qwen3_asr_audio_token_length_formula_remains_pinned(
+    vllm_source_root: Path,
+) -> None:
+    module = _parse(vllm_source_root, QWEN3_ASR_MODEL)
+    output_lengths = _direct_function(module, "_get_feat_extract_output_lengths")
+    assignments = {
+        node.targets[0].id: ast.unparse(node.value)
+        for node in output_lengths.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+    }
+    assert assignments["input_lengths_leave"] == "input_lengths % 100"
+    assert assignments["feat_lengths"] == "(input_lengths_leave - 1) // 2 + 1"
+    assert assignments["output_lengths"] == (
+        "((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + input_lengths // 100 * 13"
+    )
+
+
 def test_qwen3_asr_preserves_audio_embedding_order_and_mrope_continuity(
     vllm_source_root: Path,
 ) -> None:
@@ -306,6 +327,42 @@ def test_prompt_type_carries_multimodal_uuids_and_cache_salt(
     assert prompt_type.value is not None
     assert {"TextPrompt", "TokensPrompt", "EmbedsPrompt"} <= _names(decoder_only.value)
     assert {"DecoderOnlyPrompt", "EncoderDecoderPrompt"} == _names(prompt_type.value)
+
+
+def test_multimodal_uuid_becomes_encoder_cache_identifier_for_lookup_and_store(
+    vllm_source_root: Path,
+) -> None:
+    input_module = _parse(vllm_source_root, INPUT_PROCESSOR)
+    processor = _class(input_module, "InputProcessor")
+    process_inputs = _direct_function(processor, "process_inputs")
+
+    base_hash_values = _assignment_values(process_inputs, "base_mm_hash")
+    assert len(base_hash_values) == 1
+    assert ast.unparse(base_hash_values[0]) == "decoder_mm_hashes[modality][idx]"
+    specs = _calls(process_inputs, "MultiModalFeatureSpec")
+    assert len(specs) == 1
+    identifier = _keyword(specs[0], "identifier")
+    assert isinstance(identifier, ast.Call)
+    assert _dotted_name(identifier.func) == "self._get_mm_identifier"
+    assert ast.unparse(identifier.args[0]) == "base_mm_hash"
+
+    cache_module = _parse(vllm_source_root, ENCODER_CACHE_MANAGER)
+    manager = _class(cache_module, "EncoderCacheManager")
+    for method_name in ("check_and_update_cache", "allocate"):
+        method = _direct_function(manager, method_name)
+        hash_values = _assignment_values(method, "mm_hash")
+        assert [ast.unparse(value) for value in hash_values] == [
+            "request.mm_features[input_id].identifier"
+        ]
+        cached_accesses = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Subscript)
+            and _dotted_name(node.value) == "self.cached"
+            and isinstance(node.slice, ast.Name)
+            and node.slice.id == "mm_hash"
+        ]
+        assert cached_accesses
 
 
 def test_block_hash_uses_multimodal_position_parent_and_first_block_salt(
