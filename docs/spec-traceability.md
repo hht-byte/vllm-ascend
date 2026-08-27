@@ -1,0 +1,53 @@
+# 稳定窗口缓存交付追溯与发布审计
+
+本文件把设计规格第 6–18 节映射到独立包的实现、精确测试和验收命令。状态仅表示本次审计可在本地证明的范围；310P 运行时正确性与性能必须在目标机实测，不能由 Fake Pipeline 推断。
+
+## 规格追溯
+
+| 规格 | 需求与实现符号 | 精确测试 | 验收命令 | 状态 |
+| --- | --- | --- | --- | --- |
+| 6.1 | `WindowedRequestAdapter.build_request` 接收单条累计 mono 16 kHz、C-contiguous `float32` PCM；`WindowCacheConfig` 固定窗口、模型和上限 | `test_builds_direct_vllm_prompt_across_growing_windows`; `test_invalid_pcm_layouts_are_rejected`; `test_non_target_sample_rate_is_rejected`; `test_adapter_honors_restricted_configuration_limits` | `python -m pytest tests/unit/test_request_adapter.py tests/unit/test_windowing.py` | 已实现 |
+| 6.2 | `WindowedRequestAdapter.build_request` 产生 `prompt`、`multi_modal_data`、`multi_modal_uuids`、`cache_salt`；`release_session` 删除 CPU 元数据 | `test_builds_direct_vllm_prompt_across_growing_windows`; `test_release_is_idempotent_and_allows_the_same_key_to_start_fresh`; `test_prompt_type_carries_multimodal_uuids_and_cache_salt` | `python -m pytest tests/unit/test_request_adapter.py -vv`; `python -m pytest -m contract tests/contract/test_vllm_023_contract.py -vv` | 已实现 |
+| 7 | `split_audio_windows` 与 `AudioWindow` 以视图分割 sealed/open/final 窗口，不重采样 | `test_four_second_windows_for_six_seconds`; `test_supported_window_sizes_partition_eight_seconds_without_a_tail`; `test_final_tail_is_sealed`; `test_open_tail_is_not_sealed_and_windows_have_no_gaps_or_overlap` | `python -m pytest tests/unit/test_windowing.py -vv` | 已实现 |
+| 8 | `build_windowed_prompt` 保留一个外层音频区间并为每个窗口生成一个 anchor；原生多项顺序与 MRoPE 连续性由契约锁定 | `test_replaces_one_placeholder_with_three_anchors`; `test_rejects_missing_repeated_split_nested_or_stray_audio_tokens`; `test_qwen3_asr_preserves_audio_embedding_order_and_mrope_continuity` | `python -m pytest tests/unit/test_prompt_builder.py -vv`; `python -m pytest -m contract tests/contract/test_vllm_023_contract.py -vv` | 已实现 |
+| 9 | `canonical_pcm_digest`、`build_session_namespace`、`build_window_id` 覆盖规范 PCM、窗口位置、指纹与 schema；Adapter 将 window ID 和 namespace 分别用于 UUID 与 salt | `test_stable_windows_reuse_ids_while_open_tail_changes`; `test_each_window_identity_dimension_invalidates`; `test_canonical_pcm_digest_hashes_little_endian_float32_bytes`; `test_session_and_epoch_identity_do_not_share_encoder_or_prefix_entries` | `python -m pytest tests/unit/test_identity.py tests/integration/test_fake_cache_equivalence.py -vv` | 已实现 |
+| 10 | Adapter 仅提交原生多模态身份、不保留 embedding；Fake encoder cache 验证 sealed 命中、open miss、LRU 淘汰与历史 PCM 失效 | `test_four_second_stream_has_exact_reuse_trace_and_output_equivalence`; `test_identical_final_retry_exposes_encoder_lru_eviction`; `test_historical_sealed_pcm_change_invalidates_affected_encoder_and_kv_tail` | `python -m pytest tests/integration/test_fake_cache_equivalence.py -vv` | 已实现 |
+| 11 | `floor_reusable_prefix_tokens` 按 `hash_block_size` 向下取整；`prepare_vllm_config` 要求物理块 128 并设置哈希块；上游契约验证多模态位置、父块和 salt 进入哈希 | `test_floor_reusable_prefix_tokens`; `test_prefix_cache_hashes_only_complete_configured_blocks`; `test_block_hash_uses_multimodal_position_parent_and_first_block_salt`; `test_cache_config_allows_finer_hash_granularity_as_an_integer_multiple` | `python -m pytest tests/unit/test_metrics.py tests/integration/test_fake_cache_equivalence.py -vv`; `python -m pytest -m contract tests/contract -vv` | 已实现 |
+| 11 | 310P 实例接受 `block_size=128`、`hash_block_size=32`，或在验收失败时以 128 重跑完整正确性与性能矩阵 | `test_310p_cache_reuse_matches_full_recompute_after_lifecycle_events` | `python -m pytest -m npu tests/integration/test_310p_equivalence.py -vv`; `python benchmarks/benchmark_310p.py --help` | 目标机待验收 |
+| 12 | `_SessionState` 仅保存小型 CPU 元数据；final 仅允许精确幂等重试；`release_session` 不接触原生缓存；调度、VAD、回滚与请求序列仍在 Session API | `test_identical_final_request_is_an_idempotent_retry`; `test_finished_session_rejects_every_nonidentical_retry`; `test_adapter_state_keeps_only_small_cpu_metadata`; `test_release_is_idempotent_and_allows_the_same_key_to_start_fresh` | `python -m pytest tests/unit/test_request_adapter.py -vv` | 已实现 |
+| 13 | `errors.py` 的所有领域异常从包根导出；输入、回归长度、窗口配置、placeholder、final 与引擎配置均安全拒绝 | `test_invalid_pcm_layouts_are_rejected`; `test_rejects_accumulated_length_regression_without_advancing_state`; `test_rejects_window_change_without_advancing_state`; `test_finished_session_rejects_appended_audio`; `test_invalid_engine_values_do_not_mutate_cache_hash` | `python -m pytest tests/unit/test_request_adapter.py tests/unit/test_windowing.py tests/unit/test_engine_config.py -vv` | 已实现 |
+| 14 | `validate_runtime_versions` 精确要求 vLLM 与 vLLM-Ascend 0.23.0；`prepare_vllm_config` 使用原生 config factory，在启动前设置 hash granularity、保留原生 architecture | `test_exact_supported_runtime_versions_pass`; `test_prepares_one_config_without_changing_other_engine_settings`; `test_async_engine_config_omits_hash_granularity_and_async_factory_exists` | `python -m pytest tests/unit/test_compatibility.py tests/unit/test_engine_config.py -vv`; `python -m pytest -m contract tests/contract -vv` | 已实现 |
+| 14 | 部署机安装的精确版本、310P Engine 初始化和 hash granularity 组合 | `test_310p_cache_reuse_matches_full_recompute_after_lifecycle_events` | `python -c "import vllm, vllm_ascend; print(vllm.__version__, vllm_ascend.__version__)"`; `python -m pytest -m npu tests/integration/test_310p_equivalence.py -vv` | 目标机待验收 |
+| 15 | `ReuseExpectation`、`floor_reusable_prefix_tokens` 和 benchmark `BenchmarkResult` 记录窗口、预期/实际缓存、延迟与显式不可得的 NPU 内存；Prometheus delta 对缺失、重置和标签变化给出 warning | `test_reuse_expectation_preserves_valid_measurements`; `test_labeled_counter_samples_are_summed_by_metric_family`; `test_counter_reset_is_null_instead_of_negative_or_zero`; `test_npu_memory_is_explicitly_unavailable_from_the_asyncllm_frontend` | `python -m pytest tests/unit/test_metrics.py tests/unit/test_prometheus_delta.py tests/unit/test_benchmark_manifest.py -vv` | 已实现 |
+| 15 | 310P 上实际 Encoder/KV 命中、Audio Tower 与 prefill 时间、TTFT、尾字时延、P50/P95、NPU 内存及指标端点可用性 | `test_310p_cache_reuse_matches_full_recompute_after_lifecycle_events` | `python benchmarks/benchmark_310p.py --help`; `python -m pytest -m npu tests/integration/test_310p_equivalence.py -vv` | 目标机待验收 |
+| 16 | 独立 `src/qwen3_asr_window_cache` 包、测试、benchmark、文档与只读上游拉取/洁净检查脚本 | `test_upstream_trees_have_no_tracked_staged_or_untracked_changes`; `test_clean_contract_reports_fetch_instruction_for_each_missing_tree` | `bash scripts/verify_upstream_clean.sh`; `git diff --name-only 42066c3..HEAD` | 已实现 |
+| 17.1 | 本地单元测试覆盖 6/8/10 秒、2/4/8 秒、窗口边界、身份、prompt 与确定错误 | `test_four_second_windows_for_six_seconds`; `test_window_and_duration_matrix_matches_hand_derived_reuse`; `test_rejects_missing_repeated_split_nested_or_stray_audio_tokens` | `python -m pytest` | 已实现 |
+| 17.2 | vLLM 0.23 source contract 覆盖多 audio、anchor、连续位置、UUID、块哈希、哈希粒度和异步 factory | `test_qwen3_asr_supports_multiple_audio_items_and_per_item_replacement`; `test_prompt_type_carries_multimodal_uuids_and_cache_salt`; `test_block_hash_uses_multimodal_position_parent_and_first_block_salt` | `python -m pytest -m contract tests/contract -vv` | 已实现 |
+| 17.3 | 确定性 Fake Audio Tower/LLM 覆盖 6→8→10 秒命中轨迹、输出 token 一致性、缓存淘汰、重试、隔离及历史变化；fake embedding 对完整 PCM 而非 UUID 敏感 | `test_equal_moment_permutation_exposes_deliberately_stale_encoder_reuse`; `test_four_second_stream_has_exact_reuse_trace_and_output_equivalence`; `test_session_and_epoch_identity_do_not_share_encoder_or_prefix_entries` | `python -m pytest tests/integration/test_fake_cache_equivalence.py -vv` | 已实现 |
+| 17.4 | cache-off 一次性 UUID 与 reuse 稳定 UUID 的 greedy token、语言/文本、缓存重置、LRU 压力和 Session 重建等价性 | `test_310p_cache_reuse_matches_full_recompute_after_lifecycle_events` | `python -m pytest -m npu tests/integration/test_310p_equivalence.py -vv` | 目标机待验收 |
+| 17.5 | 6/8/10 秒、2/4/8 秒、并发 1 与业务典型并发、cache-off/reuse 的性能矩阵和 JSONL 汇总 | `test_validation_retains_all_checkpoints_and_retries_the_exact_final_request`; `test_cli_defaults_to_three_warmup_iterations` | `python benchmarks/benchmark_310p.py --help` | 目标机待验收 |
+| 18 | 不修改上游、无运行时代码 monkey patch、无注册原生模型或 Processor、无 checkpoint 变更；Session API 仅接入 Adapter、release 和 Engine config | `test_upstream_trees_have_no_tracked_staged_or_untracked_changes`; `test_direct_script_help_does_not_require_vllm_npu_or_installed_package` | `bash scripts/verify_upstream_clean.sh`; `rg -n "monkey.?patch|register_model|register_processor|sys\\.path|inference_seq|text.?rollback|VAD|chunk.?merge" src benchmarks tests docs/integration.md` | 已实现 |
+
+## 本次审计证据
+
+以下命令均在 2026-08-27（Asia/Shanghai）重新执行。命令输出不包含真实 PCM、业务 Session 标识或 benchmark 结果。
+
+| 时间 | 命令 | 摘要 | 状态 |
+| --- | --- | --- | --- |
+| 14:57:23 | `python -m pytest` | 182 passed，10 deselected | 已实现 |
+| 14:57:23 | `python -m pytest -m contract tests/contract -vv` | 9 passed；本地上游固定在各自 v0.23.0 提交 | 已实现 |
+| 14:57:23 | `python -m pytest -m npu tests/integration/test_310p_equivalence.py -vv` | 1 skipped；仅因未设置模型与 manifest 环境变量 | 目标机待验收 |
+| 14:57:23 | `python -m ruff check src tests benchmarks` | All checks passed | 已实现 |
+| 14:57:23 | `python -m mypy src benchmarks` | 12 source files 无问题 | 已实现 |
+| 15:01:13 | `python -m build --no-isolation --outdir <独立临时目录>` | 成功生成 sdist 与 wheel；隔离构建的旧 `dist` 争用未被删除 | 已实现 |
+| 14:57:23 | `bash scripts/verify_upstream_clean.sh` | 两个上游树均无 staged、unstaged 或 untracked diff | 已实现 |
+| 15:00:08 | 包根导入、PromptType 形状与异常导出探针 | 不加载 vLLM/torch；四个请求键一致；audio、UUID、anchor 计数均为 2；12 个公共异常可导入 | 已实现 |
+| 14:58:59 | 侵入式边界搜索 | `src` 无命中；测试中的 monkeypatch 仅为测试替身，文档命中仅说明职责边界 | 已实现 |
+| 14:58:59 | 占位与跳过搜索 | 生产代码无占位；唯一跳过调用位于 NPU 用例且检查两个显式环境变量；contract 缺源码用例为 fail | 已实现 |
+| 15:00:08 | 上游状态与分支范围检查 | 上游树与 checkpoint 输入路径均未见差异；分支内容局限于独立包、测试、benchmark、脚本、文档、配置和忽略规则 | 已实现 |
+
+## 目标机验收边界
+
+下列项需要在实际 Ascend 310P、目标 Qwen3-ASR-1.7B 制品和经批准的验证清单上执行：精确运行时版本、32 哈希块初始化、逐 token 等价、语言与转写一致性、多语言 CER/WER、缓存重置/LRU/Session 重建、完整性能矩阵及 NPU 内存。执行顺序和数据脱敏要求见 `docs/310p-validation.md`。
+
+本次本地审计不能声明性能收益。若 310P 不支持 32 哈希块，应改为 128 并重新执行上述正确性和性能矩阵；这只影响命中粒度，不允许绕过 PCM 内容身份或 Session/epoch 隔离。
