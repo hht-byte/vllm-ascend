@@ -13,6 +13,14 @@ class InvalidEngineConfiguration(WindowCacheError):
     """Raised when vLLM EngineArgs cannot preserve the cache contract."""
 
 
+class InvalidSessionId(WindowCacheError):
+    """Raised when a cache namespace receives an invalid Session identifier."""
+
+
+class InvalidUtteranceEpoch(WindowCacheError):
+    """Raised when a cache namespace receives an invalid utterance epoch."""
+
+
 class InvalidAudioFormat(WindowCacheError):
     """Raised when PCM is not a non-empty mono C-contiguous float32 array."""
 

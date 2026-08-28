@@ -18,6 +18,7 @@ from benchmarks.benchmark_310p import (
     load_manifest,
     parse_asr_output,
 )
+from qwen3_asr_window_cache import WindowCacheConfig, WindowedRequestAdapter
 
 
 def write_audio(path: Path, *, seconds: float = 6.0) -> Path:
@@ -193,11 +194,21 @@ def test_cli_defaults_to_three_warmup_iterations() -> None:
 
     assert args.warmup_iterations == 3
     assert args.iterations == 20
+    assert args.hash_block_size == 32
     assert args.prompt == (
         "<|im_start|>user\n"
         "<|audio_start|><|audio_pad|><|audio_end|>"
         "<|im_end|>\n<|im_start|>assistant\n"
     )
+
+
+def test_cli_accepts_only_audited_hash_block_sizes() -> None:
+    parser = build_parser()
+    explicit = parser.parse_args(["--hash-block-size", "128"])
+    assert explicit.hash_block_size == 128
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--hash-block-size", "64"])
 
 
 def test_qwen3_asr_language_prefix_is_compared_separately_from_text() -> None:
@@ -222,6 +233,7 @@ def result(*, mode: str, token_ids: tuple[int, ...], text: str) -> BenchmarkResu
         audio_duration_seconds=6.0,
         checkpoint_seconds=6.0,
         window_seconds=2,
+        hash_block_size=32,
         concurrency=1,
         iteration=0,
         request_id=f"{mode}-request",
@@ -261,6 +273,7 @@ def test_equivalence_mismatch_saves_minimal_non_sensitive_reproducer(
         "record_id": "zh-001",
         "scenario": "steady",
         "window_seconds": 2,
+        "hash_block_size": 32,
         "checkpoint_seconds": 6.0,
         "cache_off": {
             "token_ids": [1],
@@ -350,6 +363,7 @@ def test_request_telemetry_derives_cache_and_prefill_values_without_fabrication(
         is_final=False,
         prompt_token_ids=tuple(range(100)),
         num_cached_tokens=40,
+        concurrency=1,
         counter_delta=SimpleNamespace(
             values={
                 "vllm:mm_cache_queries": 7.0,
@@ -363,11 +377,15 @@ def test_request_telemetry_derives_cache_and_prefill_values_without_fabrication(
 
     assert telemetry.open_window_duration_seconds == 2.0
     assert telemetry.expected_reusable_audio_tokens == 52
-    assert telemetry.actual_encoder_cache_hits == 5.0
-    assert telemetry.actual_encoder_cache_misses == 2.0
+    assert telemetry.processor_cache_queries == 7.0
+    assert telemetry.processor_cache_hits == 5.0
+    assert telemetry.processor_cache_misses == 2.0
+    assert telemetry.actual_encoder_cache_hits is None
+    assert telemetry.actual_encoder_cache_misses is None
     assert telemetry.prefix_cache_hit_tokens == 40
     assert telemetry.prefill_computed_tokens == 60
-    assert telemetry.warnings == ()
+    assert any("renderer/MM processor cache" in item for item in telemetry.warnings)
+    assert any("EngineCore encoder-output cache" in item for item in telemetry.warnings)
 
 
 def test_request_telemetry_marks_missing_or_impossible_values_unavailable() -> None:
@@ -378,6 +396,7 @@ def test_request_telemetry_marks_missing_or_impossible_values_unavailable() -> N
         is_final=True,
         prompt_token_ids=(1, 2),
         num_cached_tokens=3,
+        concurrency=1,
         counter_delta=SimpleNamespace(
             values={
                 "vllm:mm_cache_queries": None,
@@ -391,10 +410,58 @@ def test_request_telemetry_marks_missing_or_impossible_values_unavailable() -> N
     assert telemetry.expected_reusable_audio_tokens == 78
     assert telemetry.actual_encoder_cache_hits is None
     assert telemetry.actual_encoder_cache_misses is None
+    assert telemetry.processor_cache_queries is None
+    assert telemetry.processor_cache_hits == 1.0
+    assert telemetry.processor_cache_misses is None
     assert telemetry.prefix_cache_hit_tokens == 3
     assert telemetry.prefill_computed_tokens is None
     assert "counter unavailable" in telemetry.warnings
     assert any("cached tokens exceed prompt length" in item for item in telemetry.warnings)
+
+
+def test_request_json_keeps_encoder_unknown_and_names_processor_cache_provenance() -> None:
+    payload = benchmark.replace(
+        result(mode="reuse", token_ids=(1,), text="same"),
+        processor_cache_queries=7.0,
+        processor_cache_hits=5.0,
+        processor_cache_misses=2.0,
+    ).as_json()
+
+    assert payload["processor_cache_queries"] == 7.0
+    assert payload["processor_cache_hits"] == 5.0
+    assert payload["processor_cache_misses"] == 2.0
+    assert payload["actual_encoder_cache_hits"] is None
+    assert payload["actual_encoder_cache_misses"] is None
+
+
+def test_concurrent_request_telemetry_refuses_overlapping_counter_attribution() -> None:
+    telemetry = benchmark.derive_request_telemetry(
+        sample_count=96_000,
+        sample_rate=16_000,
+        window_seconds=4,
+        is_final=False,
+        prompt_token_ids=tuple(range(100)),
+        num_cached_tokens=40,
+        concurrency=4,
+        counter_delta=SimpleNamespace(
+            values={
+                "vllm:mm_cache_queries": 7.0,
+                "vllm:mm_cache_hits": 5.0,
+                "vllm:prefix_cache_queries": 11.0,
+                "vllm:prefix_cache_hits": 8.0,
+            },
+            warnings=(),
+        ),
+    )
+
+    assert telemetry.processor_cache_queries is None
+    assert telemetry.processor_cache_hits is None
+    assert telemetry.processor_cache_misses is None
+    assert telemetry.actual_encoder_cache_hits is None
+    assert telemetry.actual_encoder_cache_misses is None
+    assert telemetry.prefix_cache_hit_tokens == 40
+    assert telemetry.prefill_computed_tokens == 60
+    assert any("concurrency=4" in item and "overlap" in item for item in telemetry.warnings)
 
 
 def test_numeric_error_sidecar_requires_exact_finite_non_sensitive_schema(
@@ -475,9 +542,18 @@ def test_numeric_error_sidecar_cli_is_lazy_and_strict(tmp_path: Path) -> None:
 
 
 class FakeEngine:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        prefix_reset_success: bool = True,
+        cached_tokens_for_request: object | None = None,
+    ) -> None:
         self.requests: list[tuple[dict[str, object], str]] = []
         self.shutdown_calls = 0
+        self.prefix_reset_success = prefix_reset_success
+        self.cached_tokens_for_request = cached_tokens_for_request
+        self.reset_prefix_calls = 0
+        self.reset_encoder_calls = 0
 
     async def generate(
         self,
@@ -487,17 +563,21 @@ class FakeEngine:
     ) -> object:
         assert isinstance(request, dict)
         self.requests.append((request, request_id))
+        cached_tokens = 0
+        if callable(self.cached_tokens_for_request):
+            cached_tokens = self.cached_tokens_for_request(request_id)
         yield SimpleNamespace(
             outputs=[SimpleNamespace(token_ids=[101], text="language Chinese<asr_text>测试")],
             prompt_token_ids=list(range(100)),
-            num_cached_tokens=0,
+            num_cached_tokens=cached_tokens,
         )
 
     async def reset_prefix_cache(self) -> bool:
-        return True
+        self.reset_prefix_calls += 1
+        return self.prefix_reset_success
 
     async def reset_encoder_cache(self) -> None:
-        return None
+        self.reset_encoder_calls += 1
 
     def shutdown(self, timeout: float | None = None) -> None:
         del timeout
@@ -511,6 +591,7 @@ def _options() -> object:
         dtype="auto",
         quantization=None,
         max_tokens=8,
+        hash_block_size=32,
         concurrency=1,
         iteration=0,
     )
@@ -518,6 +599,26 @@ def _options() -> object:
 
 def _fake_runtime() -> object:
     return SimpleNamespace(sampling_params=lambda **_: object())
+
+
+class RecordingAdapter:
+    def __init__(self, window_seconds: int = 2) -> None:
+        self.inner = WindowedRequestAdapter(
+            WindowCacheConfig(
+                model_fingerprint="model-fingerprint",
+                feature_extractor_fingerprint="extractor",
+                audio_encoder_fingerprint="encoder",
+                supported_window_seconds=(window_seconds,),
+            )
+        )
+        self.releases: list[tuple[str, int]] = []
+
+    def build_request(self, **kwargs: object) -> dict[str, object]:
+        return self.inner.build_request(**kwargs)  # type: ignore[arg-type]
+
+    def release_session(self, session_id: str, utterance_epoch: int) -> None:
+        self.releases.append((session_id, utterance_epoch))
+        self.inner.release_session(session_id, utterance_epoch)
 
 
 @pytest.mark.parametrize("runner_name", ("_run_mode", "_run_validation_mode"))
@@ -552,6 +653,197 @@ def test_engine_is_shutdown_when_adapter_creation_fails(
     assert engine.shutdown_calls == 1
 
 
+def test_normal_benchmark_releases_adapter_metadata_after_final_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio = write_audio(tmp_path / "audio.npy", seconds=6)
+    record = benchmark.ManifestRecord(
+        id="zh-001",
+        audio_npy=audio,
+        sample_rate=16_000,
+        checkpoints_seconds=(6.0,),
+        language="zh",
+        reference="测试",
+        duration_seconds=6.0,
+    )
+    engine = FakeEngine()
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(benchmark, "_load_runtime", _fake_runtime)
+    monkeypatch.setattr(benchmark, "_create_engine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr(benchmark, "_adapter", lambda *args, **kwargs: adapter)
+
+    asyncio.run(
+        benchmark._run_mode(
+            (record,),
+            window_seconds=2,
+            mode="reuse",
+            options=_options(),
+            iterations=1,
+            warmup_iterations=0,
+        )
+    )
+
+    assert adapter.releases == [("benchmark:zh-001:2:0:measured-0", 0)]
+
+
+def test_failed_prefix_reset_stops_before_encoder_reset_or_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio = write_audio(tmp_path / "audio.npy", seconds=6)
+    record = benchmark.ManifestRecord(
+        id="zh-001",
+        audio_npy=audio,
+        sample_rate=16_000,
+        checkpoints_seconds=(6.0,),
+        language="zh",
+        reference="测试",
+        duration_seconds=6.0,
+    )
+    engine = FakeEngine(prefix_reset_success=False)
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(benchmark, "_load_runtime", _fake_runtime)
+    monkeypatch.setattr(benchmark, "_create_engine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr(benchmark, "_adapter", lambda *args, **kwargs: adapter)
+
+    with pytest.raises(RuntimeError, match="reset_prefix_cache.*success"):
+        asyncio.run(
+            benchmark._run_validation_mode(
+                (record,),
+                window_seconds=2,
+                mode="reuse",
+                options=_options(),
+                lru_pressure_requests=0,
+            )
+        )
+
+    assert engine.reset_prefix_calls == 1
+    assert engine.reset_encoder_calls == 0
+    assert len(engine.requests) == 2
+
+
+@pytest.mark.parametrize("reset_cached_tokens", [None, False, 4])
+def test_reset_replay_requires_exact_observable_zero_cached_tokens(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_cached_tokens: object,
+) -> None:
+    audio = write_audio(tmp_path / "audio.npy", seconds=6)
+    record = benchmark.ManifestRecord(
+        id="zh-001",
+        audio_npy=audio,
+        sample_rate=16_000,
+        checkpoints_seconds=(6.0,),
+        language="zh",
+        reference="测试",
+        duration_seconds=6.0,
+    )
+    engine = FakeEngine(
+        cached_tokens_for_request=lambda request_id: (
+            reset_cached_tokens if "after_cache_reset:0" in request_id else 0
+        )
+    )
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(benchmark, "_load_runtime", _fake_runtime)
+    monkeypatch.setattr(benchmark, "_create_engine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr(benchmark, "_adapter", lambda *args, **kwargs: adapter)
+
+    with pytest.raises(RuntimeError, match="prefix recomputation after reset"):
+        asyncio.run(
+            benchmark._run_validation_mode(
+                (record,),
+                window_seconds=2,
+                mode="reuse",
+                options=_options(),
+                lru_pressure_requests=0,
+            )
+        )
+
+
+def test_selected_hash_block_size_reaches_reuse_engine_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    fake_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=128,
+            enable_prefix_caching=True,
+            hash_block_size=None,
+        ),
+        multimodal_config=SimpleNamespace(limit_per_prompt={"audio": 5}),
+    )
+
+    class EngineArgs:
+        def __init__(self, **kwargs: object) -> None:
+            captured["engine_kwargs"] = kwargs
+
+        def create_engine_config(self) -> object:
+            return fake_config
+
+    class AsyncLLM:
+        @staticmethod
+        def from_vllm_config(config: object) -> object:
+            captured["config"] = config
+            return object()
+
+    options = benchmark._RunOptions(
+        model="model",
+        prompt="prompt",
+        dtype="auto",
+        quantization=None,
+        max_tokens=8,
+        hash_block_size=128,
+        concurrency=1,
+        iteration=0,
+    )
+    runtime = benchmark._Runtime(
+        async_engine_args=EngineArgs,
+        async_llm=AsyncLLM,
+        sampling_params=object,
+    )
+    monkeypatch.setattr(
+        "qwen3_asr_window_cache.engine_config.validate_runtime_versions",
+        lambda: None,
+    )
+
+    benchmark._create_engine(runtime, options, mode="reuse")
+
+    assert captured["config"] is fake_config
+    assert fake_config.cache_config.hash_block_size == 128
+
+
+@pytest.mark.parametrize("hash_block_size", [True, 0, 64, 256])
+def test_matrix_api_rejects_unaudited_hash_block_sizes(
+    hash_block_size: object,
+) -> None:
+    with pytest.raises(ValueError, match="hash_block_size must be 32 or 128"):
+        asyncio.run(
+            benchmark.run_matrix(
+                model="model",
+                records=(),
+                window_seconds=(),
+                concurrency=(),
+                iterations=1,
+                warmup_iterations=0,
+                max_tokens=8,
+                hash_block_size=hash_block_size,  # type: ignore[arg-type]
+            )
+        )
+
+
+def test_hash_block_size_is_part_of_equivalence_identity_and_summary() -> None:
+    cache_off = result(mode="cache-off", token_ids=(1,), text="same")
+    reuse = result(mode="reuse", token_ids=(1,), text="same")
+    different_hash = benchmark.replace(reuse, hash_block_size=128)
+
+    with pytest.raises(RuntimeError, match="different benchmark case keys"):
+        benchmark._pair_results((cache_off,), (different_hash,))
+
+    summary = benchmark._summary_records((cache_off,))
+    assert summary[0]["hash_block_size"] == 32
+
+
 @pytest.mark.parametrize(
     ("mode", "retry_uuid_matches_final"),
     (("reuse", True), ("cache-off", False)),
@@ -572,9 +864,15 @@ def test_validation_retains_all_checkpoints_and_retries_the_exact_final_request(
         reference="测试",
         duration_seconds=8.0,
     )
-    engine = FakeEngine()
+    engine = FakeEngine(
+        cached_tokens_for_request=lambda request_id: (
+            80 if "lru_warm" in request_id else 0
+        )
+    )
+    adapter = RecordingAdapter()
     monkeypatch.setattr(benchmark, "_load_runtime", _fake_runtime)
     monkeypatch.setattr(benchmark, "_create_engine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr(benchmark, "_adapter", lambda *args, **kwargs: adapter)
 
     results = asyncio.run(
         benchmark._run_validation_mode(
@@ -589,7 +887,6 @@ def test_validation_retains_all_checkpoints_and_retries_the_exact_final_request(
     expected_full_scenarios = {
         "steady",
         "after_cache_reset",
-        "after_lru_pressure",
         "after_session_recreate",
     }
     for scenario in expected_full_scenarios:
@@ -598,6 +895,8 @@ def test_validation_retains_all_checkpoints_and_retries_the_exact_final_request(
             8.0,
         ]
     assert [item.checkpoint_seconds for item in results if item.scenario == "exact_final_retry"] == [8.0]
+    assert [item.checkpoint_seconds for item in results if item.scenario == "lru_warm_retry"] == [8.0]
+    assert [item.checkpoint_seconds for item in results if item.scenario == "lru_pressure_replay"] == [8.0]
     first = next(item for item in results if item.scenario == "steady")
     assert first.open_window_duration_seconds == 0.0
     assert first.expected_reusable_audio_tokens == 78
@@ -625,4 +924,55 @@ def test_validation_retains_all_checkpoints_and_retries_the_exact_final_request(
     assert (
         retry_request["multi_modal_uuids"] == steady_final_request["multi_modal_uuids"]
     ) is retry_uuid_matches_final
+    steady_first = engine.requests[0][0]
+    reset_first = next(
+        request
+        for request, request_id in engine.requests
+        if "after_cache_reset:0" in request_id
+    )
+    assert reset_first["cache_salt"] == steady_first["cache_salt"]
+    reset_result = next(
+        item for item in results if item.scenario == "after_cache_reset"
+    )
+    assert reset_result.num_cached_tokens == 0
+    assert reset_result.prefix_cache_recomputation_observed is (
+        True if mode == "reuse" else None
+    )
+    lru_replay = next(
+        item for item in results if item.scenario == "lru_pressure_replay"
+    )
+    assert lru_replay.lru_warm_prefix_cache_hit_tokens == (80 if mode == "reuse" else None)
+    assert lru_replay.lru_prefix_eviction_observed is (
+        True if mode == "reuse" else None
+    )
+    assert engine.reset_prefix_calls == (1 if mode == "reuse" else 0)
+    assert engine.reset_encoder_calls == (1 if mode == "reuse" else 0)
+    assert adapter.releases
     assert engine.shutdown_calls == 1
+
+
+def test_non_evicting_lru_replay_cannot_be_certified_as_after_pressure() -> None:
+    baseline_replay = benchmark.replace(
+        result(mode="cache-off", token_ids=(1,), text="same"),
+        scenario="lru_pressure_replay",
+        num_cached_tokens=0,
+    )
+    reuse_warm = benchmark.replace(
+        result(mode="reuse", token_ids=(1,), text="same"),
+        scenario="lru_warm_retry",
+        num_cached_tokens=80,
+    )
+    reuse_replay = benchmark.replace(
+        result(mode="reuse", token_ids=(1,), text="same"),
+        scenario="lru_pressure_replay",
+        num_cached_tokens=80,
+        lru_warm_prefix_cache_hit_tokens=80,
+        lru_prefix_eviction_observed=False,
+    )
+
+    with pytest.raises(RuntimeError, match="increase.*LRU pressure"):
+        benchmark._certify_lru_pressure(
+            [baseline_replay],
+            [reuse_warm, reuse_replay],
+            lru_pressure_requests=32,
+        )

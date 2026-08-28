@@ -6,6 +6,7 @@ import cbor2
 import numpy as np
 import pytest
 
+from qwen3_asr_window_cache.errors import InvalidSessionId, InvalidUtteranceEpoch
 from qwen3_asr_window_cache.identity import (
     build_session_namespace,
     build_window_id,
@@ -57,6 +58,43 @@ def ids_for(
         )
         for window in windows
     )
+
+
+@pytest.mark.parametrize("session_id", ["", "   ", 1, True, None])
+def test_session_namespace_rejects_invalid_exact_session_ids(session_id: object) -> None:
+    with pytest.raises(InvalidSessionId):
+        build_session_namespace(
+            session_id=session_id,  # type: ignore[arg-type]
+            utterance_epoch=1,
+            model_fingerprint="model-a",
+        )
+
+
+@pytest.mark.parametrize("utterance_epoch", [True, -1, 1.0, "1", None])
+def test_session_namespace_rejects_invalid_exact_epochs(
+    utterance_epoch: object,
+) -> None:
+    with pytest.raises(InvalidUtteranceEpoch):
+        build_session_namespace(
+            session_id="session-a",
+            utterance_epoch=utterance_epoch,  # type: ignore[arg-type]
+            model_fingerprint="model-a",
+        )
+
+
+def test_session_namespace_preserves_nonblank_whitespace_without_normalizing() -> None:
+    padded = build_session_namespace(
+        session_id=" session-a ",
+        utterance_epoch=1,
+        model_fingerprint="model-a",
+    )
+    plain = build_session_namespace(
+        session_id="session-a",
+        utterance_epoch=1,
+        model_fingerprint="model-a",
+    )
+
+    assert padded != plain
 
 
 def test_stable_windows_reuse_ids_while_open_tail_changes() -> None:

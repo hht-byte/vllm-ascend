@@ -29,11 +29,17 @@ engine_args = AsyncEngineArgs(
     enable_prefix_caching=True,
     limit_mm_per_prompt={"audio": 5},
 )
-vllm_config = prepare_vllm_config(engine_args, hash_block_size=32)
+selected_hash_block_size = 32
+vllm_config = prepare_vllm_config(
+    engine_args,
+    hash_block_size=selected_hash_block_size,
+)
 engine = AsyncLLM.from_vllm_config(vllm_config)
 ```
 
 每个 Engine 绑定一张 310P。同一个 `(session_id, utterance_epoch)` 仍由 Session API 串行提交；不同 Session 可以使用原服务的并发调度。
+
+`create_engine_config` 必须存在且可调用，否则 helper 在任何配置改写前抛 `InvalidEngineConfiguration`。`selected_hash_block_size=128` 只用于 32 初始化或完整正确性失败后的整套回退验收，不能按请求动态切换；选择值必须进入结果、汇总和复现记录。
 
 ## 2. 现有推理触发点：构造并原样提交请求
 
@@ -60,6 +66,8 @@ async for output in engine.generate(
 
 调用方在 vLLM 消费请求前不得原地修改累计 PCM；建议像现有累计逻辑一样替换缓冲区。窗口为 2/4/8 秒之一，同一 epoch 内不能变更。Adapter 只保留小型 CPU 生命周期元数据；embedding 和 KV 张量始终由 vLLM 原生缓存持有。
 
+每次公开命名空间、构造请求和释放操作都会先校验 scope：`session_id` 必须是精确的非空、非纯空白 `str`，`utterance_epoch` 必须是精确的非负 `int`，`bool` 不接受。非空 Session ID 的前后空白会保留并参与身份计算，不做隐式 trim。调用方应在 API 边界使用相同规则，避免把 `1`/`True` 等 Python 等值键当作同一逻辑 Session。
+
 ## 3. 现有最终清理点：释放 Adapter 元数据
 
 最终结果已经通过现有 `inference_seq` 新鲜度检查、文本回滚和业务清理后，再释放该 VAD 语句的 Adapter 状态：
@@ -74,4 +82,4 @@ adapter.release_session(session_id, utterance_epoch)
 
 接入不迁移或重写 chunk 合并、推理触发、VAD、语言识别、3–6 token 文本回滚、`inference_seq`、请求 ID、结果排序或超时取消。移除上述三个接入点即可恢复原累计音频路径。
 
-默认物理 `block_size=128`、哈希 `hash_block_size=32`。只有 310P 初始化或完整正确性验收失败时才把哈希块改为 128；必须重新运行全部 token 等价性与性能矩阵。回退造成的吞吐下降应解释为命中粒度变粗，不能关闭 PCM 内容哈希、Session namespace 或 epoch 隔离。
+默认物理 `block_size=128`、哈希 `hash_block_size=32`。只有 310P 初始化或完整正确性验收失败时才把哈希块改为 128；必须重新运行全部 token 等价性与性能矩阵，并保持 cache-off/reuse 的其他模型、prompt、采样和运行参数相同。回退造成的吞吐下降应解释为命中粒度变粗，不能关闭 PCM 内容哈希、Session namespace 或 epoch 隔离。可执行的完整 32/128 命令见 `docs/310p-validation.md`。

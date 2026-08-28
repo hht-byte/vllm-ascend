@@ -33,12 +33,13 @@ manifest 是 UTF-8 JSONL，每行只能包含以下字段：
 export QWEN3_ASR_310P_MODEL=/models/Qwen3-ASR-1.7B
 export QWEN3_ASR_310P_MANIFEST=/data/asr-validation.jsonl
 export QWEN3_ASR_310P_NUMERIC_SIDECAR=/secure-validation/numeric-error.json
+export QWEN3_ASR_310P_HASH_BLOCK_SIZE=32
 python -m pytest -m npu tests/integration/test_310p_equivalence.py -vv
 ```
 
-测试逐条检查 2/4/8 秒窗口下 cache-off 与 reuse 的 greedy token IDs、语言字段和文本，并覆盖稳定累计请求、显式 Encoder/Prefix Cache reset、唯一 Session 的 LRU 压力、`release_session` 后同 Session/epoch 重建。失败时仅保存 record ID、窗口、checkpoint、场景与两侧输出的最小复现 JSON，不保存音频或 Session ID。
+测试逐条检查 2/4/8 秒窗口下 cache-off 与 reuse 的 greedy token IDs、语言字段和文本，并覆盖稳定累计请求、显式 Encoder/Prefix Cache reset、唯一 Session 的 LRU 压力、`release_session` 后同 Session/epoch 重建。Prefix reset 必须返回成功；Adapter 同一 scope 元数据和 Encoder Cache 被释放/重置后，使用同一 Session/epoch/namespace 的首个重放请求必须观测 `num_cached_tokens == 0`。LRU 场景先记录目标 namespace 的 exact-final warm retry，释放 Adapter CPU 元数据，再用不同 cache salt 施压并重放同一目标；只有重放 cached token 比 warm retry 减少才认证 `after_lru_pressure`，否则失败并提示增加压力。失败时仅保存 record ID、窗口、checkpoint、场景与两侧输出的最小复现 JSON，不保存音频或 Session ID。
 
-cache-off 与 reuse 使用两个独立 Engine 生命周期。两者模型、prompt、窗口、dtype、量化、`temperature=0`、`top_p=1` 和 `max_tokens` 相同；cache-off 关闭 Prefix Cache，并为每个请求的每个 Adapter UUID 生成含 request ID 的一次性 SHA-256；reuse 原样使用 Adapter UUID/cache salt，并通过 `prepare_vllm_config(..., hash_block_size=32)` 启动。
+cache-off 与 reuse 使用两个独立 Engine 生命周期。两者模型、prompt、窗口、dtype、量化、`temperature=0`、`top_p=1`、`max_tokens` 和所选 hash block 相同；cache-off 关闭 Prefix Cache，并为每个请求的每个 Adapter UUID 生成含 request ID 的一次性 SHA-256；reuse 原样使用 Adapter UUID/cache salt，并通过 `prepare_vllm_config(..., hash_block_size=selected_hash_block_size)` 启动。正常、warmup、pressure 和验证 Session 都在 exact-final retry 或专用 release/recreate 流程结束后于 `finally` 释放 Adapter CPU 元数据。
 
 ## 4. 性能测量
 
@@ -50,16 +51,17 @@ python benchmarks/benchmark_310p.py \
   --manifest /data/asr-validation.jsonl \
   --window-seconds 2 4 8 \
   --concurrency 1 4 8 \
+  --hash-block-size 32 \
   --warmup-iterations 3 \
   --iterations 20 \
   --output benchmark-results/310p.jsonl
 ```
 
-输出每请求 JSONL 与每个 mode/window/concurrency 的 P50/P95 汇总，不内置“提升至少 X%”阈值。每请求包含音频/窗口/并发、request ID、sealed/open 窗口数、开放窗口时长、按 vLLM 0.23 Qwen3-ASR 100 fps 特征长度公式计算的稳定音频 token 预期、token IDs、文本、`RequestOutput.num_cached_tokens`、`prefix_cache_hit_tokens`、`prefill_computed_tokens`、TTFT、最终输出完成时延和同义的 `tail_character_completion_latency_ms`、四个 cache counter delta、实际 encoder cache hit/miss、可选的外部 `inference_seq` 以及峰值 NPU 内存。`inference_seq` 由 Session API 负责；独立 benchmark 不生成它，因此写为 `null`。
+输出每请求 JSONL 与每个 mode/window/concurrency/hash-block 的 P50/P95 汇总，不内置“提升至少 X%”阈值。每请求包含音频/窗口/并发、所选 `hash_block_size`、request ID、sealed/open 窗口数、开放窗口时长、按 vLLM 0.23 Qwen3-ASR 100 fps 特征长度公式计算的稳定音频 token 预期、token IDs、文本、`RequestOutput.num_cached_tokens`、`prefix_cache_hit_tokens`、`prefill_computed_tokens`、TTFT、最终输出完成时延和同义的 `tail_character_completion_latency_ms`、四个原始 cache counter delta、`processor_cache_queries/hits/misses`、固定为 `null` 的 `actual_encoder_cache_hits/misses`、reset/LRU 观测证据、可选的外部 `inference_seq` 以及峰值 NPU 内存。等价性键和最小复现命令也包含 hash block。`inference_seq` 由 Session API 负责；独立 benchmark 不生成它，因此写为 `null`。
 
-Prometheus counter 按完整 metric family 汇总所有 label sample。before/after 缺失时写 `null` 和 warning；after 小于 before 视为进程/counter reset，同样写 `null`，不伪造 0 或负数。并发测量中的进程级 counter delta 可能包含同一时段其他请求，应结合整组汇总解释。
+Prometheus counter 按完整 metric family 汇总所有 label sample。before/after 缺失时写 `null` 和 warning；after 小于 before 视为进程/counter reset，同样写 `null`，不伪造 0 或负数。before/after 是进程全局快照：仅 `concurrency=1` 可做精确单请求 delta；`concurrency>1` 时四个 per-request counter delta 和 processor-cache 派生值全部写 `null` 并警告区间重叠，禁止把其他请求增量归给当前请求。并发 cache counter 只能由未来实现的不重叠矩阵/组级采集补充。
 
-`actual_encoder_cache_hits` 和 `actual_encoder_cache_misses` 仅在 `vllm:mm_cache_queries` 与 `vllm:mm_cache_hits` 两个已验证 delta 都存在、非负且 hits 不超过 queries 时填入。`prefill_computed_tokens` 仅在公开的 `prompt_token_ids` 与 `num_cached_tokens` 都可用且后者不超过前者时按前者长度减后者填入；其余情况写 `null` 和 warning。它是 prompt token 工作量，不是 Audio Tower 或 LLM prefill 的时间拆分。
+固定版本中 `vllm:mm_cache_queries` 与 `vllm:mm_cache_hits` 由 renderer 的 MultiModal Processor cache 产生，不是 EngineCore Encoder-output cache。并发为 1 且 delta 有效时，只派生 `processor_cache_queries/hits/misses`；`actual_encoder_cache_hits` 和 `actual_encoder_cache_misses` 始终为 `null`，直到存在经契约证明的真实 Encoder 指标源，并附带 provenance warning。不得用 processor counter 认证 Audio Tower/Encoder Cache 命中。`prefill_computed_tokens` 仅在公开的 `prompt_token_ids` 与 `num_cached_tokens` 都可用且后者不超过前者时按前者长度减后者填入；其余情况写 `null` 和 warning。它是 prompt token 工作量，不是 Audio Tower 或 LLM prefill 的时间拆分。
 
 AsyncLLM 0.23 的 EngineCore 在后台 worker 进程拥有模型分配，前端进程的
 `torch.npu.max_memory_allocated` 不是模型峰值，不能写入本报告。当前脚本固定将
@@ -104,7 +106,7 @@ python -m pytest -m npu tests/integration/test_310p_equivalence.py -vv
 
 ```bash
 npu-smi info -t memory -i 0 > /secure-validation/npu-memory-before.txt
-msprof --application="python benchmarks/benchmark_310p.py --model /models/Qwen3-ASR-1.7B --manifest /data/asr-validation.jsonl --window-seconds 2 4 8 --concurrency 1 4 8 --warmup-iterations 3 --iterations 20 --output /secure-validation/profiled-310p.jsonl" --output=/secure-validation/msprof --analysis=on
+msprof --application="python benchmarks/benchmark_310p.py --model /models/Qwen3-ASR-1.7B --manifest /data/asr-validation.jsonl --window-seconds 2 4 8 --concurrency 1 4 8 --hash-block-size 32 --warmup-iterations 3 --iterations 20 --output /secure-validation/profiled-310p.jsonl" --output=/secure-validation/msprof --analysis=on
 npu-smi info -t memory -i 0 > /secure-validation/npu-memory-after.txt
 ```
 
@@ -118,20 +120,36 @@ npu-smi info -t memory -i 0 > /secure-validation/npu-memory-after.txt
 
 - 所有 manifest 行、窗口、checkpoint、reset/LRU/recreate 场景的 greedy token IDs、语言与文本完全一致。
 - 报告覆盖 cache-off/reuse、2/4/8 秒、6/8/10 秒及并发 1/业务典型并发，无缺失矩阵项。
-- cache counter、`num_cached_tokens`、稳定音频 token 预期、TTFT、尾字完成时延、P50/P95、峰值内存都带真实值或明确的 `null` provenance/warning；Audio Tower/LLM prefill 分段和 NPU 内存只采纳外部采集证据。
+- processor cache counter、`num_cached_tokens`、稳定音频 token 预期、TTFT、尾字完成时延、P50/P95、峰值内存都带真实值或明确的 `null` provenance/warning；真实 Encoder Cache 命中在无受支持来源时保持 `null`；Audio Tower/LLM prefill 分段和 NPU 内存只采纳外部采集证据。
 - 数值误差 sidecar 经严格校验，且其 embedding/logits 误差、dtype、kernel/capture provenance 与 token 等价性报告一同归档。
 - vLLM、vLLM-Ascend 和 checkpoint 零修改；Session/PCM 身份校验始终开启。
 - 性能结论只来自目标机测量；根据尾字时延、吞吐、内存与多语言质量共同选择窗口，不设置预设收益阈值。
 
 ## 10. 32 → 128 回退
 
-只有 `hash_block_size=32` 在 vLLM-Ascend/310P 初始化失败，或完整 token 等价性验收失败时，才改为 128。保留物理 `block_size=128`、Prefix Cache 和所有 PCM/Session/epoch 身份校验，重新运行完整正确性、质量和性能矩阵。若吞吐或尾字时延收益下降，解释为 prefix 命中粒度从 32 token 变粗到 128 token；不能改用 Session ID 强制命中，也不能绕过内容哈希。
+只有 `hash_block_size=32` 在 vLLM-Ascend/310P 初始化失败，或完整 token 等价性验收失败时，才改为 128。保留物理 `block_size=128`、Prefix Cache 和所有 PCM/Session/epoch 身份校验，重新运行完整正确性、质量和性能矩阵；cache-off/reuse 除 hash block 外保持完全相同。不要把 128 当作较快的抽样诊断。
+
+```bash
+export QWEN3_ASR_310P_HASH_BLOCK_SIZE=128
+python -m pytest -m npu tests/integration/test_310p_equivalence.py -vv
+python benchmarks/benchmark_310p.py \
+  --model /models/Qwen3-ASR-1.7B \
+  --manifest /data/asr-validation.jsonl \
+  --window-seconds 2 4 8 \
+  --concurrency 1 4 8 \
+  --hash-block-size 128 \
+  --warmup-iterations 3 \
+  --iterations 20 \
+  --output benchmark-results/310p-hash128.jsonl
+```
+
+以同一 manifest 继续执行第 6～8 节的数值、profiling、内存与多语言质量流程。若吞吐或尾字时延收益下降，解释为 prefix 命中粒度从 32 token 变粗到 128 token；不能改用 Session ID 强制命中，也不能绕过内容哈希。
 
 ## 11. 故障定位顺序
 
 1. 先确认版本、模型 fingerprint、dtype/量化、prompt、窗口、sampling 参数和 manifest slice 完全相同。
 2. 再比较 Adapter audio item、anchor、UUID 与 cache salt；验证 cache-off UUID 每请求唯一、reuse UUID 内容稳定。
-3. 检查 `num_cached_tokens` 与四个 Prometheus counter；缺失指标先修采集，不把 null 当 0。
-4. 显式 reset Encoder/Prefix Cache 后复测；若恢复一致，检查 UUID/namespace 生命周期和并发串行约束。
+3. 检查 `num_cached_tokens` 与四个 Prometheus counter；`concurrency>1` 的 per-request counter 应为 null，缺失指标不当作 0，也不把 MM processor counter 当 Encoder 命中。
+4. 显式 reset Encoder/Prefix Cache 后，以同一 Session/epoch/namespace 复测并要求首个请求 cached prefix 为 0；若观测不可用或不一致，先修生命周期证明。
 5. 以 `hash_block_size=128` 跑完整矩阵判断 32 粒度兼容性；不得只跑单条样本后决定回退。
 6. 最后使用 msprof 定位 Audio Tower、prefill、调度或 NPU kernel；profiler 数据不与无 profiler 的时延报告混用。

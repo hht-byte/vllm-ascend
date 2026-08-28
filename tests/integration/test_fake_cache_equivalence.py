@@ -472,6 +472,36 @@ def test_prefix_cache_hashes_only_complete_configured_blocks() -> None:
     assert retry.prefix == ["hit"]
 
 
+def test_incomplete_tail_uuid_change_preserves_complete_block_hit_and_output() -> None:
+    adapter = WindowedRequestAdapter(config())
+    audio = pcm(8)
+    first_request = build(adapter, audio, window_sec=4, is_final=True)
+    changed_audio = audio.copy()
+    changed_audio[4 * SAMPLE_RATE + 1] += np.float32(0.5)
+    changed_request = build(
+        WindowedRequestAdapter(config()),
+        changed_audio,
+        window_sec=4,
+        is_final=True,
+    )
+    assert audio_ids(first_request)[0] == audio_ids(changed_request)[0]
+    assert audio_ids(first_request)[1] != audio_ids(changed_request)[1]
+    assert first_request["cache_salt"] == changed_request["cache_salt"]
+    cached = FakeLLM(hash_block_size=8)
+
+    first = cached.run(first_request)
+    changed = cached.run(changed_request)
+    recomputed = FakeLLM(hash_block_size=8).run(
+        changed_request,
+        force_full_recompute=True,
+    )
+
+    assert first.prefix == ["miss"]
+    assert changed.prefix == ["hit"]
+    assert changed.embeddings == recomputed.embeddings
+    assert changed.token_ids == recomputed.token_ids
+
+
 def test_fake_llm_rejects_boolean_cache_sizes() -> None:
     with pytest.raises(ValueError):
         FakeLLM(encoder_capacity=True)

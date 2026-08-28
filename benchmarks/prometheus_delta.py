@@ -54,6 +54,8 @@ def counter_deltas(
     before_text: str,
     after_text: str,
     metric_names: Iterable[str] = CACHE_COUNTERS,
+    *,
+    concurrency: int = 1,
 ) -> CounterDeltaSnapshot:
     """Return summed labeled counter deltas without inventing missing values.
 
@@ -62,6 +64,18 @@ def counter_deltas(
     """
 
     names = tuple(metric_names)
+    if type(concurrency) is not int or concurrency <= 0:
+        raise ValueError("concurrency must be a positive integer")
+    if concurrency > 1:
+        return CounterDeltaSnapshot(
+            values={name: None for name in names},
+            warnings=(
+                (
+                    "per-request process-global Prometheus counter snapshots overlap "
+                    f"when concurrency={concurrency}; deltas are unavailable"
+                ),
+            ),
+        )
     before = _counter_series(before_text, names)
     after = _counter_series(after_text, names)
     values: dict[str, float | None] = {}

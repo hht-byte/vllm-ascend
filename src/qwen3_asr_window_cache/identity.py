@@ -5,6 +5,7 @@ import hashlib
 import cbor2
 import numpy as np
 
+from .errors import InvalidSessionId, InvalidUtteranceEpoch
 from .windowing import AudioWindow
 
 
@@ -35,9 +36,32 @@ def build_session_namespace(
     *, session_id: str, utterance_epoch: int, model_fingerprint: str
 ) -> str:
     """Build a stable, session- and epoch-scoped cache namespace."""
+    session_id, utterance_epoch = validate_session_scope(
+        session_id=session_id,
+        utterance_epoch=utterance_epoch,
+    )
     return _sha256_cbor(
         ("qwen3-asr-session-v1", session_id, utterance_epoch, model_fingerprint)
     )
+
+
+def validate_session_scope(
+    *, session_id: object, utterance_epoch: object
+) -> tuple[str, int]:
+    """Validate one exact, non-normalized Session/epoch namespace key.
+
+    Whitespace-only identifiers are rejected. Other whitespace is preserved so
+    callers cannot accidentally collapse two distinct upstream identifiers.
+    """
+    if type(session_id) is not str or not session_id.strip():
+        raise InvalidSessionId(
+            "session_id must be an exact non-empty, non-whitespace string"
+        )
+    if type(utterance_epoch) is not int or utterance_epoch < 0:
+        raise InvalidUtteranceEpoch(
+            "utterance_epoch must be an exact non-negative integer"
+        )
+    return session_id, utterance_epoch
 
 
 def build_window_id(

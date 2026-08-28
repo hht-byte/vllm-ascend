@@ -13,6 +13,8 @@ from qwen3_asr_window_cache import (
     AudioTooLong,
     InvalidPromptPlaceholder,
     InvalidSampleRate,
+    InvalidSessionId,
+    InvalidUtteranceEpoch,
     InvalidWindowSize,
     SessionAlreadyFinished,
     WindowCacheConfig,
@@ -212,6 +214,58 @@ def test_release_is_idempotent_and_allows_the_same_key_to_start_fresh() -> None:
 
     result = build(adapter, audio[:32_000], window_sec=2)
     assert len(audio_items(result)) == 1
+
+
+@pytest.mark.parametrize("invalid_epoch", [True, -1, 1.0])
+def test_invalid_epoch_cannot_read_or_release_epoch_one_state(
+    invalid_epoch: object,
+) -> None:
+    adapter = WindowedRequestAdapter(config())
+    audio = pcm(8)
+    final = build(adapter, audio[:96_000], utterance_epoch=1, is_final=True)
+
+    with pytest.raises(InvalidUtteranceEpoch):
+        build(
+            adapter,
+            audio[:96_000],
+            utterance_epoch=invalid_epoch,  # type: ignore[arg-type]
+            is_final=True,
+        )
+    with pytest.raises(InvalidUtteranceEpoch):
+        adapter.release_session(
+            "session-a",
+            invalid_epoch,  # type: ignore[arg-type]
+        )
+
+    assert audio_ids(build(adapter, audio[:96_000], is_final=True)) == audio_ids(final)
+    with pytest.raises(SessionAlreadyFinished):
+        build(adapter, audio, is_final=True)
+
+
+@pytest.mark.parametrize("invalid_session_id", ["", "  ", 1, True, None])
+def test_invalid_session_id_cannot_create_or_release_session_state(
+    invalid_session_id: object,
+) -> None:
+    adapter = WindowedRequestAdapter(config())
+    audio = pcm(8)
+    final = build(adapter, audio[:96_000], is_final=True)
+
+    with pytest.raises(InvalidSessionId):
+        build(
+            adapter,
+            audio[:96_000],
+            session_id=invalid_session_id,  # type: ignore[arg-type]
+            is_final=True,
+        )
+    with pytest.raises(InvalidSessionId):
+        adapter.release_session(
+            invalid_session_id,  # type: ignore[arg-type]
+            1,
+        )
+
+    assert audio_ids(build(adapter, audio[:96_000], is_final=True)) == audio_ids(final)
+    with pytest.raises(SessionAlreadyFinished):
+        build(adapter, audio, is_final=True)
 
 
 def test_session_and_epoch_state_are_isolated() -> None:

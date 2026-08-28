@@ -24,6 +24,13 @@ def test_310p_cache_reuse_matches_full_recompute_after_lifecycle_events(
             "to run target-machine equivalence"
         )
 
+    hash_block_size = int(
+        os.environ.get("QWEN3_ASR_310P_HASH_BLOCK_SIZE", "32")
+    )
+    assert hash_block_size in (32, 128), (
+        "QWEN3_ASR_310P_HASH_BLOCK_SIZE must be 32 or the audited 128 fallback"
+    )
+
     pairs = asyncio.run(
         run_equivalence_validation(
             model=model,
@@ -33,6 +40,7 @@ def test_310p_cache_reuse_matches_full_recompute_after_lifecycle_events(
             lru_pressure_requests=int(
                 os.environ.get("QWEN3_ASR_310P_LRU_PRESSURE_REQUESTS", "32")
             ),
+            hash_block_size=hash_block_size,
         )
     )
     assert pairs
@@ -40,7 +48,6 @@ def test_310p_cache_reuse_matches_full_recompute_after_lifecycle_events(
     full_checkpoint_scenarios = {
         "steady",
         "after_cache_reset",
-        "after_lru_pressure",
         "after_session_recreate",
     }
     for window_seconds in (2, 4, 8):
@@ -56,6 +63,32 @@ def test_310p_cache_reuse_matches_full_recompute_after_lifecycle_events(
                 for checkpoint in record.checkpoints_seconds
             } <= observed
             assert ("exact_final_retry", record.checkpoints_seconds[-1]) in observed
+            assert ("lru_warm_retry", record.checkpoints_seconds[-1]) in observed
+            assert ("after_lru_pressure", record.checkpoints_seconds[-1]) in observed
+            reset_first = next(
+                reuse
+                for _, reuse in pairs
+                if reuse.window_seconds == window_seconds
+                and reuse.record_id == record.id
+                and reuse.scenario == "after_cache_reset"
+                and reuse.checkpoint_seconds == record.checkpoints_seconds[0]
+            )
+            assert reset_first.prefix_cache_recomputation_observed is True
+            pressure_replay = next(
+                reuse
+                for _, reuse in pairs
+                if reuse.window_seconds == window_seconds
+                and reuse.record_id == record.id
+                and reuse.scenario == "after_lru_pressure"
+            )
+            assert pressure_replay.lru_prefix_eviction_observed is True
+            assert pressure_replay.lru_warm_prefix_cache_hit_tokens is not None
+            assert pressure_replay.num_cached_tokens is not None
+            assert (
+                pressure_replay.num_cached_tokens
+                < pressure_replay.lru_warm_prefix_cache_hit_tokens
+            )
+            assert pressure_replay.hash_block_size == hash_block_size
     assert_equivalent(
         pairs,
         reproducer_path=tmp_path / "310p-equivalence-reproducer.json",

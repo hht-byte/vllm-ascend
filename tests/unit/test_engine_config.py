@@ -150,3 +150,10 @@ def test_missing_required_config_attributes_leave_cache_hash_unmodified(
 def test_engine_args_without_public_config_factory_is_rejected() -> None:
     with pytest.raises(InvalidEngineConfiguration):
         prepare_vllm_config(object(), validate_versions=False)
+
+
+def test_engine_args_config_factory_must_be_callable() -> None:
+    malformed = SimpleNamespace(create_engine_config=object())
+
+    with pytest.raises(InvalidEngineConfiguration, match="callable"):
+        prepare_vllm_config(malformed, validate_versions=False)

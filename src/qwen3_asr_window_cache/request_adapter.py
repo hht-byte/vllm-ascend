@@ -20,6 +20,7 @@ from .identity import (
     build_session_namespace,
     build_window_id,
     canonical_pcm_digest,
+    validate_session_scope,
 )
 from .prompt_builder import build_windowed_prompt
 from .windowing import split_audio_windows
@@ -61,6 +62,10 @@ class WindowedRequestAdapter:
         prompt: str,
     ) -> dict[str, object]:
         """Validate and assemble one request, then atomically commit metadata."""
+        session_id, utterance_epoch = validate_session_scope(
+            session_id=session_id,
+            utterance_epoch=utterance_epoch,
+        )
         key = (session_id, utterance_epoch)
         with self._lock:
             if (
@@ -154,6 +159,10 @@ class WindowedRequestAdapter:
 
     def release_session(self, session_id: str, utterance_epoch: int) -> None:
         """Idempotently discard CPU metadata for one utterance."""
+        session_id, utterance_epoch = validate_session_scope(
+            session_id=session_id,
+            utterance_epoch=utterance_epoch,
+        )
         with self._lock:
             self._states.pop((session_id, utterance_epoch), None)
 

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "qwen3-asr-window-cache"
 version = "0.1.0"
 description = "Stable-window cache adapter domain for Qwen3-ASR"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "numpy>=1.26,<3",
     "cbor2>=5.6,<6",

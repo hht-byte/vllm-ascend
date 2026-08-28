@@ -3,7 +3,7 @@ from benchmarks.prometheus_delta import CACHE_COUNTERS, counter_deltas
 
 def test_labeled_counter_samples_are_summed_by_metric_family() -> None:
     before = """
-# HELP vllm:mm_cache_queries_total Encoder cache queries.
+# HELP vllm:mm_cache_queries_total Multimodal processor cache queries.
 # TYPE vllm:mm_cache_queries_total counter
 vllm:mm_cache_queries_total{model_name="a",worker="0"} 10
 vllm:mm_cache_queries_total{model_name="a",worker="1"} 4
@@ -109,3 +109,27 @@ vllm:mm_cache_queries_created 2000
 
     assert snapshot.values == {"vllm:mm_cache_queries": 2.0}
     assert snapshot.warnings == ()
+
+
+def test_overlapping_concurrent_requests_do_not_receive_process_global_deltas() -> None:
+    before = """
+vllm:mm_cache_queries_total 10
+vllm:mm_cache_hits_total 4
+vllm:prefix_cache_queries_total 20
+vllm:prefix_cache_hits_total 8
+"""
+    # Both overlapping requests incremented the same process-global families
+    # between these snapshots. Neither request may claim the combined delta.
+    after = """
+vllm:mm_cache_queries_total 14
+vllm:mm_cache_hits_total 7
+vllm:prefix_cache_queries_total 30
+vllm:prefix_cache_hits_total 14
+"""
+
+    snapshot = counter_deltas(before, after, concurrency=2)
+
+    assert snapshot.values == {name: None for name in CACHE_COUNTERS}
+    assert len(snapshot.warnings) == 1
+    assert "overlap" in snapshot.warnings[0]
+    assert "concurrency=2" in snapshot.warnings[0]

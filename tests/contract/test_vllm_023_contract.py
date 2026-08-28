@@ -24,6 +24,7 @@ RENDERER_PREPROCESS = Path("vllm/renderers/inputs/preprocess.py")
 INPUTS_PREPROCESS = Path("vllm/inputs/preprocess.py")
 INPUTS_ENGINE = Path("vllm/inputs/engine.py")
 PROCESSOR = Path("vllm/multimodal/processing/processor.py")
+METRIC_LOGGERS = Path("vllm/v1/metrics/loggers.py")
 
 
 def _parse(source_root: Path, relative_path: Path) -> ast.Module:
@@ -1217,3 +1218,40 @@ def test_async_engine_config_omits_hash_granularity_and_async_factory_exists(
     cls_calls = _calls(factory, "cls")
     assert len(cls_calls) == 1
     assert _dotted_name(_keyword(cls_calls[0], "vllm_config")) == "vllm_config"
+
+
+def test_mm_cache_prometheus_counters_originate_from_renderer_processor_cache(
+    vllm_source_root: Path,
+) -> None:
+    renderer_module = _parse(vllm_source_root, RENDERER_BASE)
+    renderer = _class(renderer_module, "BaseRenderer")
+    update_stats = _direct_function(renderer, "update_mm_cache_stats")
+    assert any(
+        isinstance(node, ast.Assign)
+        and [ast.unparse(target) for target in node.targets] == ["delta"]
+        and ast.unparse(node.value)
+        == "mm_processor_cache.make_stats(delta=True)"
+        for node in ast.walk(update_stats)
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "mm_cache_stats.record"
+        and [ast.unparse(argument) for argument in node.args]
+        == ["delta.total", "delta.hits"]
+        for node in ast.walk(update_stats)
+    )
+
+    logger_module = _parse(vllm_source_root, METRIC_LOGGERS)
+    logger = _class(logger_module, "PrometheusStatLogger")
+    record = _direct_function(logger, "record")
+    increments = {
+        ast.unparse(node)
+        for node in ast.walk(record)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func).endswith(".inc")
+        and "mm_cache_stats" in ast.unparse(node)
+    }
+    assert increments == {
+        "self.counter_mm_cache_queries[engine_idx].inc(mm_cache_stats.queries)",
+        "self.counter_mm_cache_hits[engine_idx].inc(mm_cache_stats.hits)",
+    }

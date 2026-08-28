@@ -6,7 +6,9 @@
 
 **Architecture:** 独立 Python 包接收现有服务保存的单条累计 PCM，将其切成 sealed 窗口与 open/final 尾窗，为每个窗口生成内容安全的稳定 UUID，并把一个原生 Qwen3-ASR 音频占位区间扩成多个连续 anchor。vLLM 原生 MultiModal Processor、Encoder Cache 和 Prefix Cache 完成张量缓存；Adapter 只保存 Session 的小型 CPU 生命周期元数据。Engine 配置辅助函数从原生 `AsyncEngineArgs` 创建 `VllmConfig`，设置 0.23.0 未由 EngineArgs 暴露的 `cache_config.hash_block_size`，然后仍用原生 `AsyncLLM.from_vllm_config` 启动。
 
-**Tech Stack:** Python 3.11、NumPy、cbor2、pytest、ruff、mypy、vLLM 0.23.0、vLLM-Ascend 0.23.0、Ascend 310P。
+**Tech Stack:** Python 3.12、NumPy、cbor2、pytest、ruff、mypy、vLLM 0.23.0、vLLM-Ascend 0.23.0、Ascend 310P。
+
+**Runtime ruling (2026-08-28):** 生产实际运行 Python 3.12，因此用户裁决以 `>=3.12,<3.13` 和 py312 静态门禁覆盖原计划的 Python 3.11 假设；不再声明或机械验证 Python 3.11 兼容性。
 
 **Spec:** `docs/superpowers/specs/2026-08-26-qwen3-asr-window-cache-design.md`
 

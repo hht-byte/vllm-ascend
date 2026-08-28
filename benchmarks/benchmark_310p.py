@@ -64,6 +64,10 @@ class EquivalenceMismatch(AssertionError):
     """Cache-off and reuse generated observably different outputs."""
 
 
+class LifecycleProofError(RuntimeError):
+    """A target cache lifecycle event was not observably demonstrated."""
+
+
 @dataclass(frozen=True, slots=True)
 class ManifestRecord:
     id: str
@@ -86,6 +90,7 @@ class BenchmarkResult:
     audio_duration_seconds: float
     checkpoint_seconds: float
     window_seconds: int
+    hash_block_size: int
     concurrency: int
     iteration: int
     request_id: str
@@ -103,12 +108,18 @@ class BenchmarkResult:
     warnings: tuple[str, ...]
     open_window_duration_seconds: float = 0.0
     expected_reusable_audio_tokens: int = 0
+    processor_cache_queries: float | None = None
+    processor_cache_hits: float | None = None
+    processor_cache_misses: float | None = None
     actual_encoder_cache_hits: float | None = None
     actual_encoder_cache_misses: float | None = None
     prefix_cache_hit_tokens: int | None = None
     prefill_computed_tokens: int | None = None
     tail_character_completion_latency_ms: float = 0.0
     inference_seq: int | None = None
+    prefix_cache_recomputation_observed: bool | None = None
+    lru_warm_prefix_cache_hit_tokens: int | None = None
+    lru_prefix_eviction_observed: bool | None = None
 
     def as_json(self) -> dict[str, object]:
         return cast(dict[str, object], asdict(self))
@@ -175,6 +186,7 @@ class _RunOptions:
     dtype: str
     quantization: str | None
     max_tokens: int
+    hash_block_size: int
     concurrency: int
     iteration: int
     inference_seq: int | None = None
@@ -184,6 +196,9 @@ class _RunOptions:
 class RequestTelemetry:
     open_window_duration_seconds: float
     expected_reusable_audio_tokens: int
+    processor_cache_queries: float | None
+    processor_cache_hits: float | None
+    processor_cache_misses: float | None
     actual_encoder_cache_hits: float | None
     actual_encoder_cache_misses: float | None
     prefix_cache_hit_tokens: int | None
@@ -302,6 +317,7 @@ def derive_request_telemetry(
     is_final: bool,
     prompt_token_ids: Sequence[int] | None,
     num_cached_tokens: int | None,
+    concurrency: int,
     counter_delta: _CounterDeltaSnapshot,
 ) -> RequestTelemetry:
     """Derive request telemetry only from public output and validated counters."""
@@ -312,24 +328,37 @@ def derive_request_telemetry(
         0.0 if is_final or not remainder else remainder / sample_rate
     )
     warnings = list(counter_delta.warnings)
-    queries, queries_warning = _nonnegative_counter(
-        counter_delta.values, "vllm:mm_cache_queries"
+    if type(concurrency) is not int or concurrency <= 0:
+        raise ValueError("concurrency must be a positive integer")
+    warnings.append(
+        "vllm:mm_cache_queries/hits provenance is the renderer/MM processor "
+        "cache, not the EngineCore encoder-output cache; actual encoder cache "
+        "hits/misses are unavailable"
     )
-    hits, hits_warning = _nonnegative_counter(
-        counter_delta.values, "vllm:mm_cache_hits"
-    )
-    if queries_warning is not None:
-        warnings.append(queries_warning)
-    if hits_warning is not None:
-        warnings.append(hits_warning)
+    if concurrency > 1:
+        queries = None
+        hits = None
+        warnings.append(
+            "per-request process-global Prometheus snapshots overlap when "
+            f"concurrency={concurrency}; processor-cache attribution is unavailable"
+        )
+    else:
+        queries, queries_warning = _nonnegative_counter(
+            counter_delta.values, "vllm:mm_cache_queries"
+        )
+        hits, hits_warning = _nonnegative_counter(
+            counter_delta.values, "vllm:mm_cache_hits"
+        )
+        if queries_warning is not None:
+            warnings.append(queries_warning)
+        if hits_warning is not None:
+            warnings.append(hits_warning)
     if queries is None or hits is None or hits > queries:
         if queries is not None and hits is not None and hits > queries:
             warnings.append("vllm:mm_cache_hits exceeds vllm:mm_cache_queries")
-        actual_hits = None
-        actual_misses = None
+        processor_misses = None
     else:
-        actual_hits = hits
-        actual_misses = queries - hits
+        processor_misses = queries - hits
 
     prefix_cache_hit_tokens, cached_warning = _nonnegative_token_count(
         num_cached_tokens, "num_cached_tokens"
@@ -355,8 +384,11 @@ def derive_request_telemetry(
             window_seconds=window_seconds,
             is_final=is_final,
         ),
-        actual_encoder_cache_hits=actual_hits,
-        actual_encoder_cache_misses=actual_misses,
+        processor_cache_queries=queries,
+        processor_cache_hits=hits,
+        processor_cache_misses=processor_misses,
+        actual_encoder_cache_hits=None,
+        actual_encoder_cache_misses=None,
         prefix_cache_hit_tokens=prefix_cache_hit_tokens,
         prefill_computed_tokens=prefill_computed_tokens,
         warnings=tuple(warnings),
@@ -512,6 +544,7 @@ def _minimal_reproducer(
         "record_id": baseline.record_id,
         "scenario": baseline.scenario,
         "window_seconds": baseline.window_seconds,
+        "hash_block_size": baseline.hash_block_size,
         "checkpoint_seconds": baseline.checkpoint_seconds,
         "cache_off": {
             "token_ids": list(baseline.token_ids),
@@ -596,7 +629,9 @@ def _create_engine(runtime: _Runtime, options: _RunOptions, *, mode: str) -> _En
     engine_args = runtime.async_engine_args(**engine_kwargs)
     if mode == "reuse":
         package = importlib.import_module("qwen3_asr_window_cache")
-        config = package.prepare_vllm_config(engine_args, hash_block_size=32)
+        config = package.prepare_vllm_config(
+            engine_args, hash_block_size=options.hash_block_size
+        )
     else:
         config = engine_args.create_engine_config()
     return cast(_Engine, runtime.async_llm.from_vllm_config(config))
@@ -628,14 +663,16 @@ def _prometheus_text() -> tuple[str, str | None]:
     return payload.decode("utf-8", errors="replace"), None
 
 
-def _counter_deltas(before: str, after: str) -> _CounterDeltaSnapshot:
+def _counter_deltas(
+    before: str, after: str, *, concurrency: int
+) -> _CounterDeltaSnapshot:
     module_name = "benchmarks.prometheus_delta" if __package__ else "prometheus_delta"
     module = importlib.import_module(module_name)
     helper = cast(
-        Callable[[str, str], _CounterDeltaSnapshot],
+        Callable[..., _CounterDeltaSnapshot],
         module.counter_deltas,
     )
-    return helper(before, after)
+    return helper(before, after, concurrency=concurrency)
 
 
 def _peak_npu_memory() -> tuple[int | None, str | None, str | None]:
@@ -700,7 +737,7 @@ async def _generate_one(
         raise RuntimeError(f"vLLM returned no final output for request {request_id}")
     detected_language, transcription = parse_asr_output(final.outputs[0].text)
     after, after_warning = _prometheus_text()
-    delta = _counter_deltas(before, after)
+    delta = _counter_deltas(before, after, concurrency=options.concurrency)
     peak, provenance, memory_warning = _peak_npu_memory()
     telemetry = derive_request_telemetry(
         sample_count=sample_count,
@@ -709,6 +746,7 @@ async def _generate_one(
         is_final=is_final,
         prompt_token_ids=getattr(final, "prompt_token_ids", None),
         num_cached_tokens=final.num_cached_tokens,
+        concurrency=options.concurrency,
         counter_delta=delta,
     )
     warnings = tuple(
@@ -732,6 +770,7 @@ async def _generate_one(
         audio_duration_seconds=record.duration_seconds,
         checkpoint_seconds=checkpoint,
         window_seconds=window_seconds,
+        hash_block_size=options.hash_block_size,
         concurrency=options.concurrency,
         iteration=options.iteration,
         request_id=request_id,
@@ -753,6 +792,9 @@ async def _generate_one(
         warnings=warnings,
         open_window_duration_seconds=telemetry.open_window_duration_seconds,
         expected_reusable_audio_tokens=telemetry.expected_reusable_audio_tokens,
+        processor_cache_queries=telemetry.processor_cache_queries,
+        processor_cache_hits=telemetry.processor_cache_hits,
+        processor_cache_misses=telemetry.processor_cache_misses,
         actual_encoder_cache_hits=telemetry.actual_encoder_cache_hits,
         actual_encoder_cache_misses=telemetry.actual_encoder_cache_misses,
         prefix_cache_hit_tokens=telemetry.prefix_cache_hit_tokens,
@@ -778,7 +820,9 @@ async def _run_record_stream(
     session_id = _session_id(record, window_seconds, options, session_suffix)
     results: list[BenchmarkResult] = []
     for index, checkpoint in enumerate(record.checkpoints_seconds):
-        request_id = f"{mode}:{session_id}:{index}:{time.perf_counter_ns()}"
+        request_id = (
+            f"{mode}:{session_id}:{scenario}:{index}:{time.perf_counter_ns()}"
+        )
         results.append(
             await _generate_one(
                 engine=engine,
@@ -818,13 +862,14 @@ async def _run_exact_final_retry(
     mode: str,
     options: _RunOptions,
     session_suffix: str,
+    scenario: str = "exact_final_retry",
 ) -> BenchmarkResult:
     """Retry the exact final request with a distinct request ID."""
 
     audio = _load_audio(record)
     session_id = _session_id(record, window_seconds, options, session_suffix)
     checkpoint = record.checkpoints_seconds[-1]
-    request_id = f"{mode}:{session_id}:retry:{time.perf_counter_ns()}"
+    request_id = f"{mode}:{session_id}:{scenario}:{time.perf_counter_ns()}"
     return await _generate_one(
         engine=engine,
         sampling=sampling,
@@ -834,7 +879,7 @@ async def _run_exact_final_retry(
         checkpoint=checkpoint,
         window_seconds=window_seconds,
         mode=mode,
-        scenario="exact_final_retry",
+        scenario=scenario,
         options=options,
         session_id=session_id,
         request_id=request_id,
@@ -870,17 +915,29 @@ async def _run_mode(
         ) -> list[BenchmarkResult]:
             async with semaphore:
                 iteration_options = replace(options, iteration=iteration)
-                return await _run_record_stream(
-                    engine=engine,
-                    sampling=sampling,
-                    adapter=adapter,
-                    record=record,
-                    window_seconds=window_seconds,
-                    mode=mode,
-                    scenario="steady",
-                    options=iteration_options,
-                    session_suffix=f"{phase}-{iteration}",
-                )
+                session_suffix = f"{phase}-{iteration}"
+                try:
+                    return await _run_record_stream(
+                        engine=engine,
+                        sampling=sampling,
+                        adapter=adapter,
+                        record=record,
+                        window_seconds=window_seconds,
+                        mode=mode,
+                        scenario="steady",
+                        options=iteration_options,
+                        session_suffix=session_suffix,
+                    )
+                finally:
+                    adapter.release_session(
+                        _session_id(
+                            record,
+                            window_seconds,
+                            iteration_options,
+                            session_suffix,
+                        ),
+                        iteration_options.iteration,
+                    )
 
         for warmup_iteration in range(warmup_iterations):
             await asyncio.gather(
@@ -905,6 +962,7 @@ def _result_key(result: BenchmarkResult) -> tuple[object, ...]:
     return (
         result.record_id,
         result.window_seconds,
+        result.hash_block_size,
         result.checkpoint_seconds,
         result.iteration,
         result.scenario,
@@ -932,12 +990,14 @@ async def run_matrix(
     iterations: int,
     warmup_iterations: int,
     max_tokens: int,
+    hash_block_size: int = 32,
     prompt: str = _DEFAULT_PROMPT,
     dtype: str = "auto",
     quantization: str | None = None,
 ) -> list[BenchmarkResult]:
     """Run isolated cache-off and reuse engines for every matrix point."""
 
+    _validate_selected_hash_block_size(hash_block_size)
     all_results: list[BenchmarkResult] = []
     for window in window_seconds:
         for concurrency_value in concurrency:
@@ -947,6 +1007,7 @@ async def run_matrix(
                 dtype=dtype,
                 quantization=quantization,
                 max_tokens=max_tokens,
+                hash_block_size=hash_block_size,
                 concurrency=concurrency_value,
                 iteration=0,
             )
@@ -993,49 +1054,143 @@ async def _run_validation_mode(
         adapter = _adapter(options.model, window_seconds)
         results: list[BenchmarkResult] = []
         for record in records:
-            steady = await _run_record_stream(
-                engine=engine,
-                sampling=sampling,
-                adapter=adapter,
-                record=record,
-                window_seconds=window_seconds,
-                mode=mode,
-                scenario="steady",
-                options=options,
-                session_suffix="steady",
+            target_suffix = "steady"
+            target_session = _session_id(
+                record, window_seconds, options, target_suffix
             )
-            results.extend(steady)
-            retry = await _run_exact_final_retry(
-                engine=engine,
-                sampling=sampling,
-                adapter=adapter,
-                record=record,
-                window_seconds=window_seconds,
-                mode=mode,
-                options=options,
-                session_suffix="steady",
-            )
-            results.append(retry)
+            try:
+                steady = await _run_record_stream(
+                    engine=engine,
+                    sampling=sampling,
+                    adapter=adapter,
+                    record=record,
+                    window_seconds=window_seconds,
+                    mode=mode,
+                    scenario="steady",
+                    options=options,
+                    session_suffix=target_suffix,
+                )
+                results.extend(steady)
+                retry = await _run_exact_final_retry(
+                    engine=engine,
+                    sampling=sampling,
+                    adapter=adapter,
+                    record=record,
+                    window_seconds=window_seconds,
+                    mode=mode,
+                    options=options,
+                    session_suffix=target_suffix,
+                )
+                results.append(retry)
+            finally:
+                adapter.release_session(target_session, options.iteration)
 
             if mode == "reuse":
-                await engine.reset_prefix_cache()
+                reset_successful = await engine.reset_prefix_cache()
+                if reset_successful is not True:
+                    raise LifecycleProofError(
+                        "reset_prefix_cache must return success before lifecycle replay"
+                    )
                 await engine.reset_encoder_cache()
-            reset_result = await _run_record_stream(
-                engine=engine,
-                sampling=sampling,
-                adapter=adapter,
-                record=record,
-                window_seconds=window_seconds,
-                mode=mode,
-                scenario="after_cache_reset",
-                options=options,
-                session_suffix="reset",
-            )
-            results.extend(
-                replace(item, scenario="after_cache_reset") for item in reset_result
-            )
+            try:
+                reset_result = await _run_record_stream(
+                    engine=engine,
+                    sampling=sampling,
+                    adapter=adapter,
+                    record=record,
+                    window_seconds=window_seconds,
+                    mode=mode,
+                    scenario="after_cache_reset",
+                    options=options,
+                    session_suffix=target_suffix,
+                )
+                if mode == "reuse":
+                    first_cached_tokens = reset_result[0].num_cached_tokens
+                    if type(first_cached_tokens) is not int:
+                        raise LifecycleProofError(
+                            "prefix recomputation after reset is unavailable: "
+                            "first replay num_cached_tokens is missing or invalid"
+                        )
+                    if first_cached_tokens != 0:
+                        raise LifecycleProofError(
+                            "prefix recomputation after reset is inconsistent: "
+                            f"first replay cached {first_cached_tokens} tokens"
+                        )
+                    reset_result[0] = replace(
+                        reset_result[0],
+                        prefix_cache_recomputation_observed=True,
+                    )
+                results.extend(reset_result)
+                lru_warm_retry = await _run_exact_final_retry(
+                    engine=engine,
+                    sampling=sampling,
+                    adapter=adapter,
+                    record=record,
+                    window_seconds=window_seconds,
+                    mode=mode,
+                    options=options,
+                    session_suffix=target_suffix,
+                    scenario="lru_warm_retry",
+                )
+                results.append(lru_warm_retry)
+            finally:
+                adapter.release_session(target_session, options.iteration)
 
             for pressure_index in range(lru_pressure_requests):
+                pressure_suffix = f"pressure-{pressure_index}"
+                pressure_session = _session_id(
+                    record, window_seconds, options, pressure_suffix
+                )
+                try:
+                    await _run_record_stream(
+                        engine=engine,
+                        sampling=sampling,
+                        adapter=adapter,
+                        record=record,
+                        window_seconds=window_seconds,
+                        mode=mode,
+                        scenario="pressure",
+                        options=options,
+                        session_suffix=pressure_suffix,
+                    )
+                finally:
+                    adapter.release_session(
+                        pressure_session, options.iteration
+                    )
+            try:
+                pressure_replay = await _run_exact_final_retry(
+                    engine=engine,
+                    sampling=sampling,
+                    adapter=adapter,
+                    record=record,
+                    window_seconds=window_seconds,
+                    mode=mode,
+                    options=options,
+                    session_suffix=target_suffix,
+                    scenario="lru_pressure_replay",
+                )
+                if mode == "reuse":
+                    warm_tokens = lru_warm_retry.num_cached_tokens
+                    replay_tokens = pressure_replay.num_cached_tokens
+                    eviction_observed = (
+                        type(warm_tokens) is int
+                        and type(replay_tokens) is int
+                        and 0 <= replay_tokens < warm_tokens
+                    )
+                    pressure_replay = replace(
+                        pressure_replay,
+                        lru_warm_prefix_cache_hit_tokens=warm_tokens,
+                        lru_prefix_eviction_observed=eviction_observed,
+                    )
+                results.append(pressure_replay)
+            finally:
+                adapter.release_session(target_session, options.iteration)
+
+            recreated_suffix = "recreated"
+            recreated_session = _session_id(
+                record, window_seconds, options, recreated_suffix
+            )
+            try:
                 await _run_record_stream(
                     engine=engine,
                     sampling=sampling,
@@ -1043,68 +1198,66 @@ async def _run_validation_mode(
                     record=record,
                     window_seconds=window_seconds,
                     mode=mode,
-                    scenario="pressure",
+                    scenario="after_session_recreate",
                     options=options,
-                    session_suffix=f"pressure-{pressure_index}",
+                    session_suffix=recreated_suffix,
                 )
-                adapter.release_session(
-                    _session_id(
-                        record,
-                        window_seconds,
-                        options,
-                        f"pressure-{pressure_index}",
-                    ),
-                    options.iteration,
+            finally:
+                adapter.release_session(recreated_session, options.iteration)
+            try:
+                recreated_again = await _run_record_stream(
+                    engine=engine,
+                    sampling=sampling,
+                    adapter=adapter,
+                    record=record,
+                    window_seconds=window_seconds,
+                    mode=mode,
+                    scenario="after_session_recreate",
+                    options=options,
+                    session_suffix=recreated_suffix,
                 )
-            pressure_result = await _run_record_stream(
-                engine=engine,
-                sampling=sampling,
-                adapter=adapter,
-                record=record,
-                window_seconds=window_seconds,
-                mode=mode,
-                scenario="after_lru_pressure",
-                options=options,
-                session_suffix="post-pressure",
-            )
-            results.extend(
-                replace(item, scenario="after_lru_pressure")
-                for item in pressure_result
-            )
-
-            recreated_session = (
-                f"benchmark:{record.id}:{window_seconds}:{options.iteration}:recreated"
-            )
-            await _run_record_stream(
-                engine=engine,
-                sampling=sampling,
-                adapter=adapter,
-                record=record,
-                window_seconds=window_seconds,
-                mode=mode,
-                scenario="after_session_recreate",
-                options=options,
-                session_suffix="recreated",
-            )
-            adapter.release_session(recreated_session, options.iteration)
-            recreated_again = await _run_record_stream(
-                engine=engine,
-                sampling=sampling,
-                adapter=adapter,
-                record=record,
-                window_seconds=window_seconds,
-                mode=mode,
-                scenario="after_session_recreate",
-                options=options,
-                session_suffix="recreated",
-            )
-            results.extend(
-                replace(item, scenario="after_session_recreate")
-                for item in recreated_again
-            )
+                results.extend(recreated_again)
+            finally:
+                adapter.release_session(recreated_session, options.iteration)
         return results
     finally:
         engine.shutdown()
+
+
+def _certify_lru_pressure(
+    baseline: list[BenchmarkResult],
+    reuse: list[BenchmarkResult],
+    *,
+    lru_pressure_requests: int,
+) -> tuple[list[BenchmarkResult], list[BenchmarkResult]]:
+    """Promote raw LRU replays only after an observable cached-token reduction."""
+
+    reuse_replays = [
+        item for item in reuse if item.scenario == "lru_pressure_replay"
+    ]
+    if not reuse_replays or any(
+        item.lru_prefix_eviction_observed is not True for item in reuse_replays
+    ):
+        raise LifecycleProofError(
+            "LRU prefix eviction was not observed with "
+            f"{lru_pressure_requests} pressure sessions; increase configured "
+            "LRU pressure and rerun the full equivalence matrix"
+        )
+
+    return (
+        [
+            replace(item, scenario="after_lru_pressure")
+            if item.scenario == "lru_pressure_replay"
+            else item
+            for item in baseline
+        ],
+        [
+            replace(item, scenario="after_lru_pressure")
+            if item.scenario == "lru_pressure_replay"
+            else item
+            for item in reuse
+        ],
+    )
 
 
 async def run_equivalence_validation(
@@ -1114,9 +1267,11 @@ async def run_equivalence_validation(
     window_seconds: Sequence[int],
     max_tokens: int,
     lru_pressure_requests: int,
+    hash_block_size: int = 32,
 ) -> list[tuple[BenchmarkResult, BenchmarkResult]]:
     """Run steady/reset/pressure/recreate scenarios on one 310P process."""
 
+    _validate_selected_hash_block_size(hash_block_size)
     records = load_manifest(manifest_path)
     pairs: list[tuple[BenchmarkResult, BenchmarkResult]] = []
     for window in window_seconds:
@@ -1126,6 +1281,7 @@ async def run_equivalence_validation(
             dtype="auto",
             quantization=None,
             max_tokens=max_tokens,
+            hash_block_size=hash_block_size,
             concurrency=1,
             iteration=0,
         )
@@ -1143,6 +1299,11 @@ async def run_equivalence_validation(
             options=options,
             lru_pressure_requests=lru_pressure_requests,
         )
+        baseline, reuse = _certify_lru_pressure(
+            baseline,
+            reuse,
+            lru_pressure_requests=lru_pressure_requests,
+        )
         pairs.extend(_pair_results(baseline, reuse))
     return pairs
 
@@ -1156,13 +1317,21 @@ def _percentile(values: Sequence[float], percentile: float) -> float | None:
 
 
 def _summary_records(results: Sequence[BenchmarkResult]) -> list[dict[str, object]]:
-    groups: dict[tuple[str, int, int], list[BenchmarkResult]] = {}
+    groups: dict[tuple[str, int, int, int], list[BenchmarkResult]] = {}
     for result in results:
         groups.setdefault(
-            (result.mode, result.window_seconds, result.concurrency), []
+            (
+                result.mode,
+                result.window_seconds,
+                result.hash_block_size,
+                result.concurrency,
+            ),
+            [],
         ).append(result)
     summaries: list[dict[str, object]] = []
-    for (mode, window, concurrency_value), group in sorted(groups.items()):
+    for (mode, window, hash_block_size, concurrency_value), group in sorted(
+        groups.items()
+    ):
         latencies = [result.final_latency_ms for result in group]
         ttfts = [result.ttft_ms for result in group if result.ttft_ms is not None]
         summaries.append(
@@ -1170,6 +1339,7 @@ def _summary_records(results: Sequence[BenchmarkResult]) -> list[dict[str, objec
                 "record_type": "summary",
                 "mode": mode,
                 "window_seconds": window,
+                "hash_block_size": hash_block_size,
                 "concurrency": concurrency_value,
                 "request_count": len(group),
                 "final_latency_ms_p50": statistics.median(latencies),
@@ -1206,6 +1376,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--warmup-iterations", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--hash-block-size", type=int, choices=(32, 128), default=32)
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--quantization")
     parser.add_argument("--prompt", default=_DEFAULT_PROMPT)
@@ -1217,6 +1388,11 @@ def build_parser() -> argparse.ArgumentParser:
 def _positive(values: Sequence[int], name: str) -> None:
     if any(type(value) is not int or value <= 0 for value in values):
         raise ValueError(f"{name} values must be positive integers")
+
+
+def _validate_selected_hash_block_size(hash_block_size: int) -> None:
+    if type(hash_block_size) is not int or hash_block_size not in (32, 128):
+        raise ValueError("hash_block_size must be 32 or 128")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1260,6 +1436,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             iterations=args.iterations,
             warmup_iterations=args.warmup_iterations,
             max_tokens=args.max_tokens,
+            hash_block_size=args.hash_block_size,
             prompt=args.prompt,
             dtype=args.dtype,
             quantization=args.quantization,

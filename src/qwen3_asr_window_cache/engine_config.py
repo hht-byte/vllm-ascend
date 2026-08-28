@@ -1,18 +1,13 @@
 """Narrow, non-invasive vLLM Engine configuration validation."""
 
-from collections.abc import Mapping
-from typing import Any, Protocol, cast, runtime_checkable
+from collections.abc import Callable, Mapping
+from typing import Any, Protocol, cast
 
 from .compatibility import validate_runtime_versions
 from .errors import InvalidEngineConfiguration
 
 _PHYSICAL_BLOCK_SIZE = 128
 _MINIMUM_AUDIO_ITEMS = 5
-
-
-@runtime_checkable
-class _EngineArgs(Protocol):
-    def create_engine_config(self) -> object: ...
 
 
 class _CacheConfig(Protocol):
@@ -47,11 +42,12 @@ def prepare_vllm_config(
 
 
 def _create_engine_config(engine_args: object) -> object:
-    if not isinstance(engine_args, _EngineArgs):
+    factory = getattr(engine_args, "create_engine_config", None)
+    if not callable(factory):
         raise InvalidEngineConfiguration(
-            "engine_args must provide create_engine_config()"
+            "engine_args must provide callable create_engine_config()"
         )
-    return engine_args.create_engine_config()
+    return cast(Callable[[], object], factory)()
 
 
 def _read_cache_config(config: object) -> _CacheConfig:

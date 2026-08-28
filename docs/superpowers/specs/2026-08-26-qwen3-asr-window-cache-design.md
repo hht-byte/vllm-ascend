@@ -49,11 +49,14 @@
 
 目标版本固定为：
 
+- Python `>=3.12,<3.13`；
 - `vllm==0.23.0`；
 - `vllm-ascend==0.23.0`；
 - Qwen3-ASR-1.7B；
 - 单个 vLLM Engine 绑定一张 Ascend 310P；
 - 多个用户 Session 可并发，但同一个 `(session_id, utterance_epoch)` 的推理请求串行执行。
+
+Python 边界按 2026-08-28 用户确认的生产环境收敛到 3.12；本交付不声明 Python 3.11 兼容性。
 
 实现以独立 Python 包 `qwen3-asr-window-cache` 交付。上游源码只用于接口契约检查和目标环境安装。
 
@@ -108,6 +111,8 @@ build_request(
 
 约束：
 
+- `session_id` 必须是精确的 `str`，不得为空或仅由空白字符组成；非空值中的前后空白保留并参与身份计算，不做隐式归一化；
+- `utterance_epoch` 必须是精确的非负 `int`，`bool` 不作为整数接受；
 - `accumulated_audio` 是 mono、16 kHz、C-contiguous `float32`；
 - `window_sec` 只能是 2、4 或 8；
 - 同一个 `(session_id, utterance_epoch)` 内 `window_sec` 不可改变；Adapter 的模型指纹在进程生命周期内不可改变；
@@ -209,6 +214,8 @@ PCM 在哈希前使用规范形式：
 - little-endian；
 - C-contiguous；
 - 哈希后不得再执行会改变数值的归一化。
+
+所有公开命名空间和 Adapter 状态键操作都先执行同一组 Session scope 校验：`session_id` 是精确的非空、非纯空白 `str`，`utterance_epoch` 是精确的非负 `int` 且不是 `bool`。校验必须发生在构造字典键或读取、写入、释放状态之前，避免 Python 的 `1 == True` 键别名跨逻辑 Session 访问状态。
 
 身份计算：
 
@@ -316,6 +323,8 @@ Adapter 只保存小型 CPU 元数据：
 
 Adapter 定义：
 
+- `InvalidSessionId`：Session ID 不是精确的非空、非纯空白 `str`；
+- `InvalidUtteranceEpoch`：epoch 不是精确的非负 `int`，包括 `bool`；
 - `InvalidAudioFormat`：非 mono、非 `float32` 或数组不合法；
 - `InvalidSampleRate`：采样率不是 16 kHz；
 - `InvalidWindowSize`：窗口不是 2、4、8 秒之一；
@@ -342,9 +351,9 @@ limit_mm_per_prompt.audio = 5
 
 5 个音频项覆盖最大 10 秒音频和最小 2 秒窗口。模型 architecture 保持原生 `Qwen3ASRForConditionalGeneration`，不修改 checkpoint 的 `config.json`。
 
-vLLM 0.23.0 的 `CacheConfig` 已包含 `hash_block_size`，但 `AsyncEngineArgs` 没有暴露对应字段，也不会在 `create_engine_config()` 时传入该值。独立包因此提供一个 Engine 配置辅助函数：先由现有 `AsyncEngineArgs` 创建 `VllmConfig`，再在 Engine 启动前设置 `vllm_config.cache_config.hash_block_size`，最后调用原生 `AsyncLLM.from_vllm_config(vllm_config)`。这只使用公开配置对象和公开构造入口，不修改 vLLM 或 vLLM-Ascend 源码。
+vLLM 0.23.0 的 `CacheConfig` 已包含 `hash_block_size`，但 `AsyncEngineArgs` 没有暴露对应字段，也不会在 `create_engine_config()` 时传入该值。独立包因此提供一个 Engine 配置辅助函数：先要求并调用可调用的 `AsyncEngineArgs.create_engine_config()` 创建 `VllmConfig`，再在 Engine 启动前设置 `vllm_config.cache_config.hash_block_size`，最后调用原生 `AsyncLLM.from_vllm_config(vllm_config)`。这只使用公开配置对象和公开构造入口，不修改 vLLM 或 vLLM-Ascend 源码。
 
-目标环境的推荐版本矩阵遵循 vLLM-Ascend 0.23.0 官方兼容说明。`hash_block_size=32` 是 310P 验收项；若不通过则使用 128。
+目标环境的推荐版本矩阵遵循 vLLM-Ascend 0.23.0 官方兼容说明。benchmark 只接受 `--hash-block-size 32` 或 `128`，默认为 32，并把所选值写入每请求结果、汇总、等价性键和复现命令。只有 32 初始化或完整正确性失败时才使用 128，且必须以 128 重跑完整 token 等价性与性能矩阵；除该值外 cache-off/reuse 条件保持相同。
 
 ## 15. 可观测性
 
@@ -355,13 +364,14 @@ vLLM 0.23.0 的 `CacheConfig` 已包含 `hash_block_size`，但 `AsyncEngineArgs
 - `sealed_window_count`；
 - `open_window_duration_seconds`；
 - `expected_reusable_audio_tokens`；
-- `actual_encoder_cache_hits/misses`；
+- `processor_cache_queries/hits/misses`；
+- `actual_encoder_cache_hits/misses`（当前固定为 `null`）；
 - `prefix_cache_hit_tokens`；
 - `prefill_computed_tokens`；
 - `request_latency_ms`；
 - `inference_seq`（由现有 Session API 服务附加）。
 
-指标区分“根据稳定窗口推导的预期命中”和“缓存未被淘汰后的实际命中”。
+vLLM 0.23 的 `vllm:mm_cache_queries/hits` 来自 renderer 的 MultiModal Processor cache 统计，不是 EngineCore Encoder-output cache。它们只能派生为 `processor_cache_queries/hits/misses`；在没有已证明的真实 Encoder-output 指标源前，`actual_encoder_cache_hits/misses` 必须保持 `null` 并附带 provenance warning，不能据此认证 Audio Tower/Encoder Cache 命中。Prometheus before/after 是进程全局快照；当 `concurrency>1` 时，单请求 counter delta 及 processor-cache 派生值必须为 `null` 并警告请求区间重叠，不能把其他请求增量归给当前请求。`RequestOutput.num_cached_tokens` 仍是每请求 Prefix Cache 观测值。
 
 ## 16. 项目结构
 
@@ -425,6 +435,8 @@ qwen3-asr-window-cache/
 - MRoPE position 连续；
 - 多模态 UUID 进入 Encoder Cache 和 Prefix Cache 身份；
 - `hash_block_size=32` 与 `block_size=128` 的哈希边界行为；
+- 相同完整哈希块、但从不完整尾部开始改变多模态 UUID 时，完整块仍命中且输出等价由后续重算保护；
+- renderer/MM processor cache 是 `vllm:mm_cache_*` Prometheus counter 的来源，不能标记为 Encoder Cache；
 - vLLM 和 vLLM-Ascend 上游目录零 diff。
 
 ### 17.3 模拟缓存集成测试
@@ -454,6 +466,8 @@ reuse：稳定窗口 UUID；启用 Encoder Cache 和 Prefix Cache
 - 最终语言和转写文本一致；
 - 多语言 CER/WER 不发生变化；
 - 重试、缓存淘汰和 Session 重建不改变结果；
+- Prefix Cache reset 必须返回成功，并在释放 Adapter 元数据后以同一个 Session/epoch/namespace 重放，首个重放请求必须观测到零 cached prefix tokens；
+- LRU 压力前先对同一个目标 namespace 做 exact-final warm retry，压力 Session 使用不同 cache salt 并释放 CPU 元数据，之后重放同一目标 namespace；只有 cached token 相对 warm retry 降低时才认证 `after_lru_pressure`，否则该次运行仅为诊断并要求增加压力后重跑；
 - embedding 和 logits 输出 dtype 相关的数值误差报告，不要求不同 NPU kernel 路径逐 bit 一致。
 
 ### 17.5 310P 性能报告
@@ -465,7 +479,7 @@ reuse：稳定窗口 UUID；启用 Encoder Cache 和 Prefix Cache
 - 并发 1 和业务典型并发；
 - 缓存关闭和开启。
 
-输出 Encoder 命中率、KV 命中 token、重算 token、Audio Tower 时间、LLM prefill 时间、TTFT、尾字完成时延、P50/P95 和峰值 NPU 内存。第一版不承诺固定提升百分比，由目标环境实测选择默认窗口。
+输出 MM Processor Cache 查询/命中/未命中、KV 命中 token、重算 token、Audio Tower 时间、LLM prefill 时间、TTFT、尾字完成时延、P50/P95 和峰值 NPU 内存。真实 Encoder Cache 命中率在没有受支持的指标源前保持未知，不能由 processor counter 替代。第一版不承诺固定提升百分比，由目标环境实测选择默认窗口。
 
 ## 18. 非侵入式验收
 
