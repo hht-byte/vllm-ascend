@@ -6,11 +6,7 @@ from qwen3_asr_window_cache.config import WindowCacheConfig
 
 
 def config(**overrides: Any) -> WindowCacheConfig:
-    settings: dict[str, Any] = {
-        "model_fingerprint": "model-v1",
-        "feature_extractor_fingerprint": "extractor-v1",
-        "audio_encoder_fingerprint": "encoder-v1",
-    }
+    settings: dict[str, Any] = {}
     settings.update(overrides)
     return WindowCacheConfig(**settings)
 
@@ -22,19 +18,6 @@ def test_default_configuration_preserves_target_limits() -> None:
     assert result.sample_rate == 16_000
     assert result.max_audio_seconds == 10
     assert result.max_audio_windows == 5
-
-
-@pytest.mark.parametrize(
-    "field",
-    [
-        "model_fingerprint",
-        "feature_extractor_fingerprint",
-        "audio_encoder_fingerprint",
-    ],
-)
-def test_blank_fingerprints_are_rejected(field: str) -> None:
-    with pytest.raises(ValueError, match=field):
-        config(**{field: "  "})
 
 
 @pytest.mark.parametrize("sample_rate", [0, -1, 8_000, 44_100])

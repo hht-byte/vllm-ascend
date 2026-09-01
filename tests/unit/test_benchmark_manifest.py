@@ -605,20 +605,17 @@ class RecordingAdapter:
     def __init__(self, window_seconds: int = 2) -> None:
         self.inner = WindowedRequestAdapter(
             WindowCacheConfig(
-                model_fingerprint="model-fingerprint",
-                feature_extractor_fingerprint="extractor",
-                audio_encoder_fingerprint="encoder",
                 supported_window_seconds=(window_seconds,),
             )
         )
-        self.releases: list[tuple[str, int]] = []
+        self.releases: list[str] = []
 
     def build_request(self, **kwargs: object) -> dict[str, object]:
         return self.inner.build_request(**kwargs)  # type: ignore[arg-type]
 
-    def release_session(self, session_id: str, utterance_epoch: int) -> None:
-        self.releases.append((session_id, utterance_epoch))
-        self.inner.release_session(session_id, utterance_epoch)
+    def release_session(self, session_id: str) -> None:
+        self.releases.append(session_id)
+        self.inner.release_session(session_id)
 
 
 @pytest.mark.parametrize("runner_name", ("_run_mode", "_run_validation_mode"))
@@ -684,7 +681,7 @@ def test_normal_benchmark_releases_adapter_metadata_after_final_request(
         )
     )
 
-    assert adapter.releases == [("benchmark:zh-001:2:0:measured-0", 0)]
+    assert adapter.releases == ["benchmark:zh-001:2:0:measured-0"]
 
 
 def test_failed_prefix_reset_stops_before_encoder_reset_or_replay(

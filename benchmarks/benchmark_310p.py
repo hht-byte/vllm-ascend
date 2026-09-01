@@ -146,7 +146,6 @@ class _WindowedAdapter(Protocol):
         self,
         *,
         session_id: str,
-        utterance_epoch: int,
         accumulated_audio: np.ndarray,
         sample_rate: int,
         window_sec: int,
@@ -154,7 +153,7 @@ class _WindowedAdapter(Protocol):
         prompt: str,
     ) -> dict[str, object]: ...
 
-    def release_session(self, session_id: str, utterance_epoch: int) -> None: ...
+    def release_session(self, session_id: str) -> None: ...
 
 
 class _Engine(Protocol):
@@ -643,9 +642,6 @@ def _adapter(model: str, window_seconds: int) -> _WindowedAdapter:
         _WindowedAdapter,
         package.WindowedRequestAdapter(
             package.WindowCacheConfig(
-                model_fingerprint=model,
-                feature_extractor_fingerprint="vllm-qwen3-asr-0.23.0",
-                audio_encoder_fingerprint="qwen3-asr-1.7b-audio-tower",
                 supported_window_seconds=(window_seconds,),
             )
         ),
@@ -712,7 +708,6 @@ async def _generate_one(
     sample_count = round(checkpoint * record.sample_rate)
     request = adapter.build_request(
         session_id=session_id,
-        utterance_epoch=options.iteration,
         accumulated_audio=audio[:sample_count],
         sample_rate=record.sample_rate,
         window_sec=window_seconds,
@@ -935,8 +930,7 @@ async def _run_mode(
                             window_seconds,
                             iteration_options,
                             session_suffix,
-                        ),
-                        iteration_options.iteration,
+                        )
                     )
 
         for warmup_iteration in range(warmup_iterations):
@@ -1083,7 +1077,7 @@ async def _run_validation_mode(
                 )
                 results.append(retry)
             finally:
-                adapter.release_session(target_session, options.iteration)
+                adapter.release_session(target_session)
 
             if mode == "reuse":
                 reset_successful = await engine.reset_prefix_cache()
@@ -1134,7 +1128,7 @@ async def _run_validation_mode(
                 )
                 results.append(lru_warm_retry)
             finally:
-                adapter.release_session(target_session, options.iteration)
+                adapter.release_session(target_session)
 
             for pressure_index in range(lru_pressure_requests):
                 pressure_suffix = f"pressure-{pressure_index}"
@@ -1154,9 +1148,7 @@ async def _run_validation_mode(
                         session_suffix=pressure_suffix,
                     )
                 finally:
-                    adapter.release_session(
-                        pressure_session, options.iteration
-                    )
+                    adapter.release_session(pressure_session)
             try:
                 pressure_replay = await _run_exact_final_retry(
                     engine=engine,
@@ -1184,7 +1176,7 @@ async def _run_validation_mode(
                     )
                 results.append(pressure_replay)
             finally:
-                adapter.release_session(target_session, options.iteration)
+                adapter.release_session(target_session)
 
             recreated_suffix = "recreated"
             recreated_session = _session_id(
@@ -1203,7 +1195,7 @@ async def _run_validation_mode(
                     session_suffix=recreated_suffix,
                 )
             finally:
-                adapter.release_session(recreated_session, options.iteration)
+                adapter.release_session(recreated_session)
             try:
                 recreated_again = await _run_record_stream(
                     engine=engine,
@@ -1218,7 +1210,7 @@ async def _run_validation_mode(
                 )
                 results.extend(recreated_again)
             finally:
-                adapter.release_session(recreated_session, options.iteration)
+                adapter.release_session(recreated_session)
         return results
     finally:
         engine.shutdown()

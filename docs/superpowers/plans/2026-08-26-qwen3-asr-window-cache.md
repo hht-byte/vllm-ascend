@@ -10,6 +10,8 @@
 
 **Runtime ruling (2026-08-28):** 生产实际运行 Python 3.12，因此用户裁决以 `>=3.12,<3.13` 和 py312 静态门禁覆盖原计划的 Python 3.11 假设；不再声明或机械验证 Python 3.11 兼容性。
 
+**Identity ruling (2026-09-01):** 现有 Session API 保证每个 `session_id` 同时只有一条串行推理链，并在下一条 VAD 语句前调用 `release_session(session_id)`；因此公共 API 不再要求 `utterance_epoch`。Engine 生命周期固定模型、Processor 和音频塔，升级时重启 Engine 并清空缓存，所以窗口身份仅由 Session namespace、窗口序号和 PCM SHA-256 构成。
+
 **Spec:** `docs/superpowers/specs/2026-08-26-qwen3-asr-window-cache-design.md`
 
 ## Global Constraints
@@ -70,14 +72,10 @@ docs/310p-validation.md                              # 310P 正确性、性能�
 ```python
 @dataclass(frozen=True, slots=True)
 class WindowCacheConfig:
-    model_fingerprint: str
-    feature_extractor_fingerprint: str
-    audio_encoder_fingerprint: str
     supported_window_seconds: tuple[int, ...] = (2, 4, 8)
     sample_rate: int = 16_000
     max_audio_seconds: int = 10
     max_audio_windows: int = 5
-    adapter_schema_version: str = "1"
 
 @dataclass(frozen=True, slots=True)
 class AudioWindow:
@@ -138,7 +136,7 @@ def split_audio_windows(
 
 - [ ] 运行 `python -m pytest tests/unit/test_config.py tests/unit/test_windowing.py`；预期失败为 `ModuleNotFoundError: No module named 'qwen3_asr_window_cache'`，不能是测试语法错误。
 
-- [ ] 在 `errors.py` 定义规格中的异常层次；在 `config.py` 的 `__post_init__` 校验非空指纹、正采样率、支持窗口和最大窗口覆盖关系；在 `windowing.py` 先完整校验、再用连续 slice 产生 `AudioWindow`，不复制 PCM。
+- [ ] 在 `errors.py` 定义规格中的异常层次；在 `config.py` 的 `__post_init__` 校验采样率、支持窗口和最大窗口覆盖关系；在 `windowing.py` 先完整校验、再用连续 slice 产生 `AudioWindow`，不复制 PCM。
 
   ```python
   full_count, remainder = divmod(audio.size, window_samples)
@@ -173,26 +171,21 @@ def split_audio_windows(
 
 ```python
 def canonical_pcm_digest(samples: np.ndarray) -> bytes: ...
-def build_session_namespace(
-    *, session_id: str, utterance_epoch: int, model_fingerprint: str
-) -> str: ...
+def build_session_namespace(*, session_id: str) -> str: ...
 def build_window_id(
-    *, namespace: str, window: AudioWindow, window_sec: int,
-    feature_extractor_fingerprint: str,
-    audio_encoder_fingerprint: str,
-    adapter_schema_version: str,
+    *, namespace: str, window: AudioWindow,
 ) -> str: ...
 ```
 
-- [ ] 写 `tests/unit/test_identity.py`，先固定以下安全性质：相同输入重试 ID 相同；open 尾窗增长后 ID 改变；sealed 前窗 ID 保持；Session、epoch、窗口位置、窗口大小、PCM、模型/预处理/encoder/schema 任一变化都会改变 ID。
+- [ ] 写 `tests/unit/test_identity.py`，先固定以下安全性质：相同输入重试 ID 相同；open 尾窗增长后 ID 改变；sealed 前窗 ID 保持；Session、窗口序号或 PCM 任一变化都会改变 ID。
 
   ```python
-  first = ids_for(audio_6s, session_id="u1", epoch=7, window_sec=4)
-  second = ids_for(audio_8s, session_id="u1", epoch=7, window_sec=4)
+  first = ids_for(audio_6s, session_id="u1", window_sec=4)
+  second = ids_for(audio_8s, session_id="u1", window_sec=4)
   assert first[0] == second[0]
   assert first[1] != second[1]
-  assert ids_for(audio_8s_changed_at_sample_3, "u1", 7, 4)[0] != second[0]
-  assert ids_for(audio_8s, "u2", 7, 4)[0] != second[0]
+  assert ids_for(audio_8s_changed_at_sample_3, "u1", 4)[0] != second[0]
+  assert ids_for(audio_8s, "u2", 4)[0] != second[0]
   ```
 
 - [ ] 增加 canonical PCM 测试：hash 对 C-contiguous little-endian `float32` 的 byte representation 确定；函数拒绝 dtype/维度/连续性不合规输入；`-0.0` 与 `+0.0` 不被擅自归一化；NaN payload 按原始字节参与身份。
@@ -205,11 +198,9 @@ def build_window_id(
   def _sha256_cbor(payload: object) -> str:
       return hashlib.sha256(cbor2.dumps(payload, canonical=True)).hexdigest()
 
-  namespace = _sha256_cbor(("qwen3-asr-session-v1", session_id, epoch, model_fp))
+  namespace = _sha256_cbor(("qwen3-asr-session-v2", session_id))
   window_id = _sha256_cbor((
-      "qwen3-asr-window-v1", namespace, window.index, window_sec,
-      window.start_sample, window.end_sample, pcm_digest,
-      feature_fp, encoder_fp, schema_version,
+      "qwen3-asr-window-v2", namespace, window.index, pcm_digest,
   ))
   ```
 
@@ -285,12 +276,12 @@ class WindowedRequestAdapter:
     def __init__(self, config: WindowCacheConfig) -> None: ...
 
     def build_request(
-        self, *, session_id: str, utterance_epoch: int,
+        self, *, session_id: str,
         accumulated_audio: np.ndarray, sample_rate: int,
         window_sec: int, is_final: bool, prompt: str,
     ) -> dict[str, object]: ...
 
-    def release_session(self, session_id: str, utterance_epoch: int) -> None: ...
+    def release_session(self, session_id: str) -> None: ...
 ```
 
 - [ ] 写 happy-path 测试，以同一 Session 的 6s→8s→10s、4 秒窗口连续调用；断言返回 dict 可直接作为 vLLM PromptType、数组与 UUID 一一对应、cache salt 稳定、0–4 秒 UUID 三轮相同、4–8 秒 UUID 在 8s/10s 相同、open 尾窗增长时 UUID 改变。
@@ -299,7 +290,6 @@ class WindowedRequestAdapter:
   def build(samples: np.ndarray, *, is_final: bool) -> dict[str, object]:
       return adapter.build_request(
           session_id="session-a",
-          utterance_epoch=1,
           accumulated_audio=samples,
           sample_rate=16_000,
           window_sec=4,
@@ -318,13 +308,13 @@ class WindowedRequestAdapter:
   )
   ```
 
-- [ ] 写状态机测试：长度回退；同 epoch 改窗口；final 后追加；完全相同 final 幂等重试；`release_session` 幂等；release 后同 key 可作为新状态进入；同一 `session_id` 不同 epoch、不同 Session 完全隔离。
+- [ ] 写状态机测试：长度回退；同一 Session 改窗口；final 后追加；完全相同 final 幂等重试；`release_session` 幂等；release 后同 `session_id` 可作为下一条 VAD 语句进入；不同 Session 完全隔离。
 
 - [ ] 写历史 PCM 修改测试：长度增长时若旧 sealed 区域内容改变，Adapter 不错误拒绝，但受影响窗口 UUID 必须变化，未受影响窗口保持；相同长度但不同内容的非 final 请求也必须安全失效旧 UUID。
 
 - [ ] 运行 `python -m pytest tests/unit/test_request_adapter.py`；确认失败来自缺少 Adapter。
 
-- [ ] 实现私有 `_SessionState(window_sec, model_fingerprint, last_sample_count, last_audio_digest, finished)`；用 `(session_id, utterance_epoch)` 为 key。所有输入、prompt、窗口和身份先计算成功，再一次性提交状态，保证异常调用不污染状态。
+- [ ] 实现私有 `_SessionState(window_sec, last_sample_count, finished, final_request_digest)`；用 `session_id` 为 key。所有输入、prompt、窗口和身份先计算成功，再一次性提交状态，保证异常调用不污染状态。
 
 - [ ] 返回准确结构；固定采样率时每个 audio item 直接传 NumPy 一维数组，不包装重采样 tuple：
 

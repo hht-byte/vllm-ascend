@@ -61,11 +61,7 @@ WINDOW_2_OPEN_EMBEDDING = FakeEmbedding(
 
 
 def config() -> WindowCacheConfig:
-    return WindowCacheConfig(
-        model_fingerprint="model-v1",
-        feature_extractor_fingerprint="extractor-v1",
-        audio_encoder_fingerprint="encoder-v1",
-    )
+    return WindowCacheConfig()
 
 
 def pcm(seconds: int = 10) -> np.ndarray:
@@ -81,12 +77,10 @@ def build(
     *,
     window_sec: int,
     session_id: str = "session-a",
-    utterance_epoch: int = 1,
     is_final: bool = False,
 ) -> dict[str, object]:
     return adapter.build_request(
         session_id=session_id,
-        utterance_epoch=utterance_epoch,
         accumulated_audio=samples,
         sample_rate=SAMPLE_RATE,
         window_sec=window_sec,
@@ -371,31 +365,23 @@ def test_identical_final_retry_exposes_encoder_lru_eviction(
     assert retry.token_ids == full.token_ids
 
 
-def test_session_and_epoch_identity_do_not_share_encoder_or_prefix_entries() -> None:
+def test_distinct_session_identity_does_not_share_encoder_or_prefix_entries() -> None:
     adapter = WindowedRequestAdapter(config())
     audio = pcm(8)
     cached = FakeLLM(encoder_capacity=8, hash_block_size=4)
     requests = [
         build(adapter, audio, window_sec=4, session_id="session-a", is_final=True),
         build(adapter, audio, window_sec=4, session_id="session-b", is_final=True),
-        build(
-            adapter,
-            audio,
-            window_sec=4,
-            session_id="session-a",
-            utterance_epoch=2,
-            is_final=True,
-        ),
     ]
 
     traces = [cached.run(request) for request in requests]
 
     assert all(trace.encoder == ["miss", "miss"] for trace in traces)
     assert all(trace.prefix == ["miss", "miss", "miss"] for trace in traces)
-    assert len({str(request["cache_salt"]) for request in requests}) == 3
-    assert len({identifier for request in requests for identifier in audio_ids(request)}) == 6
-    assert traces[0].embeddings == traces[1].embeddings == traces[2].embeddings
-    assert traces[0].token_ids == traces[1].token_ids == traces[2].token_ids
+    assert len({str(request["cache_salt"]) for request in requests}) == 2
+    assert len({identifier for request in requests for identifier in audio_ids(request)}) == 4
+    assert traces[0].embeddings == traces[1].embeddings
+    assert traces[0].token_ids == traces[1].token_ids
 
 
 def test_historical_sealed_pcm_change_invalidates_affected_encoder_and_kv_tail() -> None:

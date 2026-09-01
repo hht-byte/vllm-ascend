@@ -10,29 +10,15 @@ _MAX_AUDIO_WINDOWS = 5
 
 @dataclass(frozen=True, slots=True)
 class WindowCacheConfig:
-    """Validated CPU-only limits and cache identity fingerprints."""
+    """Validated CPU-only audio window limits."""
 
-    model_fingerprint: str
-    feature_extractor_fingerprint: str
-    audio_encoder_fingerprint: str
     supported_window_seconds: tuple[int, ...] = (2, 4, 8)
     sample_rate: int = _TARGET_SAMPLE_RATE
     max_audio_seconds: int = _MAX_AUDIO_SECONDS
     max_audio_windows: int = _MAX_AUDIO_WINDOWS
-    adapter_schema_version: str = "1"
 
     def __post_init__(self) -> None:
-        self._validate_fingerprints()
         self._validate_limits()
-
-    def _validate_fingerprints(self) -> None:
-        for field_name, value in (
-            ("model_fingerprint", self.model_fingerprint),
-            ("feature_extractor_fingerprint", self.feature_extractor_fingerprint),
-            ("audio_encoder_fingerprint", self.audio_encoder_fingerprint),
-        ):
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{field_name} must be a non-empty string")
 
     def _validate_limits(self) -> None:
         if type(self.sample_rate) is not int or self.sample_rate != _TARGET_SAMPLE_RATE:

@@ -54,7 +54,7 @@
 - `vllm-ascend==0.23.0`；
 - Qwen3-ASR-1.7B；
 - 单个 vLLM Engine 绑定一张 Ascend 310P；
-- 多个用户 Session 可并发，但同一个 `(session_id, utterance_epoch)` 的推理请求串行执行。
+- 多个用户 Session 可并发，但同一个 `session_id` 的推理请求串行执行。
 
 Python 边界按 2026-08-28 用户确认的生产环境收敛到 3.12；本交付不声明 Python 3.11 兼容性。
 
@@ -94,13 +94,12 @@ vLLM-Ascend 0.23 / Ascend 310P
 
 ### 6.1 输入
 
-Adapter 在现有服务初始化时接收不可变配置，其中包含模型、音频预处理和缓存 schema 指纹。单次调用接口为：
+Adapter 在现有服务初始化时接收窗口和音频限制配置。模型、预处理器与 Audio Tower 固定绑定 Engine 生命周期，升级时重启 Engine。单次调用接口为：
 
 ```python
 build_request(
     *,
     session_id: str,
-    utterance_epoch: int,
     accumulated_audio: numpy.ndarray,
     sample_rate: int,
     window_sec: int,
@@ -112,10 +111,9 @@ build_request(
 约束：
 
 - `session_id` 必须是精确的 `str`，不得为空或仅由空白字符组成；非空值中的前后空白保留并参与身份计算，不做隐式归一化；
-- `utterance_epoch` 必须是精确的非负 `int`，`bool` 不作为整数接受；
 - `accumulated_audio` 是 mono、16 kHz、C-contiguous `float32`；
 - `window_sec` 只能是 2、4 或 8；
-- 同一个 `(session_id, utterance_epoch)` 内 `window_sec` 不可改变；Adapter 的模型指纹在进程生命周期内不可改变；
+- 同一个 `session_id` 在 `release_session` 前不可改变 `window_sec`；
 - 累计采样数只能单调增加或在幂等重试时保持不变；
 - `prompt` 必须恰好包含一个原生 Qwen3-ASR 音频占位区间：
   `<|audio_start|><|audio_pad|><|audio_end|>`；
@@ -126,7 +124,7 @@ Adapter 不重新采样、不做 VAD、不修改现有文本前缀。
 现有服务收到最终推理结果并完成 Session 清理时调用：
 
 ```python
-release_session(session_id: str, utterance_epoch: int) -> None
+release_session(session_id: str) -> None
 ```
 
 ### 6.2 输出
@@ -215,27 +213,21 @@ PCM 在哈希前使用规范形式：
 - C-contiguous；
 - 哈希后不得再执行会改变数值的归一化。
 
-所有公开命名空间和 Adapter 状态键操作都先执行同一组 Session scope 校验：`session_id` 是精确的非空、非纯空白 `str`，`utterance_epoch` 是精确的非负 `int` 且不是 `bool`。校验必须发生在构造字典键或读取、写入、释放状态之前，避免 Python 的 `1 == True` 键别名跨逻辑 Session 访问状态。
+所有公开命名空间和 Adapter 状态键操作都先校验 `session_id` 是精确的非空、非纯空白 `str`。校验必须发生在构造字典键或读取、写入、释放状态之前。
 
 身份计算：
 
 ```text
 session_namespace = SHA256(
-    session_id,
-    utterance_epoch,
-    model_fingerprint
+    "qwen3-asr-session-v2",
+    session_id
 )
 
 window_id = SHA256-CBOR(
+    "qwen3-asr-window-v2",
     session_namespace,
     window_index,
-    window_sec,
-    start_sample,
-    end_sample,
-    SHA256(canonical_pcm_bytes),
-    feature_extractor_fingerprint,
-    audio_encoder_fingerprint,
-    adapter_schema_version
+    SHA256(canonical_pcm_bytes)
 )
 ```
 
@@ -244,8 +236,8 @@ window_id = SHA256-CBOR(
 - 同一个稳定窗口在后续请求中得到相同 ID；
 - 开放窗口内容增长时 ID 改变；
 - 完全相同请求重试时 ID 不变；
-- PCM、位置、窗口大小、模型或预处理配置任一变化都会失效；
-- Session 和 epoch 参与命名空间，禁止跨用户或跨语句共享缓存。
+- PCM、窗口序号或 Session 任一变化都会失效；位置和窗口时长不重复进入内容身份；
+- Session 参与命名空间，禁止跨用户共享缓存；同 Session 新语句由 `release_session` 与现有 `inference_seq` 保证生命周期。
 
 `multi_modal_uuids` 使用 `window_id`。`cache_salt` 使用 `session_namespace`，作为 vLLM Prefix Cache 的额外用户隔离层。
 
@@ -300,9 +292,8 @@ vLLM 0.23 的 `CacheConfig.hash_block_size` 支持比物理块更细的前缀哈
 Adapter 只保存小型 CPU 元数据：
 
 ```text
-(session_id, utterance_epoch)
+session_id
   -> window_sec
-  -> model_fingerprint
   -> last_sample_count
   -> finished
 ```
@@ -311,8 +302,8 @@ Adapter 只保存小型 CPU 元数据：
 
 规则：
 
-- 同一 Session/epoch 最多一个 `AsyncLLM` 请求执行；该串行约束继续由现有 Session API 服务保证；
-- `inference_seq` 和请求 ID 继续由现有 Session API 服务生成，推荐请求 ID 格式为 `session_id:utterance_epoch:inference_seq`；Adapter 不生成请求 ID，也不负责任务结果排序；
+- 同一 Session 最多一个 `AsyncLLM` 请求执行；该串行约束继续由现有 Session API 服务保证；
+- `inference_seq` 和请求 ID 继续由现有 Session API 服务生成；Adapter 不生成请求 ID，也不负责任务结果排序；
 - 幂等重试允许相同累计长度和内容；
 - 旧结果只有在 `inference_seq` 仍为最新时才由现有 Session API 服务接受；
 - `is_final=true` 后状态标记为已结束；完全相同的 final 请求允许幂等重试，任何音频追加都被拒绝；
@@ -324,13 +315,12 @@ Adapter 只保存小型 CPU 元数据：
 Adapter 定义：
 
 - `InvalidSessionId`：Session ID 不是精确的非空、非纯空白 `str`；
-- `InvalidUtteranceEpoch`：epoch 不是精确的非负 `int`，包括 `bool`；
 - `InvalidAudioFormat`：非 mono、非 `float32` 或数组不合法；
 - `InvalidSampleRate`：采样率不是 16 kHz；
 - `InvalidWindowSize`：窗口不是 2、4、8 秒之一；
 - `AudioTooLong`：累计音频超过 10 秒；
-- `AudioLengthRegressed`：同一 epoch 累计长度缩短；
-- `WindowConfigChanged`：同一 epoch 修改窗口或模型指纹；
+- `AudioLengthRegressed`：同一 Session 在释放前累计长度缩短；
+- `WindowConfigChanged`：同一 Session 在释放前修改窗口；
 - `InvalidPromptPlaceholder`：音频占位区间缺失或不唯一；
 - `SessionAlreadyFinished`：已结束语句继续追加；
 - `UnsupportedRuntimeVersion`：vLLM 或 vLLM-Ascend 版本不匹配；
@@ -466,7 +456,7 @@ reuse：稳定窗口 UUID；启用 Encoder Cache 和 Prefix Cache
 - 最终语言和转写文本一致；
 - 多语言 CER/WER 不发生变化；
 - 重试、缓存淘汰和 Session 重建不改变结果；
-- Prefix Cache reset 必须返回成功，并在释放 Adapter 元数据后以同一个 Session/epoch/namespace 重放，首个重放请求必须观测到零 cached prefix tokens；
+- Prefix Cache reset 必须返回成功，并在释放 Adapter 元数据后以同一个 Session/namespace 重放，首个重放请求必须观测到零 cached prefix tokens；
 - LRU 压力前先对同一个目标 namespace 做 exact-final warm retry，压力 Session 使用不同 cache salt 并释放 CPU 元数据，之后重放同一目标 namespace；只有 cached token 相对 warm retry 降低时才认证 `after_lru_pressure`，否则该次运行仅为诊断并要求增加压力后重跑；
 - embedding 和 logits 输出 dtype 相关的数值误差报告，不要求不同 NPU kernel 路径逐 bit 一致。
 

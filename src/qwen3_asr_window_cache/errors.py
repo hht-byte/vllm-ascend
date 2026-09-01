@@ -17,10 +17,6 @@ class InvalidSessionId(WindowCacheError):
     """Raised when a cache namespace receives an invalid Session identifier."""
 
 
-class InvalidUtteranceEpoch(WindowCacheError):
-    """Raised when a cache namespace receives an invalid utterance epoch."""
-
-
 class InvalidAudioFormat(WindowCacheError):
     """Raised when PCM is not a non-empty mono C-contiguous float32 array."""
 
@@ -42,11 +38,11 @@ class TooManyAudioWindows(WindowCacheError):
 
 
 class AudioLengthRegressed(WindowCacheError):
-    """Raised when accumulated PCM becomes shorter within one utterance epoch."""
+    """Raised when accumulated PCM becomes shorter before Session release."""
 
 
 class WindowConfigChanged(WindowCacheError):
-    """Raised when stable window or model identity changes within an epoch."""
+    """Raised when stable window size changes before Session release."""
 
 
 class InvalidPromptPlaceholder(WindowCacheError):

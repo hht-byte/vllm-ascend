@@ -14,7 +14,6 @@ from qwen3_asr_window_cache import (
     InvalidPromptPlaceholder,
     InvalidSampleRate,
     InvalidSessionId,
-    InvalidUtteranceEpoch,
     InvalidWindowSize,
     SessionAlreadyFinished,
     WindowCacheConfig,
@@ -25,11 +24,7 @@ from qwen3_asr_window_cache import request_adapter as request_adapter_module
 
 
 def config(**overrides: Any) -> WindowCacheConfig:
-    settings: dict[str, Any] = {
-        "model_fingerprint": "model-v1",
-        "feature_extractor_fingerprint": "extractor-v1",
-        "audio_encoder_fingerprint": "encoder-v1",
-    }
+    settings: dict[str, Any] = {}
     settings.update(overrides)
     return WindowCacheConfig(**settings)
 
@@ -43,7 +38,6 @@ def build(
     samples: np.ndarray,
     *,
     session_id: str = "session-a",
-    utterance_epoch: int = 1,
     sample_rate: int = 16_000,
     window_sec: int = 4,
     is_final: bool = False,
@@ -51,7 +45,6 @@ def build(
 ) -> dict[str, object]:
     return adapter.build_request(
         session_id=session_id,
-        utterance_epoch=utterance_epoch,
         accumulated_audio=samples,
         sample_rate=sample_rate,
         window_sec=window_sec,
@@ -209,37 +202,11 @@ def test_release_is_idempotent_and_allows_the_same_key_to_start_fresh() -> None:
     audio = pcm(6)
     build(adapter, audio, is_final=True)
 
-    adapter.release_session("session-a", 1)
-    adapter.release_session("session-a", 1)
+    adapter.release_session("session-a")
+    adapter.release_session("session-a")
 
     result = build(adapter, audio[:32_000], window_sec=2)
     assert len(audio_items(result)) == 1
-
-
-@pytest.mark.parametrize("invalid_epoch", [True, -1, 1.0])
-def test_invalid_epoch_cannot_read_or_release_epoch_one_state(
-    invalid_epoch: object,
-) -> None:
-    adapter = WindowedRequestAdapter(config())
-    audio = pcm(8)
-    final = build(adapter, audio[:96_000], utterance_epoch=1, is_final=True)
-
-    with pytest.raises(InvalidUtteranceEpoch):
-        build(
-            adapter,
-            audio[:96_000],
-            utterance_epoch=invalid_epoch,  # type: ignore[arg-type]
-            is_final=True,
-        )
-    with pytest.raises(InvalidUtteranceEpoch):
-        adapter.release_session(
-            "session-a",
-            invalid_epoch,  # type: ignore[arg-type]
-        )
-
-    assert audio_ids(build(adapter, audio[:96_000], is_final=True)) == audio_ids(final)
-    with pytest.raises(SessionAlreadyFinished):
-        build(adapter, audio, is_final=True)
 
 
 @pytest.mark.parametrize("invalid_session_id", ["", "  ", 1, True, None])
@@ -260,7 +227,6 @@ def test_invalid_session_id_cannot_create_or_release_session_state(
     with pytest.raises(InvalidSessionId):
         adapter.release_session(
             invalid_session_id,  # type: ignore[arg-type]
-            1,
         )
 
     assert audio_ids(build(adapter, audio[:96_000], is_final=True)) == audio_ids(final)
@@ -268,17 +234,13 @@ def test_invalid_session_id_cannot_create_or_release_session_state(
         build(adapter, audio, is_final=True)
 
 
-def test_session_and_epoch_state_are_isolated() -> None:
+def test_session_state_isolated_and_release_starts_next_utterance() -> None:
     adapter = WindowedRequestAdapter(config())
     audio = pcm(8)
     build(adapter, audio[:96_000], is_final=True)
 
-    next_epoch = build(
-        adapter,
-        audio[:32_000],
-        utterance_epoch=2,
-        window_sec=2,
-    )
+    adapter.release_session("session-a")
+    next_utterance = build(adapter, audio[:32_000], window_sec=2)
     other_session = build(
         adapter,
         audio[:32_000],
@@ -286,9 +248,9 @@ def test_session_and_epoch_state_are_isolated() -> None:
         window_sec=2,
     )
 
-    assert len(audio_items(next_epoch)) == 1
+    assert len(audio_items(next_utterance)) == 1
     assert len(audio_items(other_session)) == 1
-    assert next_epoch["cache_salt"] != other_session["cache_salt"]
+    assert next_utterance["cache_salt"] != other_session["cache_salt"]
 
 
 def test_changed_historical_pcm_invalidates_only_affected_window_on_growth() -> None:

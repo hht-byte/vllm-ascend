@@ -5,7 +5,7 @@ import hashlib
 import cbor2
 import numpy as np
 
-from .errors import InvalidSessionId, InvalidUtteranceEpoch
+from .errors import InvalidSessionId
 from .windowing import AudioWindow
 
 
@@ -32,23 +32,14 @@ def canonical_pcm_digest(samples: np.ndarray) -> bytes:
     return hashlib.sha256(byte_view).digest()
 
 
-def build_session_namespace(
-    *, session_id: str, utterance_epoch: int, model_fingerprint: str
-) -> str:
-    """Build a stable, session- and epoch-scoped cache namespace."""
-    session_id, utterance_epoch = validate_session_scope(
-        session_id=session_id,
-        utterance_epoch=utterance_epoch,
-    )
-    return _sha256_cbor(
-        ("qwen3-asr-session-v1", session_id, utterance_epoch, model_fingerprint)
-    )
+def build_session_namespace(*, session_id: str) -> str:
+    """Build a stable cache namespace for one serialized business Session."""
+    session_id = validate_session_id(session_id)
+    return _sha256_cbor(("qwen3-asr-session-v2", session_id))
 
 
-def validate_session_scope(
-    *, session_id: object, utterance_epoch: object
-) -> tuple[str, int]:
-    """Validate one exact, non-normalized Session/epoch namespace key.
+def validate_session_id(session_id: object) -> str:
+    """Validate one exact, non-normalized Session namespace key.
 
     Whitespace-only identifiers are rejected. Other whitespace is preserved so
     callers cannot accidentally collapse two distinct upstream identifiers.
@@ -57,34 +48,20 @@ def validate_session_scope(
         raise InvalidSessionId(
             "session_id must be an exact non-empty, non-whitespace string"
         )
-    if type(utterance_epoch) is not int or utterance_epoch < 0:
-        raise InvalidUtteranceEpoch(
-            "utterance_epoch must be an exact non-negative integer"
-        )
-    return session_id, utterance_epoch
+    return session_id
 
 
 def build_window_id(
     *,
     namespace: str,
     window: AudioWindow,
-    window_sec: int,
-    feature_extractor_fingerprint: str,
-    audio_encoder_fingerprint: str,
-    adapter_schema_version: str,
 ) -> str:
-    """Build a stable content and configuration identity for one window."""
+    """Build a stable per-item identity from Session, occurrence and PCM."""
     payload = (
-        "qwen3-asr-window-v1",
+        "qwen3-asr-window-v2",
         namespace,
         window.index,
-        window_sec,
-        window.start_sample,
-        window.end_sample,
         canonical_pcm_digest(window.samples),
-        feature_extractor_fingerprint,
-        audio_encoder_fingerprint,
-        adapter_schema_version,
     )
     return _sha256_cbor(payload)
 

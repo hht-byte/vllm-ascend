@@ -20,7 +20,7 @@ from .identity import (
     build_session_namespace,
     build_window_id,
     canonical_pcm_digest,
-    validate_session_scope,
+    validate_session_id,
 )
 from .prompt_builder import build_windowed_prompt
 from .windowing import split_audio_windows
@@ -29,9 +29,7 @@ from .windowing import split_audio_windows
 @dataclass(frozen=True, slots=True)
 class _SessionState:
     window_sec: int
-    model_fingerprint: str
     last_sample_count: int
-    last_audio_digest: bytes
     finished: bool
     final_request_digest: bytes | None
 
@@ -47,14 +45,13 @@ class WindowedRequestAdapter:
 
     def __init__(self, config: WindowCacheConfig) -> None:
         self._config = config
-        self._states: dict[tuple[str, int], _SessionState] = {}
+        self._states: dict[str, _SessionState] = {}
         self._lock = RLock()
 
     def build_request(
         self,
         *,
         session_id: str,
-        utterance_epoch: int,
         accumulated_audio: np.ndarray,
         sample_rate: int,
         window_sec: int,
@@ -62,11 +59,8 @@ class WindowedRequestAdapter:
         prompt: str,
     ) -> dict[str, object]:
         """Validate and assemble one request, then atomically commit metadata."""
-        session_id, utterance_epoch = validate_session_scope(
-            session_id=session_id,
-            utterance_epoch=utterance_epoch,
-        )
-        key = (session_id, utterance_epoch)
+        session_id = validate_session_id(session_id)
+        key = session_id
         with self._lock:
             if (
                 type(window_sec) is not int
@@ -92,28 +86,17 @@ class WindowedRequestAdapter:
                 )
 
             windowed_prompt = build_windowed_prompt(prompt, window_count=len(windows))
-            namespace = build_session_namespace(
-                session_id=session_id,
-                utterance_epoch=utterance_epoch,
-                model_fingerprint=self._config.model_fingerprint,
-            )
+            namespace = build_session_namespace(session_id=session_id)
             window_ids = [
                 build_window_id(
                     namespace=namespace,
                     window=window,
-                    window_sec=window_sec,
-                    feature_extractor_fingerprint=(
-                        self._config.feature_extractor_fingerprint
-                    ),
-                    audio_encoder_fingerprint=(self._config.audio_encoder_fingerprint),
-                    adapter_schema_version=self._config.adapter_schema_version,
                 )
                 for window in windows
             ]
             audio_digest = canonical_pcm_digest(accumulated_audio)
             request_digest = self._request_digest(
                 session_id=session_id,
-                utterance_epoch=utterance_epoch,
                 sample_rate=sample_rate,
                 window_sec=window_sec,
                 is_final=is_final,
@@ -135,42 +118,33 @@ class WindowedRequestAdapter:
                             "finished session accepts only an identical final retry"
                         )
                     return result
-                if (
-                    previous.window_sec != window_sec
-                    or previous.model_fingerprint != self._config.model_fingerprint
-                ):
+                if previous.window_sec != window_sec:
                     raise WindowConfigChanged(
-                        "window or model configuration changed within an epoch"
+                        "window configuration changed before Session release"
                     )
                 if accumulated_audio.size < previous.last_sample_count:
                     raise AudioLengthRegressed(
-                        "accumulated audio became shorter within an epoch"
+                        "accumulated audio became shorter before Session release"
                     )
 
             self._states[key] = _SessionState(
                 window_sec=window_sec,
-                model_fingerprint=self._config.model_fingerprint,
                 last_sample_count=accumulated_audio.size,
-                last_audio_digest=audio_digest,
                 finished=is_final,
                 final_request_digest=request_digest if is_final else None,
             )
             return result
 
-    def release_session(self, session_id: str, utterance_epoch: int) -> None:
+    def release_session(self, session_id: str) -> None:
         """Idempotently discard CPU metadata for one utterance."""
-        session_id, utterance_epoch = validate_session_scope(
-            session_id=session_id,
-            utterance_epoch=utterance_epoch,
-        )
+        session_id = validate_session_id(session_id)
         with self._lock:
-            self._states.pop((session_id, utterance_epoch), None)
+            self._states.pop(session_id, None)
 
     def _request_digest(
         self,
         *,
         session_id: str,
-        utterance_epoch: int,
         sample_rate: int,
         window_sec: int,
         is_final: bool,
@@ -178,17 +152,12 @@ class WindowedRequestAdapter:
         prompt: str,
     ) -> bytes:
         payload = (
-            "qwen3-asr-final-request-v1",
+            "qwen3-asr-final-request-v2",
             session_id,
-            utterance_epoch,
             sample_rate,
             window_sec,
             is_final,
             audio_digest,
             prompt,
-            self._config.model_fingerprint,
-            self._config.feature_extractor_fingerprint,
-            self._config.audio_encoder_fingerprint,
-            self._config.adapter_schema_version,
         )
         return hashlib.sha256(cbor2.dumps(payload, canonical=True)).digest()

@@ -37,7 +37,7 @@ export QWEN3_ASR_310P_HASH_BLOCK_SIZE=32
 python -m pytest -m npu tests/integration/test_310p_equivalence.py -vv
 ```
 
-测试逐条检查 2/4/8 秒窗口下 cache-off 与 reuse 的 greedy token IDs、语言字段和文本，并覆盖稳定累计请求、显式 Encoder/Prefix Cache reset、唯一 Session 的 LRU 压力、`release_session` 后同 Session/epoch 重建。Prefix reset 必须返回成功；Adapter 同一 scope 元数据和 Encoder Cache 被释放/重置后，使用同一 Session/epoch/namespace 的首个重放请求必须观测 `num_cached_tokens == 0`。LRU 场景先记录目标 namespace 的 exact-final warm retry，释放 Adapter CPU 元数据，再用不同 cache salt 施压并重放同一目标；只有重放 cached token 比 warm retry 减少才认证 `after_lru_pressure`，否则失败并提示增加压力。失败时仅保存 record ID、窗口、checkpoint、场景与两侧输出的最小复现 JSON，不保存音频或 Session ID。
+测试逐条检查 2/4/8 秒窗口下 cache-off 与 reuse 的 greedy token IDs、语言字段和文本，并覆盖稳定累计请求、显式 Encoder/Prefix Cache reset、唯一 Session 的 LRU 压力、`release_session` 后同 Session 重建。Prefix reset 必须返回成功；Adapter 同一 Session 元数据和 Encoder Cache 被释放/重置后，使用同一 Session/namespace 的首个重放请求必须观测 `num_cached_tokens == 0`。LRU 场景先记录目标 namespace 的 exact-final warm retry，释放 Adapter CPU 元数据，再用不同 cache salt 施压并重放同一目标；只有重放 cached token 比 warm retry 减少才认证 `after_lru_pressure`，否则失败并提示增加压力。失败时仅保存 record ID、窗口、checkpoint、场景与两侧输出的最小复现 JSON，不保存音频或 Session ID。
 
 cache-off 与 reuse 使用两个独立 Engine 生命周期。两者模型、prompt、窗口、dtype、量化、`temperature=0`、`top_p=1`、`max_tokens` 和所选 hash block 相同；cache-off 关闭 Prefix Cache，并为每个请求的每个 Adapter UUID 生成含 request ID 的一次性 SHA-256；reuse 原样使用 Adapter UUID/cache salt，并通过 `prepare_vllm_config(..., hash_block_size=selected_hash_block_size)` 启动。正常、warmup、pressure 和验证 Session 都在 exact-final retry 或专用 release/recreate 流程结束后于 `finally` 释放 Adapter CPU 元数据。
 
@@ -127,7 +127,7 @@ npu-smi info -t memory -i 0 > /secure-validation/npu-memory-after.txt
 
 ## 10. 32 → 128 回退
 
-只有 `hash_block_size=32` 在 vLLM-Ascend/310P 初始化失败，或完整 token 等价性验收失败时，才改为 128。保留物理 `block_size=128`、Prefix Cache 和所有 PCM/Session/epoch 身份校验，重新运行完整正确性、质量和性能矩阵；cache-off/reuse 除 hash block 外保持完全相同。不要把 128 当作较快的抽样诊断。
+只有 `hash_block_size=32` 在 vLLM-Ascend/310P 初始化失败，或完整 token 等价性验收失败时，才改为 128。保留物理 `block_size=128`、Prefix Cache 和所有 PCM/Session 身份校验，重新运行完整正确性、质量和性能矩阵；cache-off/reuse 除 hash block 外保持完全相同。不要把 128 当作较快的抽样诊断。
 
 ```bash
 export QWEN3_ASR_310P_HASH_BLOCK_SIZE=128
@@ -150,6 +150,6 @@ python benchmarks/benchmark_310p.py \
 1. 先确认版本、模型 fingerprint、dtype/量化、prompt、窗口、sampling 参数和 manifest slice 完全相同。
 2. 再比较 Adapter audio item、anchor、UUID 与 cache salt；验证 cache-off UUID 每请求唯一、reuse UUID 内容稳定。
 3. 检查 `num_cached_tokens` 与四个 Prometheus counter；`concurrency>1` 的 per-request counter 应为 null，缺失指标不当作 0，也不把 MM processor counter 当 Encoder 命中。
-4. 显式 reset Encoder/Prefix Cache 后，以同一 Session/epoch/namespace 复测并要求首个请求 cached prefix 为 0；若观测不可用或不一致，先修生命周期证明。
+4. 显式 reset Encoder/Prefix Cache 后，以同一 Session/namespace 复测并要求首个请求 cached prefix 为 0；若观测不可用或不一致，先修生命周期证明。
 5. 以 `hash_block_size=128` 跑完整矩阵判断 32 粒度兼容性；不得只跑单条样本后决定回退。
 6. 最后使用 msprof 定位 Audio Tower、prefill、调度或 NPU kernel；profiler 数据不与无 profiler 的时延报告混用。
