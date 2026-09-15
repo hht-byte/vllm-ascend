@@ -124,15 +124,24 @@ def main():
         captures=0,
     )
     graphs = {}  # Keep every bucket's graph alive, as the model runner does.
+    graph_pool = torch.npu.graph_pool_handle()
+    buffers = {}
     for bucket in args.buckets:
         query = torch.zeros(bucket, HEADS, HEAD_SIZE, dtype=torch.float16, device=device)
         key = torch.zeros(bucket, KV_HEADS, HEAD_SIZE, dtype=torch.float16, device=device)
         value = torch.zeros_like(key)
         output = torch.empty_like(query)
         eager_output = torch.empty_like(query)
-        graph = None
+        buffers[bucket] = (query, key, value, output, eager_output)
+    # Revisit old graphs after other buckets have overwritten the shared arena.
+    # Retaining graph objects alone does not exercise this lifetime boundary.
+    visits = [(repeat, bucket) for repeat in range(args.repeats) for bucket in args.buckets]
+    for repeat, bucket in visits:
+        query, key, value, output, eager_output = buffers[bucket]
+        graph = graphs.get(bucket)
         last_reference = None
-        for iteration, qlens in enumerate(CASES[bucket] * args.repeats):
+        for case_index, qlens in enumerate(CASES[bucket]):
+            iteration = repeat * len(CASES[bucket]) + case_index
             sync()  # Do not overwrite host qLens while a replay may still read it.
             contexts = [n + (0, 63, 127, 129)[(row + iteration) % 4] for row, n in enumerate(qlens)]
             blocks = base_blocks.roll(iteration % MAX_REQS, dims=0)
@@ -181,7 +190,7 @@ def main():
                 forward()  # Eager operator warmup.
                 sync()
                 graph = torch.npu.NPUGraph()
-                with torch.npu.graph(graph):
+                with torch.npu.graph(graph, pool=graph_pool):
                     forward()
                 sync()
                 report["captures"] += 1
@@ -231,6 +240,7 @@ def main():
                 raise AssertionError("V cache changed outside real slots")
             case = dict(
                 bucket=bucket,
+                repeat=repeat,
                 graph_id=id(graph),
                 scheduled=qlens,
                 contexts=contexts,

@@ -39,7 +39,7 @@ python examples/310p/probe_token_graph.py --buckets 20 80 192 --layout fixed --u
 
 每轮同时更换 query、真实 K/V、KV 历史长度和 block table，跨越 block 边界。比较对象包括独立 CPU 因果 GQA 参考以及不含空槽/dummy 的 eager splitfuse；检查真实槽之外的 KV 没有被改写。task update 后重新将输出置 NaN，再 replay，防止把 update 阶段的输出误当成 replay 结果。
 
-报告包含 graph_id、capture 次数、metadata 地址、最大误差、含同步开销的 update/replay 时间、峰值显存。每桶只有一次 capture，所有桶的图对象都保留。探针时间是诊断数据，不是整模型性能结论。
+报告包含 graph_id、capture 次数、metadata 地址、最大误差、含同步开销的 update/replay 时间、峰值显存。每桶只有一次 capture，所有桶的图对象和输入输出缓冲区都保留。`--repeats 2` 以上会按 `20 → 80 → 192 → 20 → 80 → 192` 的顺序切换桶，验证其他桶覆盖共享 metadata 后旧图仍可复用。探针时间是诊断数据，不是整模型性能结论。
 
 如某个模式失败，保存完整报错与软件版本；不要删除断言、放宽精度比较或在失败后自动重捕获。仅通过 context_lens 的旧测试，不足以选择 inplace 模式。
 
@@ -66,6 +66,7 @@ python examples/310p/probe_token_graph.py --buckets 20 80 192 --layout fixed --u
 - KV 写入固定为桶 T，slot_mapping 为持久的一维 int32，padding slot=-1；调度/采样使用的真实计数保留在原始 common metadata。
 - dummy 请求仅从有效 block 0 读取，block table 每列重复 0，KV 可见长度等于 dummy q_len，因此长 padding 不会索引到不存在的 block。dummy 不写 KV、不参与采样；probe 校验无非真实槽写入。此项仍需整模型验证。
 - metadata 在 runner 的单一 arena 中分配，各桶使用视图；host qLens 改写前等待上轮完成。每层 attention task 在 capture 时登记，后续在 replay 前更新。初版使用保守同步，后续再基于 profiling 改成更细粒度事件依赖。
+- 当前 task 记录强引用保留每层、每桶的 query/output，保证更新参数的生命周期；这会限制 graph pool 对中间激活的复用，显存可能随层数和各桶 token 数之和增长。共享 metadata 不等于所有图显存仅按最大桶分配。整模型验收必须记录逐桶捕获后的显存，再评估现有 `weak_ref_tensors` 机制是否适用，不能在未验证生命周期前直接释放引用。
 - splitfuse_v2 的现有 Python 接口没有显式 workspace 参数，当前由 ATB 管理 setup / workspace。代码没有声称已证明全范围 workspace 上界。必须通过目标软件栈的长度、请求数、连续多轮和整模型压力测试，尤其关注 task update 后资源变化。
 - 预热也使用同一 splitfuse 分支，避免非均匀 dummy batch 被送到单 query PA。
 - 本地调用边界测试使用真实 runner 方法的 AST 和配套 dispatcher 源码，替代环境依赖；它不能证明完整引擎可导入或设备启动成功。
