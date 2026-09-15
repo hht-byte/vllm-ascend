@@ -81,6 +81,8 @@ def main():
     parser.add_argument("--update-mode", choices=("inplace", "task_update"), default="task_update")
     parser.add_argument("--buckets", type=int, nargs="+", default=[20, 80, 192])
     parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--graph-pool", choices=("shared", "private"), default="shared")
+    parser.add_argument("--eager-only", action="store_true", help="Check the first case without capture, then exit")
     parser.add_argument("--output", type=Path, default=Path("token-graph-probe.json"))
     args = parser.parse_args()
     if args.layout == "active" and args.update_mode != "task_update":
@@ -119,12 +121,15 @@ def main():
         device=torch.npu.get_device_name(0),
         layout=args.layout,
         update_mode=args.update_mode,
+        graph_pool=args.graph_pool,
+        eager_only=args.eager_only,
         operator="_npu_paged_attention_splitfuse_v2",
         cases=[],
         captures=0,
     )
     graphs = {}  # Keep every bucket's graph alive, as the model runner does.
-    graph_pool = torch.npu.graph_pool_handle()
+    graph_pool = torch.npu.graph_pool_handle() if args.graph_pool == "shared" and not args.eager_only else None
+    print("[ENV]", json.dumps({k: v for k, v in report.items() if k != "cases"}), flush=True)
     buffers = {}
     for bucket in args.buckets:
         query = torch.zeros(bucket, HEADS, HEAD_SIZE, dtype=torch.float16, device=device)
@@ -187,28 +192,51 @@ def main():
                 )
 
             if graph is None:
+                print(
+                    "[EAGER BEGIN]",
+                    dict(
+                        bucket=bucket,
+                        qlens=state.plan.query_lens,
+                        contexts=state.plan.context_lens,
+                        stream=str(torch.npu.current_stream()),
+                    ),
+                    flush=True,
+                )
                 forward()  # Eager operator warmup.
                 sync()
+                diff = check(output[:n], expected, "pre-capture eager vs CPU reference")
+                print("[EAGER PASS]", dict(max_abs_diff=diff), flush=True)
+                if args.eager_only:
+                    report["cases"].append(dict(bucket=bucket, scheduled=qlens, max_abs_diff=diff))
+                    args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+                    print("PASS: first-case eager only; capture/update/replay NOT tested.", flush=True)
+                    return
                 graph = torch.npu.NPUGraph()
+                print("[CAPTURE BEGIN]", dict(bucket=bucket, pool=args.graph_pool), flush=True)
                 with torch.npu.graph(graph, pool=graph_pool):
                     forward()
                 sync()
+                print("[CAPTURE PASS]", flush=True)
                 report["captures"] += 1
                 graphs[bucket] = graph
             output.fill_(float("nan"))
             sync()
+            print("[UPDATE BEGIN]", dict(bucket=bucket, iteration=iteration, mode=args.update_mode), flush=True)
             start = time.perf_counter()
             state.update(torch_npu)
             sync()
             update_ms = (time.perf_counter() - start) * 1000
+            print("[UPDATE PASS]", flush=True)
             # A task update may launch work on some stacks. Poison AFTER it so
             # only a successful graph replay can produce the compared output.
             output.fill_(float("nan"))
             sync()
+            print("[REPLAY BEGIN]", dict(bucket=bucket, iteration=iteration), flush=True)
             start = time.perf_counter()
             graph.replay()
             sync()
             replay_ms = (time.perf_counter() - start) * 1000
+            print("[REPLAY PASS]", flush=True)
             actual = output[:n].cpu().clone()
             # Independent eager invocation, with exact positive request lengths
             # (no zero rows and no dummy) to expose padding mistakes.

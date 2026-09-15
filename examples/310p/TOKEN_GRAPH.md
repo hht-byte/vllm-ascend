@@ -43,6 +43,27 @@ python examples/310p/probe_token_graph.py --buckets 20 80 192 --layout fixed --u
 
 如某个模式失败，保存完整报错与软件版本；不要删除断言、放宽精度比较或在失败后自动重捕获。仅通过 context_lens 的旧测试，不足以选择 inplace 模式。
 
+## Capture 报 allocator / PagedAttentionOperation 错误时
+
+2026-09-15 收到的 fixed/task_update 日志在 capture 内 `graph_task_group_end` 暴露异步错误，包含 `aclrtAllocatorGetByStream ... stream is not registered with any allocator`。尚未确认这是首个底层错误，也未证明与零 query 行或共享 pool 存在因果关系。`pool=((0,1),)` 是 torch_npu graph 上下文的正常参数包装日志，不要手动拆解 pool handle。
+
+先更新本分支，再用独立进程依次执行。第一条只验证首个 case，绝不进入 capture：
+
+```bash
+ASCEND_LAUNCH_BLOCKING=1 python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode task_update --eager-only --output eager.json
+python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode task_update --graph-pool private --output private-update.json
+python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode inplace --graph-pool private --output private-inplace.json
+```
+
+后两条图测试须保证没有继承 `ASCEND_LAUNCH_BLOCKING=1`。失败后新启进程，不在失效的 graph/stream 上重试。保留完整终端输出及同一时间段的 CANN/ATB 日志，包括 Python traceback 之前的首个底层错误。
+
+- eager 失败：先定位相同输入的 splitfuse / cache 问题，不能归因于 graph task update。可用 active 布局的 eager-only 作为无零 query 行对照。
+- eager 通过、private/task_update 通过，而原 shared/task_update 失败：才有证据进一步调查共享 pool 差异；private 仅用于诊断，不代表整模型共享池已验证。
+- private/task_update 在 capture 失败、private/inplace 能 capture：缩小到 task group 与算子捕获组合。若 inplace 后续精度失败，不算 inplace 模式通过。
+- 两种 private 模式均在 capture 失败：继续检查算子图支持和目标软件栈的 allocator/workspace 路径。
+
+新增 `[EAGER PASS]` 是和独立 CPU 参考比较通过；`[CAPTURE PASS]`、`[UPDATE PASS]`、`[REPLAY PASS]` 是对应阶段已返回并同步，不代替最终精度断言。环境日志记录 torch/torch_npu 版本；另需完整 CANN、ATB、HDK 版本及已通过 Test A 的实际算子与 pool 配置。
+
 ## 模型侧启用
 
 在原有模型启动命令中合并以下参数，保留原有模型和 ASR 参数：
