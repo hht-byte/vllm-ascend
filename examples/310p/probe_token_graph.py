@@ -87,6 +87,12 @@ def main():
     )
     parser.add_argument("--buckets", type=int, nargs="+", default=[20, 80, 192])
     parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument(
+        "--control",
+        choices=("none", "inputs", "contexts", "blocks"),
+        default="none",
+        help="Keep dense qLens fixed and vary only the selected input family",
+    )
     parser.add_argument("--graph-pool", choices=("shared", "private"), default="shared")
     parser.add_argument("--eager-only", action="store_true", help="Check the first case without capture, then exit")
     parser.add_argument("--output", type=Path, default=Path("token-graph-probe.json"))
@@ -97,6 +103,8 @@ def main():
         parser.error("Choose unique buckets from 20,80,192 and positive repeats")
     if args.capture_case == "dense" and args.buckets != [20]:
         parser.error("dense capture control requires --buckets 20")
+    if args.control != "none" and (args.capture_case != "dense" or args.buckets != [20]):
+        parser.error("controls require --capture-case dense --buckets 20")
     torch.set_num_threads(1)
     torch.manual_seed(310)
     torch.npu.set_device(0)
@@ -132,6 +140,7 @@ def main():
         graph_pool=args.graph_pool,
         eager_only=args.eager_only,
         capture_case=args.capture_case,
+        control=args.control,
         operator="_npu_paged_attention_splitfuse_v2",
         cases=[],
         captures=0,
@@ -157,11 +166,17 @@ def main():
         cases = CASES[bucket]
         if args.capture_case == "dense":
             cases = [[1] * 20] + [q for q in cases if q != [1] * 20]
+        if args.control != "none":
+            cases = [[1] * 20] * 4
         for case_index, qlens in enumerate(cases):
             iteration = repeat * len(cases) + case_index
             sync()  # Do not overwrite host qLens while a replay may still read it.
-            contexts = [n + (0, 63, 127, 129)[(row + iteration) % 4] for row, n in enumerate(qlens)]
-            blocks = base_blocks.roll(iteration % MAX_REQS, dims=0)
+            context_step = iteration if args.control in ("none", "contexts") else 0
+            block_step = iteration if args.control in ("none", "blocks") else 0
+            contexts = [n + (0, 63, 127, 129)[(row + context_step) % 4] for row, n in enumerate(qlens)]
+            blocks = base_blocks.roll(block_step % MAX_REQS, dims=0)
+            if args.control in ("contexts", "blocks"):
+                torch.manual_seed(310)  # Keep query and new K/V identical between iterations.
             slots = []
             for row, (n, c) in enumerate(zip(qlens, contexts)):
                 slots.extend(int(blocks[row, p // BLOCK_SIZE]) * BLOCK_SIZE + p % BLOCK_SIZE for p in range(c - n, c))
@@ -180,6 +195,7 @@ def main():
                 last_reference is not None
                 and last_reference.shape == expected.shape
                 and torch.equal(last_reference, expected)
+                and args.control == "none"
             ):
                 raise AssertionError("Test inputs failed to produce a distinct reference")
             last_reference = expected.clone()
@@ -267,8 +283,40 @@ def main():
                 out=eager_output[:n],
             )
             sync()
-            diff = check(actual, expected, "graph vs independent CPU causal reference")
-            check(actual, eager_output[:n], "graph vs exact-request eager")
+            eager_snapshot = eager_output[:n].cpu().clone()
+            try:
+                eager_diff = check(eager_snapshot, expected, "exact-request eager vs CPU reference")
+                print("[EAGER REFERENCE PASS]", dict(iteration=iteration, max_abs_diff=eager_diff), flush=True)
+                diff = check(actual, expected, "graph vs independent CPU causal reference")
+                check(actual, eager_snapshot, "graph vs exact-request eager")
+            except AssertionError as error:
+                failure_path = args.output.with_suffix(".failure.pt")
+                torch.save(
+                    dict(
+                        graph=actual,
+                        eager=eager_snapshot,
+                        expected=expected,
+                        scheduled=qlens,
+                        contexts=contexts,
+                        plan=vars(state.plan),
+                        blocks=blocks.clone(),
+                        query=q_cpu.clone(),
+                        key_reference=key_nd.clone(),
+                        value_reference=value_nd.clone(),
+                    ),
+                    failure_path,
+                )
+                report["failure"] = dict(
+                    bucket=bucket,
+                    iteration=iteration,
+                    scheduled=qlens,
+                    contexts=contexts,
+                    error=str(error),
+                    tensors=str(failure_path),
+                )
+                args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+                print("[FAILURE SAVED]", str(failure_path), flush=True)
+                raise
             untouched = torch.ones(num_blocks, BLOCK_SIZE, dtype=torch.bool)
             for slot in slots:
                 untouched[slot // BLOCK_SIZE, slot % BLOCK_SIZE] = False

@@ -13,6 +13,20 @@
 
 ## 先运行设备探针
 
+最新设备结果（Ascend310P3、torch 2.10.0+cpu、torch_npu 2.10.0.post4）：private pool、fixed/inplace、dense capture 成功，首次 replay 最大绝对误差约 0.000615；切到第二组 8 请求后 replay 返回，但 97.4% 元素不满足精度要求，最大绝对差约 4.988。说明该算子路径在初始输入上可捕获并回放，尚不支持已测的整组 metadata 原地切换。不能将该结果归因于单独的 qLens，因为该轮同时改变了多项输入。
+
+先使用以下对照，始终保留 20 条单 query 请求。每个进程只选择一个 control：
+
+```bash
+python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode inplace --graph-pool private --capture-case dense --control inputs --output control-inputs.json
+python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode inplace --graph-pool private --capture-case dense --control contexts --output control-contexts.json
+python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode inplace --graph-pool private --capture-case dense --control blocks --output control-blocks.json
+```
+
+inputs 固定 metadata，仅变化 query 和新 K/V；contexts 固定 qLens、block table、query 和新 K/V，变化 context（写槽随 context 相应变化）；blocks 固定 qLens、context、query 和新 K/V，变化 block table（写槽随 block table 相应变化）。KV cache 会按相应真实槽写入，CPU 参考同步维护逻辑 cache。
+
+每轮先检查 exact-request eager 与 CPU 参考，再检查 graph。精度失败时保存输出 JSON 和同名 `.failure.pt`，包含三份独立输出、输入 metadata 及逻辑 KV 参考。若 `[EAGER REFERENCE PASS]` 后 graph 比较失败，可进一步将问题缩小到捕获/回放路径。`[UPDATE PASS]` 在 inplace 模式仅表示无更新调用的分支返回，不证明参数已被算子读取。
+
 根据最新设备反馈，默认更新模式改为 `fixed + inplace`。task_update 保留为显式对照选项，不作为主路径。inplace 的 splitfuse capture 也已报告失败，因此该默认选择是实现方向，不代表设备验收通过。
 
 在打补丁后的 vLLM-Ascend 根目录执行，每种组合使用独立进程：
