@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Experimental token-bucket graphs for 310P multi-query attention.
+"""Experimental token-bucket graphs for 310P attention.
 
 The planner is deliberately independent of vLLM and torch_npu so it can be
 tested on CPU. Hardware support for zero-query rows / descriptor updates is
-NOT inferred from the successful context_lens-only experiment.
+NOT inferred from the successful context_lens-only experiment. Token layout
+keeps operator qLens constant and expresses causality using per-token contexts.
 """
 
 from dataclasses import dataclass, field
@@ -22,7 +23,7 @@ PAD_SLOT = -1
 class TokenGraphConfig:
     enabled: bool = False
     update_mode: str = "inplace"
-    request_layout: str = "fixed"
+    request_layout: str = "token"
 
     @classmethod
     def from_vllm(cls, config):
@@ -37,10 +38,12 @@ class TokenGraphConfig:
             raise ValueError("enabled must be a boolean")
         if result.update_mode not in ("inplace", "task_update"):
             raise ValueError("update_mode must be inplace or task_update")
-        if result.request_layout not in ("fixed", "active"):
-            raise ValueError("request_layout must be fixed or active")
+        if result.request_layout not in ("token", "fixed", "active"):
+            raise ValueError("request_layout must be token, fixed or active")
         if result.request_layout == "active" and result.update_mode != "task_update":
             raise ValueError("active request views require task_update")
+        if result.enabled and result.request_layout == "fixed" and result.update_mode == "inplace":
+            raise ValueError("fixed/inplace cannot replay changing host qLens; use request_layout=token")
         return result
 
 
@@ -52,12 +55,13 @@ class TokenGraphPlan:
     query_lens: tuple[int, ...]
     context_lens: tuple[int, ...]
     query_start_loc: tuple[int, ...]
+    row_requests: tuple[int, ...] = ()
 
     @classmethod
     def create(cls, bucket, query_lens, context_lens, max_reqs, max_context, layout="fixed"):
         q = tuple(int(x) for x in query_lens)
         c = tuple(int(x) for x in context_lens)
-        if layout not in ("fixed", "active"):
+        if layout not in ("token", "fixed", "active"):
             raise ValueError("Unknown request layout")
         if not q or len(q) != len(c) or len(q) > max_reqs:
             raise ValueError("Invalid real request count / context_lens length")
@@ -67,6 +71,21 @@ class TokenGraphPlan:
         if not actual <= bucket <= max_context:
             raise ValueError("Require actual_tokens <= bucket <= max_context")
         reqs = len(q)
+        if layout == "token":
+            # The j-th query of request r may see exactly C_r - Q_r + j + 1
+            # keys, even though all new K/V are written before attention runs.
+            contexts = tuple(length for n, end in zip(q, c) for length in range(end - n + 1, end + 1))
+            owners = tuple(row for row, n in enumerate(q) for _ in range(n))
+            padding = bucket - actual
+            return cls(
+                bucket,
+                actual,
+                reqs,
+                (1,) * bucket,
+                contexts + (1,) * padding,
+                tuple(range(bucket + 1)),
+                owners + (-1,) * padding,
+            )
         if bucket > actual:
             # Read-only dummy: repeated block 0 covers the virtual context.
             q += (bucket - actual,)
@@ -95,9 +114,9 @@ class TokenGraphArena:
         self.max_context = max_context
         self.config = config
         self.device = torch.device(device)
-        self.capacity = min(max_tokens, max_reqs + 1)
+        self.capacity = max_tokens if config.request_layout == "token" else min(max_tokens, max_reqs + 1)
         pinned = self.device.type != "cpu"
-        self.qlens = torch.zeros(self.capacity, dtype=torch.int32, pin_memory=pinned)
+        self.qlens = torch.ones(self.capacity, dtype=torch.int32, pin_memory=pinned)
         self.context_cpu = torch.ones(self.capacity, dtype=torch.int32, pin_memory=pinned)
         self.starts_cpu = torch.zeros(self.capacity + 1, dtype=torch.int32, pin_memory=pinned)
         self.context = torch.ones(self.capacity, dtype=torch.int32, device=device)
@@ -107,6 +126,7 @@ class TokenGraphArena:
         self.states: dict[int, TokenGraphState] = {}
 
     def prepare(self, bucket, query_lens, context_lens, blocks, slots):
+        query_lens = tuple(int(length) for length in query_lens)
         if bucket > self.max_tokens:
             raise ValueError("Bucket exceeds allocated arena")
         plan = TokenGraphPlan.create(
@@ -117,13 +137,21 @@ class TokenGraphArena:
             raise ValueError("Block table does not cover real requests or has changed width")
         if slots.ndim != 1 or slots.numel() < plan.actual_tokens:
             raise ValueError("Slot mapping does not cover real tokens")
-        self.qlens[:rows].copy_(torch.tensor(plan.query_lens, dtype=torch.int32))
+        if self.config.request_layout != "token":
+            self.qlens[:rows].copy_(torch.tensor(plan.query_lens, dtype=torch.int32))
         self.context_cpu[:rows].copy_(torch.tensor(plan.context_lens, dtype=torch.int32))
         self.starts_cpu[: rows + 1].copy_(torch.tensor(plan.query_start_loc, dtype=torch.int32))
         self.context[:rows].copy_(self.context_cpu[:rows], non_blocking=True)
         self.starts[: rows + 1].copy_(self.starts_cpu[: rows + 1], non_blocking=True)
         self.blocks[:rows].zero_()
-        self.blocks[: plan.actual_reqs].copy_(blocks[: plan.actual_reqs], non_blocking=True)
+        if self.config.request_layout == "token":
+            offset = 0
+            for row, length in enumerate(query_lens):
+                # Broadcast the real request's table to each of its query rows.
+                self.blocks[offset : offset + length].copy_(blocks[row], non_blocking=True)
+                offset += length
+        else:
+            self.blocks[: plan.actual_reqs].copy_(blocks[: plan.actual_reqs], non_blocking=True)
         self.slots[:bucket].fill_(PAD_SLOT)
         self.slots[: plan.actual_tokens].copy_(slots[: plan.actual_tokens], non_blocking=True)
         if bucket not in self.states:

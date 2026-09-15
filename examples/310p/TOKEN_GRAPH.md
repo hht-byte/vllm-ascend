@@ -1,145 +1,78 @@
 # 310P token-only FULL graph（实验实现）
 
-基线为 vLLM-Ascend v0.23.0 `5cb98caaadeff42b5b62b996e34bb2aaa29d20fd`，配套 vLLM v0.23.0 `0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665`。
+基线：vLLM-Ascend v0.23.0 `5cb98caaadeff42b5b62b996e34bb2aaa29d20fd`，配套 vLLM v0.23.0 `0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665`。没有修改配套 vLLM。
 
-本实现按 token 桶复用模型图，统一使用 `_npu_paged_attention_splitfuse_v2`，保留每条请求的多 query 计算。没有改为逐 token PA，也没有修改配套 vLLM。
+## 当前方案：token + inplace
 
-## 当前验证状态
+根据 Ascend310P3、torch 2.10.0+cpu、torch_npu 2.10.0.post4 的实测，splitfuse_v2 的 query/KV、context、block table 原地更新各通过 8 轮；但固定八请求的正数 host qLens 从 `[3,3,3,3,2,2,2,2]` 变为 `[2,2,2,2,3,3,3,3]` 时，eager 正确而图输出 71.2% 元素不满足精度要求。旧的 host qLens 原地修改方案不再作为模型主路径。
 
-- 用户此前的 context_lens 原地更新和同拓扑 task update 算子实验已通过；它不等价于此 splitfuse 图路径已通过。
-- 本地 19 项 CPU / 调用边界测试通过；Ruff 检查和 Python 编译检查通过。
-- 本会话运行环境为 Windows、CPU PyTorch 2.12.1，无法运行 torch_npu / 310P 测试。跨请求数设备精度、workspace、整模型与性能验收仍待完成。
-- 功能默认关闭。若算子不支持零 query 行或 task descriptor 更新，会报错，不会偷偷按请求数捕获另一张图。
+新默认 `request_layout=token, update_mode=inplace` 将每个 query token 映射为一个算子行。仍调用 `_npu_paged_attention_splitfuse_v2`，但算子收到的 host qLens 恒为 `[1]*T`，不会随调度 qLens 变化。对于真实请求的 Q 个 query、总 KV 长度 C，第 j 个 query（从 0 开始）对应：
+
+- `context = C - Q + j + 1`，只看当前 query 及之前的 KV。
+- block table 复制该真实请求的映射。
+- query、K/V、输出顺序不变；K/V 写入仍按真实 slot mapping。
+
+例如 `Q=3,C=130` 对应 context `[128,129,130]`。虽然先写完全部新 K/V，较早 query 的可见长度仍排除未来 token。对于 T-N 个 padding token，每行 qLen=1、context=1、block table 全零、slot=-1，不写 KV、不参与采样。调度和采样仍使用真实请求数与 token 数。
+
+这样同一 T 图可表示不同请求数和 qLens，而算子行数、query shape、host qLens 均不变。注意：这是逐 token attention 计算，可能增加 prefill 的 KV 读取，不能宣称保留了原多 query 的性能。
 
 ## 先运行设备探针
 
-### 固定八请求的正数 qLens 对照
-
-inputs、contexts、blocks 三组设备对照均已由用户报告每组一张图、8 轮精度通过。下一步隔离 qLens 分段变化：
+先重跑此前失败的固定八请求对照，使用新布局：
 
 ```bash
-python examples/310p/probe_token_graph.py --buckets 20 --layout active --update-mode inplace --graph-pool private --control qlens --output qlens.json
+python examples/310p/probe_token_graph.py --buckets 20 --layout token --update-mode inplace --graph-pool private --control qlens --output token-qlens.json
 ```
 
-此专用对照始终向算子传入恰好 8 行，依次运行 `[3,3,3,3,2,2,2,2]`、`[2,2,2,2,3,3,3,3]`、`[1,1,1,1,4,4,4,4]`，再返回第一组。每组总 token 都是 20，全部 qLen 为正，context 始终为 `[130]*8`，block table、query 和新 K/V 固定。写入槽及每条请求的 token 归属随 qLens 相应变化；CPU 参考按相同语义更新 KV。
-
-这里的 active 仅用于取得精确的八行视图，所有轮次 shape 和地址保持不变。探针只为 `--control qlens` 允许这种固定形状的 active/inplace 组合；模型侧仍拒绝一般的 active/inplace。不要附加 `--capture-case dense`，否则会混入请求数变化。
-
-- 若首次 eager 或 capture 失败：尚未检验 qLens 动态更新，先定位八请求多 query 的基础路径。
-- 若首次精度通过，第二组 `[EAGER REFERENCE PASS]` 后 graph 精度失败：证明这组固定形状、全正数 qLens 分段切换不能由当前 inplace 路径正确完成，不再需要零 query 行或请求数变化才能触发。
-- 若全通过：只能确认该八请求对照，随后再验证零 query 行和 8/10 请求切换。
-
-日志 `[QLENS CONTROL]` 标明当前分布和 `rows=8`。失败时保留 `qlens.json` 与 `qlens.failure.pt`。
-
-最新设备结果（Ascend310P3、torch 2.10.0+cpu、torch_npu 2.10.0.post4）：private pool、fixed/inplace、dense capture 成功，首次 replay 最大绝对误差约 0.000615；切到第二组 8 请求后 replay 返回，但 97.4% 元素不满足精度要求，最大绝对差约 4.988。说明该算子路径在初始输入上可捕获并回放，尚不支持已测的整组 metadata 原地切换。不能将该结果归因于单独的 qLens，因为该轮同时改变了多项输入。
-
-先使用以下对照，始终保留 20 条单 query 请求。每个进程只选择一个 control：
+真实请求始终八条；日志 rows=20 是算子行数。`scheduled` 会变化，但 `operator_qlens` 必须一直是 20 个 1。随后验证 8/10 请求切换和 padding：
 
 ```bash
-python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode inplace --graph-pool private --capture-case dense --control inputs --output control-inputs.json
-python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode inplace --graph-pool private --capture-case dense --control contexts --output control-contexts.json
-python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode inplace --graph-pool private --capture-case dense --control blocks --output control-blocks.json
+python examples/310p/probe_token_graph.py --buckets 20 --layout token --update-mode inplace --graph-pool private --output token-requests.json
 ```
 
-inputs 固定 metadata，仅变化 query 和新 K/V；contexts 固定 qLens、block table、query 和新 K/V，变化 context（写槽随 context 相应变化）；blocks 固定 qLens、context、query 和新 K/V，变化 block table（写槽随 block table 相应变化）。KV cache 会按相应真实槽写入，CPU 参考同步维护逻辑 cache。
-
-每轮先检查 exact-request eager 与 CPU 参考，再检查 graph。精度失败时保存输出 JSON 和同名 `.failure.pt`，包含三份独立输出、输入 metadata 及逻辑 KV 参考。若 `[EAGER REFERENCE PASS]` 后 graph 比较失败，可进一步将问题缩小到捕获/回放路径。`[UPDATE PASS]` 在 inplace 模式仅表示无更新调用的分支返回，不证明参数已被算子读取。
-
-根据最新设备反馈，默认更新模式改为 `fixed + inplace`。task_update 保留为显式对照选项，不作为主路径。inplace 的 splitfuse capture 也已报告失败，因此该默认选择是实现方向，不代表设备验收通过。
-
-在打补丁后的 vLLM-Ascend 根目录执行，每种组合使用独立进程：
+最后扩大到共享 graph pool、多桶交错回放：
 
 ```bash
-python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode task_update --output fixed-update.json
-python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode inplace --output fixed-inplace.json
-python examples/310p/probe_token_graph.py --buckets 20 --layout active --update-mode task_update --output active-update.json
+python examples/310p/probe_token_graph.py --buckets 20 80 192 --layout token --update-mode inplace --graph-pool shared --repeats 5 --output token-all.json
 ```
 
-fixed 使用每桶固定请求容量；未用行 q_len=0，因此必须验证算子接受空行。active 不传空行，而是通过 task update 切换有效视图的 shape。active 与 inplace 的组合被拒绝。
+每个命令使用独立进程；图测试不要设置 `ASCEND_LAUNCH_BLOCKING=1`。默认 mixed 用例覆盖 `[1,1,1,1,1,5]`、`[1,1,1,1,5,70]`、`[1,1,1,1,7,7]`、`[70,40,70]` 以及 20 tokens 下 8/10 请求切换。每桶只 capture 一次，多轮按 `20→80→192→20` 顺序回放。
 
-通过所选模式的 20-token 探针后，扩大到全部桶。例如：
-
-```bash
-python examples/310p/probe_token_graph.py --buckets 20 80 192 --layout fixed --update-mode inplace --repeats 5 --output all-buckets.json
-```
-
-探针复用运行时的 metadata arena 和 task 更新代码，覆盖下列场景：
-
-| 桶 | 场景 |
-| --- | --- |
-| 20 | 非均匀 8 请求、qLens 重排、10 请求、10/18 个真实 token 补齐、20 个单 token 请求、切回 8 请求 |
-| 80 | `[1,1,1,1,5,70]`、20 个单 token 请求、4×20 token |
-| 192 | `[70,40,70]`、单请求 192 token、20 个单 token 请求 |
-
-每轮同时更换 query、真实 K/V、KV 历史长度和 block table，跨越 block 边界。比较对象包括独立 CPU 因果 GQA 参考以及不含空槽/dummy 的 eager splitfuse；检查真实槽之外的 KV 没有被改写。task update 后重新将输出置 NaN，再 replay，防止把 update 阶段的输出误当成 replay 结果。
-
-报告包含 graph_id、capture 次数、metadata 地址、最大误差、含同步开销的 update/replay 时间、峰值显存。每桶只有一次 capture，所有桶的图对象和输入输出缓冲区都保留。`--repeats 2` 以上会按 `20 → 80 → 192 → 20 → 80 → 192` 的顺序切换桶，验证其他桶覆盖共享 metadata 后旧图仍可复用。探针时间是诊断数据，不是整模型性能结论。
-
-如某个模式失败，保存完整报错与软件版本；不要删除断言、放宽精度比较或在失败后自动重捕获。仅通过 context_lens 的旧测试，不足以选择 inplace 模式。
-
-## Capture 报 allocator / PagedAttentionOperation 错误时
-
-后续 inplace 日志也在 capture_end 出现相同 PagedAttentionOperation / allocator 错误：task update 不是该错误的必要触发条件。退出清理期间的 `stream is captured` 出现在 capture 失败之后，不能当作独立的首因。当前优先使用 inplace：
-
-```bash
-ASCEND_LAUNCH_BLOCKING=1 python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode inplace --eager-only --output eager-inplace.json
-python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode inplace --graph-pool private --output private-inplace.json
-```
-
-如果第二条仍在 capture 失败，保持其它参数不变，增加 `--capture-case dense`，输出到另一个文件。dense 先捕获 `[1]*20`，无零 query 行、无 dummy、无多 query 请求；如果连它也不能 capture，则这些因素都不是失败的必要条件。若 dense capture 成功，后续仍在同一图上运行原有 8/10 请求用例，不增加 capture 次数。该对照使用同一 splitfuse_v2，不等同于其它 PA 算子的成功实验。
-
-2026-09-15 收到的 fixed/task_update 日志在 capture 内 `graph_task_group_end` 暴露异步错误，包含 `aclrtAllocatorGetByStream ... stream is not registered with any allocator`。尚未确认这是首个底层错误，也未证明与零 query 行或共享 pool 存在因果关系。`pool=((0,1),)` 是 torch_npu graph 上下文的正常参数包装日志，不要手动拆解 pool handle。
-
-先更新本分支，再用独立进程依次执行。第一条只验证首个 case，绝不进入 capture：
-
-```bash
-ASCEND_LAUNCH_BLOCKING=1 python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode task_update --eager-only --output eager.json
-python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode task_update --graph-pool private --output private-update.json
-python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode inplace --graph-pool private --output private-inplace.json
-```
-
-后两条图测试须保证没有继承 `ASCEND_LAUNCH_BLOCKING=1`。失败后新启进程，不在失效的 graph/stream 上重试。保留完整终端输出及同一时间段的 CANN/ATB 日志，包括 Python traceback 之前的首个底层错误。
-
-- eager 失败：先定位相同输入的 splitfuse / cache 问题，不能归因于 graph task update。可用 active 布局的 eager-only 作为无零 query 行对照。
-- eager 通过、private/task_update 通过，而原 shared/task_update 失败：才有证据进一步调查共享 pool 差异；private 仅用于诊断，不代表整模型共享池已验证。
-- private/task_update 在 capture 失败、private/inplace 能 capture：缩小到 task group 与算子捕获组合。若 inplace 后续精度失败，不算 inplace 模式通过。
-- 两种 private 模式均在 capture 失败：继续检查算子图支持和目标软件栈的 allocator/workspace 路径。
-
-新增 `[EAGER PASS]` 是和独立 CPU 参考比较通过；`[CAPTURE PASS]`、`[UPDATE PASS]`、`[REPLAY PASS]` 是对应阶段已返回并同步，不代替最终精度断言。环境日志记录 torch/torch_npu 版本；另需完整 CANN、ATB、HDK 版本及已通过 Test A 的实际算子与 pool 配置。
+每轮比较独立 CPU 因果 GQA 参考、原始真实请求 eager splitfuse 和 graph；还检查真实写槽之外的 KV 未改变。精度失败保存 JSON 和 `.failure.pt`，包含三份独立输出、metadata 和逻辑 KV 参考。不要删除断言或放宽精度。update/replay 时间包含同步，是诊断数据，不是整模型性能数据。inplace 的 UPDATE PASS 仅表示无 task update 调用的分支返回。
 
 ## 模型侧启用
 
-在原有模型启动命令中合并以下参数，保留原有模型和 ASR 参数：
+只有探针在目标设备上通过后，再将以下选项合并进原启动命令：
 
 ```bash
 --no-async-scheduling \
 --max-num-seqs 20 \
 --compilation-config '{"cudagraph_mode":"FULL","cudagraph_capture_sizes":[20,80,192],"max_cudagraph_capture_size":192}' \
---additional-config '{"token_graph_310p":{"enabled":true,"request_layout":"fixed","update_mode":"inplace"}}'
+--additional-config '{"token_graph_310p":{"enabled":true,"request_layout":"token","update_mode":"inplace"}}'
 ```
 
-`request_layout` / `update_mode` 必须与已通过的设备探针对应；如已有 additional-config，将 token_graph_310p 合并进去，不覆盖其他设置。不要同时启用 enforce-eager。超出最大桶的 batch 沿用 eager，不创建新桶。
+已有 additional-config 时合并此项，不覆盖其它配置。功能默认关闭；启用后默认 token/inplace。旧 `fixed/inplace` 模型配置现在明确报错，避免继续运行已失败的 host qLens 更新路径。`active/inplace` 也不作为模型支持组合；旧 fixed/active 布局保留在探针用于对照。不要同时启用 enforce-eager。超出最大桶的 batch 使用 eager，不自动捕获新桶。
 
-初版范围：单卡 dense causal decoder、单一普通 FullAttentionSpec KV 组、非量化 KV、无滑窗/ALiBi/sinks/KV sharing、无 LoRA/KV transfer/ENPU。投机验证初版支持 ngram；带独立 draft 模型的方法明确拒绝，避免将其 metadata 或图生命周期混入 target graph。Qwen3-ASR 的音频编码器仍使用原有路径，此改动针对 decoder。
+范围：单卡 dense causal decoder、单一普通 FullAttentionSpec KV 组、非量化 KV，无滑窗/ALiBi/sinks/KV sharing/LoRA/KV transfer/ENPU。投机验证仅 ngram，独立 draft 模型明确拒绝。Qwen3-ASR 音频编码器仍使用原路径，改动针对 decoder。
 
-启用 `VLLM_LOGGING_LEVEL=DEBUG` 可查看 `310P token graph` 日志：bucket、真实 token/request 数、metadata 行数、attention task 数。attention task 数是层数，不能当作模型图数量；图数量看 ACLGraphWrapper 的 capture 日志与实际 graph entry 数。
+## 内存与设备验收边界
 
-## 实现说明与未关闭的验收项
+- 图键只按 token 桶，不包含真实请求数或 qLens。算子行数 T 可以大于 max_num_seqs，后者仍限制真实请求数。
+- 一个共享 arena 按最大 T 分配 metadata，各桶使用固定前缀视图。block table 空间约为 `max_T * max_blocks * 4` 字节；每轮复制真实请求表到对应 token 行。
+- host qLens 初始化为全 1，token 布局不再改写它。device context/block table/slot mapping 原地更新，回放前保守同步；attention 仍在每层只发起一个算子调用。
+- task 记录仍保留每层每桶 query/output 强引用，图激活显存不保证只按最大桶增长。弱引用和更细同步需额外设备验证。
+- splitfuse_v2 Python 接口不提供显式 workspace 管理。当前依赖 ATB，不能声称已证明长度变化下的全范围 workspace 上界。
+- 新 token 布局目前只有 CPU 语义和接入边界验证；旧输入/context/block table 的设备结果是设计依据，不能替代新布局的组合、padding、多桶、整模型精度和性能验收。
 
-- Dispatcher 为 Ascend 插件内子类，描述符统一 `num_reqs=None, uniform=False`；初始化和运行时选择使用相同规则。
-- KV 写入固定为桶 T，slot_mapping 为持久的一维 int32，padding slot=-1；调度/采样使用的真实计数保留在原始 common metadata。
-- dummy 请求仅从有效 block 0 读取，block table 每列重复 0，KV 可见长度等于 dummy q_len，因此长 padding 不会索引到不存在的 block。dummy 不写 KV、不参与采样；probe 校验无非真实槽写入。此项仍需整模型验证。
-- metadata 在 runner 的单一 arena 中分配，各桶使用视图；host qLens 改写前等待上轮完成。每层 attention task 在 capture 时登记，后续在 replay 前更新。初版使用保守同步，后续再基于 profiling 改成更细粒度事件依赖。
-- 当前 task 记录强引用保留每层、每桶的 query/output，保证更新参数的生命周期；这会限制 graph pool 对中间激活的复用，显存可能随层数和各桶 token 数之和增长。共享 metadata 不等于所有图显存仅按最大桶分配。整模型验收必须记录逐桶捕获后的显存，再评估现有 `weak_ref_tensors` 机制是否适用，不能在未验证生命周期前直接释放引用。
-- splitfuse_v2 的现有 Python 接口没有显式 workspace 参数，当前由 ATB 管理 setup / workspace。代码没有声称已证明全范围 workspace 上界。必须通过目标软件栈的长度、请求数、连续多轮和整模型压力测试，尤其关注 task update 后资源变化。
-- 预热也使用同一 splitfuse 分支，避免非均匀 dummy batch 被送到单 query PA。
-- 本地调用边界测试使用真实 runner 方法的 AST 和配套 dispatcher 源码，替代环境依赖；它不能证明完整引擎可导入或设备启动成功。
+## CPU 检查与历史记录
 
-## CPU 检查
+本地 24 项 CPU/调用边界测试、修改文件的 Ruff 和 Python 编译检查通过。未在本会话运行 NPU；完整 format.sh 检查依赖本地尚未安装的 pre-commit。
 
 ```bash
 python tests/ut/_310p/test_token_graph_standalone.py
 python tests/ut/_310p/test_token_graph_wiring.py
 ```
 
-第二个测试需要配套 vLLM 位于相邻目录 `../vllm`。测试无需 pytest 或 torch_npu，但需要 CPU PyTorch。
+第二个测试需要相邻目录 `../vllm` 的 v0.23.0 源码。CPU 测试包含逐 token 与多 query 因果注意力等价比较、全部示例、block table 展开、padding、地址稳定，以及实际 runner 方法 AST / dispatcher 边界测试；不等于完整引擎或 NPU 测试。
+
+此前的 allocator、dense、inputs/contexts/blocks 和八请求对照记录见 [历史诊断](TOKEN_GRAPH_DIAGNOSTICS.md)。

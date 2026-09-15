@@ -77,7 +77,7 @@ def reference(query, key, value, blocks, qlens, contexts):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--layout", choices=("fixed", "active"), default="fixed")
+    parser.add_argument("--layout", choices=("token", "fixed", "active"), default="token")
     parser.add_argument("--update-mode", choices=("inplace", "task_update"), default="inplace")
     parser.add_argument(
         "--capture-case",
@@ -103,8 +103,10 @@ def main():
         parser.error("Choose unique buckets from 20,80,192 and positive repeats")
     if args.capture_case == "dense" and args.buckets != [20]:
         parser.error("dense capture control requires --buckets 20")
-    if args.control == "qlens" and (args.layout != "active" or args.buckets != [20] or args.capture_case != "mixed"):
-        parser.error("qlens control requires --layout active --buckets 20 --capture-case mixed (the default)")
+    if args.control == "qlens" and (
+        args.layout not in ("active", "token") or args.buckets != [20] or args.capture_case != "mixed"
+    ):
+        parser.error("qlens control requires --layout active or token --buckets 20 --capture-case mixed (the default)")
     if args.control not in ("none", "qlens") and (args.capture_case != "dense" or args.buckets != [20]):
         parser.error("controls require --capture-case dense --buckets 20")
     torch.set_num_threads(1)
@@ -214,8 +216,9 @@ def main():
             last_reference = expected.clone()
             state = storage.prepare(bucket, qlens, contexts, blocks.to(device), torch.tensor(slots, device=device))
             if args.control == "qlens":
-                if len(state.plan.query_lens) != 8 or min(state.plan.query_lens) <= 0 or sum(qlens) != 20:
-                    raise AssertionError("qLens control must retain exactly eight positive rows and 20 tokens")
+                expected_rows = bucket if args.layout == "token" else 8
+                if len(state.plan.query_lens) != expected_rows or min(state.plan.query_lens) <= 0 or sum(qlens) != 20:
+                    raise AssertionError("qLens control must retain fixed positive operator rows and 20 tokens")
                 print(
                     "[QLENS CONTROL]",
                     dict(
@@ -226,6 +229,8 @@ def main():
                     ),
                     flush=True,
                 )
+            if args.layout == "token" and state.plan.query_lens != (1,) * bucket:
+                raise AssertionError("Token layout must never change operator qLens")
             # Snapshot cache to detect any writes outside real slots, including block 0.
             before_k = key_cache.cpu().clone()
             before_v = value_cache.cpu().clone()
@@ -358,6 +363,8 @@ def main():
                 graph_id=id(graph),
                 scheduled=qlens,
                 contexts=contexts,
+                operator_qlens=list(state.plan.query_lens),
+                operator_contexts=list(state.plan.context_lens),
                 max_abs_diff=diff,
                 update_ms=update_ms,
                 replay_ms=replay_ms,

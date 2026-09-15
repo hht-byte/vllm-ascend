@@ -169,10 +169,93 @@ class TestTokenGraph(unittest.TestCase):
         state.update(backend)
         self.assertEqual(backend.calls, [])
 
-    def test_enabled_defaults_to_fixed_inplace(self):
+    def test_enabled_defaults_to_token_inplace(self):
         config = tg.TokenGraphConfig.from_vllm(SimpleNamespace(additional_config={tg.CONFIG_KEY: {"enabled": True}}))
         self.assertEqual(config.update_mode, "inplace")
-        self.assertEqual(config.request_layout, "fixed")
+        self.assertEqual(config.request_layout, "token")
+
+    def test_failed_requestwise_inplace_config_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "token"):
+            tg.TokenGraphConfig.from_vllm(
+                SimpleNamespace(
+                    additional_config={
+                        tg.CONFIG_KEY: {"enabled": True, "request_layout": "fixed", "update_mode": "inplace"}
+                    }
+                )
+            )
+
+    def test_token_rows_preserve_causal_context_and_padding(self):
+        plan = tg.TokenGraphPlan.create(8, [3, 2], [130, 5], 20, 512, "token")
+        self.assertEqual(plan.query_lens, (1,) * 8)
+        self.assertEqual(plan.context_lens, (128, 129, 130, 4, 5, 1, 1, 1))
+        self.assertEqual(plan.row_requests, (0, 0, 0, 1, 1, -1, -1, -1))
+        self.assertEqual(plan.query_start_loc, tuple(range(9)))
+        self.assertEqual((plan.actual_tokens, plan.actual_reqs), (5, 2))
+
+    def test_token_bucket_switches_keep_shapes_addresses_and_unit_qlens(self):
+        storage = arena("token", "inplace")
+        pointers = None
+        for bucket, q in (*CASES, CASES[0]):
+            state = prepare(storage, bucket, q)
+            self.assertEqual(state.metadata_kwargs()["seq_len"].tolist(), [1] * bucket)
+            self.assertEqual(state.metadata_kwargs()["block_table"].shape, (bucket, 4))
+            current = {k: v.data_ptr() for k, v in state.metadata_kwargs().items()}
+            if pointers is None:
+                pointers = current
+            self.assertEqual(current, pointers)
+            for token, owner in enumerate(state.plan.row_requests):
+                expected = [0] * 4 if owner < 0 else list(range(owner * 4, owner * 4 + 4))
+                self.assertEqual(storage.blocks[token].tolist(), expected)
+            self.assertTrue(torch.all(storage.slots[sum(q) : bucket] == -1))
+
+    def test_token_rows_match_multiquery_causal_attention(self):
+        generator = torch.Generator().manual_seed(310)
+        keys = torch.randn(80, 64, 4, generator=generator)
+        values = torch.randn(80, 64, 4, generator=generator)
+        blocks = torch.arange(80, dtype=torch.int32).reshape(20, 4)
+        storage = arena("token", "inplace")
+        for bucket, q in CASES:
+            contexts = [n + 7 for n in q]
+            queries = torch.randn(sum(q), 4, generator=generator)
+            state = storage.prepare(bucket, q, contexts, blocks, torch.arange(sum(q)))
+            expected = []
+            offset = 0
+            for row, (length, context) in enumerate(zip(q, contexts)):
+                k = keys[blocks[row].long()].flatten(0, 1)[:context]
+                v = values[blocks[row].long()].flatten(0, 1)[:context]
+                scores = queries[offset : offset + length] @ k.T / 2
+                visible = torch.arange(context)[None, :] <= torch.arange(context - length, context)[:, None]
+                expected.append(scores.masked_fill(~visible, float("-inf")).softmax(-1) @ v)
+                offset += length
+            actual = []
+            for token in range(sum(q)):
+                c = state.plan.context_lens[token]
+                k = keys[storage.blocks[token].long()].flatten(0, 1)[:c]
+                v = values[storage.blocks[token].long()].flatten(0, 1)[:c]
+                actual.append((queries[token] @ k.T / 2).softmax(-1) @ v)
+            torch.testing.assert_close(torch.stack(actual), torch.cat(expected), rtol=1e-5, atol=1e-6)
+
+    def test_token_capture_views_read_new_metadata_without_task_update(self):
+        storage = arena("token", "inplace")
+        state = prepare(storage, 20, CASES[4][1])
+        metadata = SimpleNamespace()
+        state.attach(metadata)
+        slot_view, starts_view = metadata.slot_mapping, metadata.query_start_loc
+        backend = FakeBackend()
+        backend.capturing = True
+        query = torch.zeros(20, 2, 16)
+        state.attention(backend, "layer0", query, query, query, query, query, 2, 2, 0.25)
+        backend.capturing = False
+        captured = state.tasks["layer0"].kwargs
+        for q in (CASES[5][1], CASES[0][1], CASES[4][1]):
+            prepare(storage, 20, q)
+            state.update(backend)
+            self.assertEqual(captured["seq_len"].tolist(), [1] * 20)
+            self.assertEqual(captured["context_lens"].tolist(), list(state.plan.context_lens))
+            self.assertEqual(captured["block_table"].tolist(), storage.blocks[:20].tolist())
+            self.assertEqual(slot_view.tolist(), storage.slots[:20].tolist())
+            self.assertEqual(starts_view.tolist(), list(range(21)))
+        self.assertEqual(len(backend.calls), 1)  # Capture only; no task updates.
 
     def test_other_bucket_shares_arena_not_task_handles(self):
         storage = arena()
