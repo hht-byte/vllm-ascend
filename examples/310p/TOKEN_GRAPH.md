@@ -7,11 +7,13 @@
 ## 当前验证状态
 
 - 用户此前的 context_lens 原地更新和同拓扑 task update 算子实验已通过；它不等价于此 splitfuse 图路径已通过。
-- 本地 18 项 CPU / 调用边界测试通过；Ruff 检查和 Python 编译检查通过。
+- 本地 19 项 CPU / 调用边界测试通过；Ruff 检查和 Python 编译检查通过。
 - 本会话运行环境为 Windows、CPU PyTorch 2.12.1，无法运行 torch_npu / 310P 测试。跨请求数设备精度、workspace、整模型与性能验收仍待完成。
 - 功能默认关闭。若算子不支持零 query 行或 task descriptor 更新，会报错，不会偷偷按请求数捕获另一张图。
 
 ## 先运行设备探针
+
+根据最新设备反馈，默认更新模式改为 `fixed + inplace`。task_update 保留为显式对照选项，不作为主路径。inplace 的 splitfuse capture 也已报告失败，因此该默认选择是实现方向，不代表设备验收通过。
 
 在打补丁后的 vLLM-Ascend 根目录执行，每种组合使用独立进程：
 
@@ -26,7 +28,7 @@ fixed 使用每桶固定请求容量；未用行 q_len=0，因此必须验证算
 通过所选模式的 20-token 探针后，扩大到全部桶。例如：
 
 ```bash
-python examples/310p/probe_token_graph.py --buckets 20 80 192 --layout fixed --update-mode task_update --repeats 5 --output all-buckets.json
+python examples/310p/probe_token_graph.py --buckets 20 80 192 --layout fixed --update-mode inplace --repeats 5 --output all-buckets.json
 ```
 
 探针复用运行时的 metadata arena 和 task 更新代码，覆盖下列场景：
@@ -44,6 +46,15 @@ python examples/310p/probe_token_graph.py --buckets 20 80 192 --layout fixed --u
 如某个模式失败，保存完整报错与软件版本；不要删除断言、放宽精度比较或在失败后自动重捕获。仅通过 context_lens 的旧测试，不足以选择 inplace 模式。
 
 ## Capture 报 allocator / PagedAttentionOperation 错误时
+
+后续 inplace 日志也在 capture_end 出现相同 PagedAttentionOperation / allocator 错误：task update 不是该错误的必要触发条件。退出清理期间的 `stream is captured` 出现在 capture 失败之后，不能当作独立的首因。当前优先使用 inplace：
+
+```bash
+ASCEND_LAUNCH_BLOCKING=1 python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode inplace --eager-only --output eager-inplace.json
+python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-mode inplace --graph-pool private --output private-inplace.json
+```
+
+如果第二条仍在 capture 失败，保持其它参数不变，增加 `--capture-case dense`，输出到另一个文件。dense 先捕获 `[1]*20`，无零 query 行、无 dummy、无多 query 请求；如果连它也不能 capture，则这些因素都不是失败的必要条件。若 dense capture 成功，后续仍在同一图上运行原有 8/10 请求用例，不增加 capture 次数。该对照使用同一 splitfuse_v2，不等同于其它 PA 算子的成功实验。
 
 2026-09-15 收到的 fixed/task_update 日志在 capture 内 `graph_task_group_end` 暴露异步错误，包含 `aclrtAllocatorGetByStream ... stream is not registered with any allocator`。尚未确认这是首个底层错误，也未证明与零 query 行或共享 pool 存在因果关系。`pool=((0,1),)` 是 torch_npu graph 上下文的正常参数包装日志，不要手动拆解 pool handle。
 
@@ -72,7 +83,7 @@ python examples/310p/probe_token_graph.py --buckets 20 --layout fixed --update-m
 --no-async-scheduling \
 --max-num-seqs 20 \
 --compilation-config '{"cudagraph_mode":"FULL","cudagraph_capture_sizes":[20,80,192],"max_cudagraph_capture_size":192}' \
---additional-config '{"token_graph_310p":{"enabled":true,"request_layout":"fixed","update_mode":"task_update"}}'
+--additional-config '{"token_graph_310p":{"enabled":true,"request_layout":"fixed","update_mode":"inplace"}}'
 ```
 
 `request_layout` / `update_mode` 必须与已通过的设备探针对应；如已有 additional-config，将 token_graph_310p 合并进去，不覆盖其他设置。不要同时启用 enforce-eager。超出最大桶的 batch 沿用 eager，不创建新桶。

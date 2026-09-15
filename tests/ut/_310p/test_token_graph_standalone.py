@@ -169,6 +169,11 @@ class TestTokenGraph(unittest.TestCase):
         state.update(backend)
         self.assertEqual(backend.calls, [])
 
+    def test_enabled_defaults_to_fixed_inplace(self):
+        config = tg.TokenGraphConfig.from_vllm(SimpleNamespace(additional_config={tg.CONFIG_KEY: {"enabled": True}}))
+        self.assertEqual(config.update_mode, "inplace")
+        self.assertEqual(config.request_layout, "fixed")
+
     def test_other_bucket_shares_arena_not_task_handles(self):
         storage = arena()
         a = prepare(storage, 20, CASES[4][1])

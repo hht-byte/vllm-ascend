@@ -21,7 +21,7 @@ PAD_SLOT = -1
 @dataclass(frozen=True)
 class TokenGraphConfig:
     enabled: bool = False
-    update_mode: str = "task_update"
+    update_mode: str = "inplace"
     request_layout: str = "fixed"
 
     @classmethod

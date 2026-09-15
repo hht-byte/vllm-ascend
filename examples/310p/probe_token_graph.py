@@ -78,7 +78,13 @@ def reference(query, key, value, blocks, qlens, contexts):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--layout", choices=("fixed", "active"), default="fixed")
-    parser.add_argument("--update-mode", choices=("inplace", "task_update"), default="task_update")
+    parser.add_argument("--update-mode", choices=("inplace", "task_update"), default="inplace")
+    parser.add_argument(
+        "--capture-case",
+        choices=("mixed", "dense"),
+        default="mixed",
+        help="dense starts bucket 20 with 20 positive single-query rows (no padding)",
+    )
     parser.add_argument("--buckets", type=int, nargs="+", default=[20, 80, 192])
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--graph-pool", choices=("shared", "private"), default="shared")
@@ -89,6 +95,8 @@ def main():
         parser.error("active layout requires task_update")
     if args.repeats < 1 or len(set(args.buckets)) != len(args.buckets) or any(b not in CASES for b in args.buckets):
         parser.error("Choose unique buckets from 20,80,192 and positive repeats")
+    if args.capture_case == "dense" and args.buckets != [20]:
+        parser.error("dense capture control requires --buckets 20")
     torch.set_num_threads(1)
     torch.manual_seed(310)
     torch.npu.set_device(0)
@@ -123,6 +131,7 @@ def main():
         update_mode=args.update_mode,
         graph_pool=args.graph_pool,
         eager_only=args.eager_only,
+        capture_case=args.capture_case,
         operator="_npu_paged_attention_splitfuse_v2",
         cases=[],
         captures=0,
@@ -145,8 +154,11 @@ def main():
         query, key, value, output, eager_output = buffers[bucket]
         graph = graphs.get(bucket)
         last_reference = None
-        for case_index, qlens in enumerate(CASES[bucket]):
-            iteration = repeat * len(CASES[bucket]) + case_index
+        cases = CASES[bucket]
+        if args.capture_case == "dense":
+            cases = [[1] * 20] + [q for q in cases if q != [1] * 20]
+        for case_index, qlens in enumerate(cases):
+            iteration = repeat * len(cases) + case_index
             sync()  # Do not overwrite host qLens while a replay may still read it.
             contexts = [n + (0, 63, 127, 129)[(row + iteration) % 4] for row, n in enumerate(qlens)]
             blocks = base_blocks.roll(iteration % MAX_REQS, dims=0)
