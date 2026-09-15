@@ -13,6 +13,24 @@
 
 ## 先运行设备探针
 
+### 固定八请求的正数 qLens 对照
+
+inputs、contexts、blocks 三组设备对照均已由用户报告每组一张图、8 轮精度通过。下一步隔离 qLens 分段变化：
+
+```bash
+python examples/310p/probe_token_graph.py --buckets 20 --layout active --update-mode inplace --graph-pool private --control qlens --output qlens.json
+```
+
+此专用对照始终向算子传入恰好 8 行，依次运行 `[3,3,3,3,2,2,2,2]`、`[2,2,2,2,3,3,3,3]`、`[1,1,1,1,4,4,4,4]`，再返回第一组。每组总 token 都是 20，全部 qLen 为正，context 始终为 `[130]*8`，block table、query 和新 K/V 固定。写入槽及每条请求的 token 归属随 qLens 相应变化；CPU 参考按相同语义更新 KV。
+
+这里的 active 仅用于取得精确的八行视图，所有轮次 shape 和地址保持不变。探针只为 `--control qlens` 允许这种固定形状的 active/inplace 组合；模型侧仍拒绝一般的 active/inplace。不要附加 `--capture-case dense`，否则会混入请求数变化。
+
+- 若首次 eager 或 capture 失败：尚未检验 qLens 动态更新，先定位八请求多 query 的基础路径。
+- 若首次精度通过，第二组 `[EAGER REFERENCE PASS]` 后 graph 精度失败：证明这组固定形状、全正数 qLens 分段切换不能由当前 inplace 路径正确完成，不再需要零 query 行或请求数变化才能触发。
+- 若全通过：只能确认该八请求对照，随后再验证零 query 行和 8/10 请求切换。
+
+日志 `[QLENS CONTROL]` 标明当前分布和 `rows=8`。失败时保留 `qlens.json` 与 `qlens.failure.pt`。
+
 最新设备结果（Ascend310P3、torch 2.10.0+cpu、torch_npu 2.10.0.post4）：private pool、fixed/inplace、dense capture 成功，首次 replay 最大绝对误差约 0.000615；切到第二组 8 请求后 replay 返回，但 97.4% 元素不满足精度要求，最大绝对差约 4.988。说明该算子路径在初始输入上可捕获并回放，尚不支持已测的整组 metadata 原地切换。不能将该结果归因于单独的 qLens，因为该轮同时改变了多项输入。
 
 先使用以下对照，始终保留 20 条单 query 请求。每个进程只选择一个 control：

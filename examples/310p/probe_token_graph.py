@@ -89,21 +89,23 @@ def main():
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument(
         "--control",
-        choices=("none", "inputs", "contexts", "blocks"),
+        choices=("none", "inputs", "contexts", "blocks", "qlens"),
         default="none",
-        help="Keep dense qLens fixed and vary only the selected input family",
+        help="Isolate an input family; qlens uses exactly eight positive request rows",
     )
     parser.add_argument("--graph-pool", choices=("shared", "private"), default="shared")
     parser.add_argument("--eager-only", action="store_true", help="Check the first case without capture, then exit")
     parser.add_argument("--output", type=Path, default=Path("token-graph-probe.json"))
     args = parser.parse_args()
-    if args.layout == "active" and args.update_mode != "task_update":
+    if args.layout == "active" and args.update_mode != "task_update" and args.control != "qlens":
         parser.error("active layout requires task_update")
     if args.repeats < 1 or len(set(args.buckets)) != len(args.buckets) or any(b not in CASES for b in args.buckets):
         parser.error("Choose unique buckets from 20,80,192 and positive repeats")
     if args.capture_case == "dense" and args.buckets != [20]:
         parser.error("dense capture control requires --buckets 20")
-    if args.control != "none" and (args.capture_case != "dense" or args.buckets != [20]):
+    if args.control == "qlens" and (args.layout != "active" or args.buckets != [20] or args.capture_case != "mixed"):
+        parser.error("qlens control requires --layout active --buckets 20 --capture-case mixed (the default)")
+    if args.control not in ("none", "qlens") and (args.capture_case != "dense" or args.buckets != [20]):
         parser.error("controls require --capture-case dense --buckets 20")
     torch.set_num_threads(1)
     torch.manual_seed(310)
@@ -168,14 +170,25 @@ def main():
             cases = [[1] * 20] + [q for q in cases if q != [1] * 20]
         if args.control != "none":
             cases = [[1] * 20] * 4
+        if args.control == "qlens":
+            # Exact eight-row views throughout: active slicing does NOT change
+            # descriptors in this control. No zero rows or dummy query tokens.
+            cases = [
+                [3, 3, 3, 3, 2, 2, 2, 2],
+                [2, 2, 2, 2, 3, 3, 3, 3],
+                [1, 1, 1, 1, 4, 4, 4, 4],
+                [3, 3, 3, 3, 2, 2, 2, 2],
+            ]
         for case_index, qlens in enumerate(cases):
             iteration = repeat * len(cases) + case_index
             sync()  # Do not overwrite host qLens while a replay may still read it.
             context_step = iteration if args.control in ("none", "contexts") else 0
             block_step = iteration if args.control in ("none", "blocks") else 0
             contexts = [n + (0, 63, 127, 129)[(row + context_step) % 4] for row, n in enumerate(qlens)]
+            if args.control == "qlens":
+                contexts = [130] * 8
             blocks = base_blocks.roll(block_step % MAX_REQS, dims=0)
-            if args.control in ("contexts", "blocks"):
+            if args.control in ("contexts", "blocks", "qlens"):
                 torch.manual_seed(310)  # Keep query and new K/V identical between iterations.
             slots = []
             for row, (n, c) in enumerate(zip(qlens, contexts)):
@@ -200,6 +213,19 @@ def main():
                 raise AssertionError("Test inputs failed to produce a distinct reference")
             last_reference = expected.clone()
             state = storage.prepare(bucket, qlens, contexts, blocks.to(device), torch.tensor(slots, device=device))
+            if args.control == "qlens":
+                if len(state.plan.query_lens) != 8 or min(state.plan.query_lens) <= 0 or sum(qlens) != 20:
+                    raise AssertionError("qLens control must retain exactly eight positive rows and 20 tokens")
+                print(
+                    "[QLENS CONTROL]",
+                    dict(
+                        iteration=iteration,
+                        qlens=qlens,
+                        contexts=contexts,
+                        rows=state.metadata_kwargs()["seq_len"].numel(),
+                    ),
+                    flush=True,
+                )
             # Snapshot cache to detect any writes outside real slots, including block 0.
             before_k = key_cache.cpu().clone()
             before_v = value_cache.cpu().clone()
