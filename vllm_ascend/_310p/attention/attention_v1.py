@@ -109,6 +109,22 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         super().__init__(*args, **kwargs)
         self.support_compressed_mask = is_compressed_mask_supported()
 
+    def forward(self, layer, query, key, value, kv_cache, attn_metadata,
+                output=None, output_scale=None, output_block_scale=None):
+        state = getattr(attn_metadata, "token_graph_state", None)
+        if state is not None:
+            if (self.sliding_window is not None or self.alibi_slopes is not None
+                    or self.kv_sharing_target_layer_name is not None
+                    or self.sinks is not None
+                    or not attn_metadata.causal):
+                raise ValueError("Token graphs require ordinary causal attention without sliding window or KV sharing")
+            self._token_graph_layer_name = layer.layer_name
+            # Upstream may replace slot_mapping. Always restore our persistent
+            # graph-local view before fixed-T reshape_and_cache.
+            state.attach(attn_metadata)
+        return super().forward(layer, query, key, value, kv_cache, attn_metadata,
+                               output=output, output_scale=output_scale, output_block_scale=output_block_scale)
+
     def _flash_attention(
         self,
         query: torch.Tensor,
@@ -326,6 +342,15 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         Raises:
             NotImplementedError: If the attention state is not supported on 310P.
         """
+        token_state = getattr(attn_metadata, "token_graph_state", None)
+        if token_state is not None:
+            if query.shape[0] != token_state.plan.bucket:
+                raise ValueError("Token graph query shape differs from its bucket")
+            return token_state.attention(
+                torch_npu, self._token_graph_layer_name, query, self.key_cache, self.value_cache,
+                AttentionMaskBuilder310.get_compressed_splitfuse_mask(query.device),
+                output, self.num_heads, self.num_kv_heads, self.scale,
+            )
         state = attn_metadata.attn_state
         # Condition for PrefillNoCache: No previous tokens have been processed yet
         if state == AscendAttentionState.PrefillNoCache:
