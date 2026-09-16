@@ -1,0 +1,10 @@
+{
+  "model": "/absolute/path/to/your/model",
+  "dtype": "float16",
+  "max_model_len": 2048,
+  "gpu_memory_utilization": 0.8,
+  "max_num_seqs": 20,
+  "max_num_batched_tokens": 192,
+  "enable_prefix_caching": false,
+  "enable_chunked_prefill": true
+}

@@ -42,6 +42,8 @@ python examples/310p/probe_token_graph.py --buckets 20 80 192 --layout token --u
 
 ## 模型侧启用
 
+整模型 eager/graph 对照脚本与样本格式见 [模型验收](MODEL_ACCEPTANCE.md)。
+
 只有探针在目标设备上通过后，再将以下选项合并进原启动命令：
 
 ```bash
@@ -62,7 +64,7 @@ python examples/310p/probe_token_graph.py --buckets 20 80 192 --layout token --u
 - host qLens 初始化为全 1，token 布局不再改写它。device context/block table/slot mapping 原地更新，回放前保守同步；attention 仍在每层只发起一个算子调用。
 - task 记录仍保留每层每桶 query/output 强引用，图激活显存不保证只按最大桶增长。弱引用和更细同步需额外设备验证。
 - splitfuse_v2 Python 接口不提供显式 workspace 管理。当前依赖 ATB，不能声称已证明长度变化下的全范围 workspace 上界。
-- 新 token 布局目前只有 CPU 语义和接入边界验证；旧输入/context/block table 的设备结果是设计依据，不能替代新布局的组合、padding、多桶、整模型精度和性能验收。
+- 2026-09-16 用户设备日志确认：token qLens 对照 1 图/8 case、20-token 请求切换 1 图/16 case、shared pool 的 20/80/192 多桶交错回放 3 图/30 case 均通过。多桶最大误差约 0.002361；storage_offset 警告仍未关闭。此结果是算子探针验收，不替代整模型精度和性能验收。
 
 ## CPU 检查与历史记录
 

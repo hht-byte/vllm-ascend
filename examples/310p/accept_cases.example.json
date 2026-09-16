@@ -1,0 +1,5 @@
+[
+  {"id": "text-short", "prompt": "Explain why the sky looks blue in one sentence."},
+  {"id": "text-medium", "prompt": "Write a short explanation of how a computer stores text. Mention characters, encoding, and bytes, and use a concrete example."},
+  {"id": "text-long", "prompt": "Compare travelling by train and travelling by car for a family holiday. Discuss journey time, flexibility, luggage, rest stops, cost, and environmental impact. Give a balanced recommendation for a short trip and for a long trip. Explain which assumptions your recommendation depends on."}
+]
