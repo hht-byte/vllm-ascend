@@ -21,7 +21,10 @@ replace, or recapture missing graphs. No `graph_task_update` is used by this mod
 ## Fresh prefill representation
 
 All Q/K/V tokens in bucket T are packed into one virtual sequence with constant
-`seq_len=[T]`. A persistent device additive mask permits attention exactly when
+`seq_len=[T]`. FA v3 receives a separate immutable CPU int32 length tensor for
+each bucket, matching the op-plugin SelfAttention V3 test contract. It is not
+the device context-length buffer used by PA, and cannot be shared or overwritten
+when another bucket runs. A persistent device additive mask permits attention exactly when
 query and key belong to the same request and key position is not after query
 position. Padding belongs to a separate virtual request; its KV write slots are
 `-1`. Real positions/RoPE and scheduler request boundaries are unchanged.
@@ -58,6 +61,16 @@ captures every bucket before replay workloads, revisits buckets sharing metadata
 and checks changed request counts, partitions, padding, contexts and block tables.
 It poisons graph outputs before replay and snapshots them before eager reference
 execution. The report is saved on failure; capture failures require a new process.
+
+If failure occurs at `[EAGER]`, isolate native setup before investigating graphs:
+
+```bash
+python examples/310p/probe_phase_graph.py --family prefill --buckets 192 --eager-only --output prefill-eager.json
+```
+
+`[INPUTS]` records shapes, devices, dtypes, addresses, strides, NPU formats and
+host length values. The report separates cache-write, attention and capture/replay
+stages. An eager-only pass does not validate graph capture or dynamic mask replay.
 
 ## Full-model configuration and acceptance
 

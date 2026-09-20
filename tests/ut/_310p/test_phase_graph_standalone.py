@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU contracts for native attention graph routing and metadata."""
 
+import ast
 import importlib.util
 import sys
 import unittest
@@ -18,6 +19,35 @@ spec.loader.exec_module(tg)
 
 
 class TestPhaseGraphs(unittest.TestCase):
+    def test_real_prefill_forward_passes_host_lengths_to_flash(self):
+        source = ROOT / "vllm_ascend/_310p/attention/attention_v1.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                   and n.name == "AscendAttentionBackendImpl310")
+        method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward_prefill_310")
+        env = {}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), env)
+        lengths = torch.tensor([20], dtype=torch.int32)
+        metadata = SimpleNamespace(native_graph_state=SimpleNamespace(flash_seq_lens=lengths),
+                                   seq_lens=object(), attn_mask=object())
+        impl = SimpleNamespace(_flash_attention=lambda q, k, v, mask, seq, out: seq)
+        self.assertIs(env["forward_prefill_310"](impl, None, None, None, metadata, None), lengths)
+
+    def test_flash_lengths_are_immutable_host_tensors_owned_by_each_bucket(self):
+        arena = tg.NativeGraphArena(80, 10, 4, 512, "cpu", "prefill")
+        blocks = torch.zeros(10, 4, dtype=torch.int32)
+        small = arena.prepare(20, [7, 5], [7, 5], blocks, torch.arange(12))
+        lengths = small.flash_seq_lens
+        self.assertEqual(lengths.device.type, "cpu")
+        self.assertEqual(lengths.dtype, torch.int32)
+        self.assertEqual(lengths.tolist(), [20])
+        large = arena.prepare(80, [70], [70], blocks, torch.arange(70))
+        self.assertEqual(large.flash_seq_lens.tolist(), [80])
+        self.assertEqual(lengths.tolist(), [20])
+        self.assertNotEqual(large.flash_seq_lens.data_ptr(), lengths.data_ptr())
+        again = arena.prepare(20, [2] * 10, [2] * 10, blocks, torch.arange(20))
+        self.assertIs(again.flash_seq_lens, lengths)
+
     def test_packed_flash_mask_matches_independent_request_attention(self):
         torch.manual_seed(310)
         arena = tg.NativeGraphArena(20, 10, 4, 512, "cpu", "prefill")

@@ -241,7 +241,7 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             # Fixed virtual sequence [T], with dynamic block-diagonal causal
             # mask. No device -> host scalar reads inside capture.
             return self._flash_attention(
-                query, key, value, attn_metadata.attn_mask, attn_metadata.seq_lens, output,
+                query, key, value, attn_metadata.attn_mask, attn_metadata.native_graph_state.flash_seq_lens, output,
             )
         real_tokens = int(attn_metadata.seq_lens.sum().item())
         seq_len = attn_metadata.seq_lens

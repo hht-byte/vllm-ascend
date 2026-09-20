@@ -62,6 +62,12 @@ def flash_reference(query, key, value, qlens):
     return torch.stack(outputs)
 
 
+def tensor_descriptor(tensor):
+    return dict(shape=list(tensor.shape), dtype=str(tensor.dtype), device=str(tensor.device),
+                stride=list(tensor.stride()), storage_offset=tensor.storage_offset(), ptr=tensor.data_ptr(),
+                npu_format=torch_npu.get_npu_format(tensor) if tensor.device.type != "cpu" else None)
+
+
 def main():
     from types import SimpleNamespace
 
@@ -69,6 +75,7 @@ def main():
     parser.add_argument("--family", choices=("prefill", "decode"), required=True)
     parser.add_argument("--buckets", type=int, nargs="+", default=[20, 80, 192])
     parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--eager-only", action="store_true", help="Validate native inputs without any graph capture")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.repeats < 1 or len(set(args.buckets)) != len(args.buckets) or any(b not in CASES for b in args.buckets):
@@ -94,7 +101,8 @@ def main():
     pool = torch.npu.graph_pool_handle()
     buffers, graphs = {}, {}
     report = dict(family=args.family, torch=torch.__version__, torch_npu=torch_npu.__version__,
-                  device=torch.npu.get_device_name(0), captures=0, cases=[], passed=False)
+                  device=torch.npu.get_device_name(0), eager_only=args.eager_only,
+                  captures=0, eager_checks=[], cases=[], passed=False)
     for bucket in args.buckets:
         buffers[bucket] = (
             torch.zeros(bucket, HEADS, HEAD_SIZE, device=device, dtype=torch.float16),
@@ -128,13 +136,24 @@ def main():
         expected = (flash_reference(q_cpu, k_cpu, v_cpu, qlens) if args.family == "prefill"
                     else reference(q_cpu, key_nd, value_nd, tables, qlens, contexts))
 
-        def forward():
+        def forward(diagnose=False):
+            if diagnose:
+                report["stage"] = "reshape_and_cache"
             torch_npu._npu_reshape_and_cache(k, v, op.key_cache, op.value_cache, metadata.slot_mapping)
+            if diagnose:
+                sync()
+                report["stage"] = "attention"
             if args.family == "prefill":
                 op.forward_prefill_310(q, k, v, metadata, output)
             else:
                 op.forward_paged_attention(q, metadata, output)
 
+        report["inputs"] = dict(bucket=bucket, scheduled=qlens, stream=str(torch.npu.current_stream()),
+                                query=tensor_descriptor(q), key=tensor_descriptor(k), value=tensor_descriptor(v))
+        if args.family == "prefill":
+            report["inputs"].update(seq_len=tensor_descriptor(state.flash_seq_lens),
+                                    seq_len_values=state.flash_seq_lens.tolist(),
+                                    mask=tensor_descriptor(arena.prefill_mask))
         return forward, expected, state
 
     try:
@@ -146,16 +165,26 @@ def main():
                 qlens[-1] += bucket % rows
             forward, expected, state = prepare(bucket, qlens, 0)
             print("[EAGER]", args.family, bucket, flush=True)
-            forward()
+            print("[INPUTS]", json.dumps(report["inputs"]), flush=True)
+            forward(diagnose=True)
             sync()
-            check(buffers[bucket][3][:sum(qlens)], expected, "eager vs CPU")
+            diff = check(buffers[bucket][3][:sum(qlens)], expected, "eager vs CPU")
+            report["eager_checks"].append(dict(bucket=bucket, max_abs_diff=diff))
+            if args.eager_only:
+                continue
             graph = torch.npu.NPUGraph()
             print("[CAPTURE]", args.family, bucket, flush=True)
+            report["stage"] = "capture"
             with torch.npu.graph(graph, pool=pool):
                 forward()
             sync()
             graphs[bucket] = graph
             report["captures"] += 1
+        if args.eager_only:
+            report["passed"] = True
+            report["stage"] = "eager_complete"
+            print(f"EAGER PASS: {len(report['eager_checks'])} buckets; no graphs captured.", flush=True)
+            return
         for repeat in range(args.repeats):
             for bucket in args.buckets:
                 cases = CASES[bucket] if args.family == "prefill" else [[1] * n for n in (1, 8, 10, 20)]
@@ -164,11 +193,12 @@ def main():
                     output = buffers[bucket][3]
                     output.fill_(float("nan"))
                     sync()
+                    report["stage"] = "replay"
                     graphs[bucket].replay()
                     sync()
                     actual = output[:sum(qlens)].cpu().clone()
                     # Snapshot graph output BEFORE eager overwrites the same output.
-                    forward()
+                    forward(diagnose=True)
                     sync()
                     check(output[:sum(qlens)], expected, "changed-layout eager vs CPU")
                     diff = check(actual, expected, "graph vs CPU")
@@ -179,6 +209,7 @@ def main():
                     report["cases"].append(event)
                     print("[PASS]", json.dumps(event), flush=True)
         report["passed"] = True
+        report["stage"] = "complete"
     except Exception as exc:
         report["error"] = repr(exc)
         raise

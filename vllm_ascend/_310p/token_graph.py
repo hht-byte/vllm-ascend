@@ -284,6 +284,12 @@ class NativeGraphArena(TokenGraphArena):
             state = NativeGraphState(self, state.plan)
             self.states[bucket] = state
         if self.family == "prefill":
+            if state.flash_seq_lens is None:
+                # FA v3 consumes host lengths during ATB Setup. Never share or
+                # overwrite these between buckets: captures may retain hostData.
+                state.flash_seq_lens = torch.tensor(
+                    [bucket], dtype=torch.int32, device="cpu", pin_memory=self.device.type != "cpu",
+                )
             # Pack the bucket into one virtual FA sequence. Request boundaries
             # live in a device mask, so neither host qLens nor zero-length rows
             # participate in FA graph replay. Padding is a separate sequence.
@@ -326,6 +332,7 @@ class NativeGraphArena(TokenGraphArena):
 @dataclass
 class NativeGraphState(TokenGraphState):
     scheduled_query_lens: tuple[int, ...] = ()
+    flash_seq_lens: torch.Tensor | None = None
 
     def attach(self, metadata):
         super().attach(metadata)
