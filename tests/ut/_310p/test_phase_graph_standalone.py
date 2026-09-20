@@ -25,13 +25,34 @@ class TestPhaseGraphs(unittest.TestCase):
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
                    and n.name == "AscendAttentionBackendImpl310")
         method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward_prefill_310")
-        env = {}
+        calls = []
+        env = {"torch_npu": SimpleNamespace(_npu_flash_attention=lambda **kwargs: calls.append(kwargs))}
         exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), env)
         lengths = torch.tensor([20], dtype=torch.int32)
         metadata = SimpleNamespace(native_graph_state=SimpleNamespace(flash_seq_lens=lengths),
                                    seq_lens=object(), attn_mask=object())
-        impl = SimpleNamespace(_flash_attention=lambda q, k, v, mask, seq, out: seq)
-        self.assertIs(env["forward_prefill_310"](impl, None, None, None, metadata, None), lengths)
+        impl = SimpleNamespace(num_heads=8, num_kv_heads=2, scale=0.125)
+        output = object()
+        self.assertIs(env["forward_prefill_310"](impl, None, None, None, metadata, output), output)
+        self.assertIs(calls[0]["seq_len"], lengths)
+        self.assertIs(calls[0]["mask"], metadata.attn_mask)
+
+    def test_normal_masks_are_aligned_and_owned_by_bucket(self):
+        arena = tg.NativeGraphArena(80, 10, 4, 512, "cpu", "prefill")
+        blocks = torch.zeros(10, 4, dtype=torch.int32)
+        small = arena.prepare(20, [7, 5], [7, 5], blocks, torch.arange(12))
+        meta = SimpleNamespace()
+        small.attach(meta)
+        mask = meta.attn_mask
+        self.assertEqual(tuple(mask.shape), (1, 2, 32, 16))
+        large = arena.prepare(80, [70], [70], blocks, torch.arange(70))
+        large.attach(meta)
+        self.assertEqual(tuple(meta.attn_mask.shape), (1, 5, 80, 16))
+        small.attach(meta)
+        self.assertIs(meta.attn_mask, mask)
+        again = arena.prepare(20, [2] * 10, [2] * 10, blocks, torch.arange(20))
+        again.attach(meta)
+        self.assertIs(meta.attn_mask, mask)
 
     def test_flash_lengths_are_immutable_host_tensors_owned_by_each_bucket(self):
         arena = tg.NativeGraphArena(80, 10, 4, 512, "cpu", "prefill")

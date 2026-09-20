@@ -108,8 +108,8 @@ class NPUModelRunner310(NPUModelRunner):
                 raise ValueError("token_graph_310p does not support ENPU or prefix-LM attention")
             if not hasattr(torch_npu, "_npu_paged_attention_splitfuse_v2"):
                 raise ValueError("token_graph_310p requires compressed splitfuse_v2")
-            if self.token_graph_config.phase_routing and not hasattr(torch_npu, "_npu_flash_attention_v3"):
-                raise ValueError("phase_routing requires compressed flash_attention_v3")
+            if self.token_graph_config.phase_routing and not hasattr(torch_npu, "_npu_flash_attention"):
+                raise ValueError("phase_routing requires flash_attention with normal masking")
             self.cudagraph_dispatcher = TokenGraphDispatcher310(self.vllm_config)
             logger.warning("Experimental 310P token graphs enabled; validate qLens and request-count replay on device.")
         self.input_batch = NPUInputBatch(

@@ -64,7 +64,7 @@ def worker_audit(worker, action="snapshot", phase=""):
                     event="replay" if entry is not None and entry.aclgraph is not None else "capture",
                     bucket=desc.num_tokens,
                     family=family,
-                    operator={"prefill": "_npu_flash_attention_v3", "decode": "_npu_paged_attention",
+                    operator={"prefill": "_npu_flash_attention", "decode": "_npu_paged_attention",
                               "token": "_npu_paged_attention_splitfuse_v2"}[family],
                     actual_tokens=state.plan.actual_tokens,
                     actual_reqs=state.plan.actual_reqs,

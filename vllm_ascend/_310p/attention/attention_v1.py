@@ -240,9 +240,15 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         if getattr(attn_metadata, "native_graph_state", None) is not None:
             # Fixed virtual sequence [T], with dynamic block-diagonal causal
             # mask. No device -> host scalar reads inside capture.
-            return self._flash_attention(
-                query, key, value, attn_metadata.attn_mask, attn_metadata.native_graph_state.flash_seq_lens, output,
+            # v3 hardcodes compressed triangular masking, which cannot express
+            # the masked lower-triangle regions between packed requests.
+            torch_npu._npu_flash_attention(
+                query=query, key=key, value=value, mask=attn_metadata.attn_mask,
+                seq_len=attn_metadata.native_graph_state.flash_seq_lens,
+                scale_value=self.scale, num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads, out=output,
             )
+            return output
         real_tokens = int(attn_metadata.seq_lens.sum().item())
         seq_len = attn_metadata.seq_lens
         aligned_tokens = int(query.shape[0])

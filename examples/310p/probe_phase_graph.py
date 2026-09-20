@@ -101,6 +101,7 @@ def main():
     pool = torch.npu.graph_pool_handle()
     buffers, graphs = {}, {}
     report = dict(family=args.family, torch=torch.__version__, torch_npu=torch_npu.__version__,
+                  operator="_npu_flash_attention" if args.family == "prefill" else "_npu_paged_attention",
                   device=torch.npu.get_device_name(0), eager_only=args.eager_only,
                   captures=0, eager_checks=[], cases=[], passed=False)
     for bucket in args.buckets:
@@ -148,7 +149,8 @@ def main():
             else:
                 op.forward_paged_attention(q, metadata, output)
 
-        report["inputs"] = dict(bucket=bucket, scheduled=qlens, stream=str(torch.npu.current_stream()),
+        report["inputs"] = dict(bucket=bucket, scheduled=qlens, operator=report["operator"],
+                                stream=str(torch.npu.current_stream()),
                                 query=tensor_descriptor(q), key=tensor_descriptor(k), value=tensor_descriptor(v))
         if args.family == "prefill":
             report["inputs"].update(seq_len=tensor_descriptor(state.flash_seq_lens),

@@ -269,9 +269,7 @@ class NativeGraphArena(TokenGraphArena):
         super().__init__(max_tokens, max_reqs, max_blocks, max_context, device,
                          TokenGraphConfig(request_layout=layout))
         self.prefill_mask = None
-        self._prefill_mask_layout = None
-        self.prefill_mask_cpu = (torch.full((COMPRESSED_MASK_SIZE, COMPRESSED_MASK_SIZE), float("-inf"),
-                                          dtype=torch.float16) if family == "prefill" else None)
+        self.prefill_mask_cpu = None
 
     def prepare(self, bucket, query_lens, context_lens, blocks, slots):
         query_lens, context_lens = tuple(query_lens), tuple(context_lens)
@@ -285,7 +283,7 @@ class NativeGraphArena(TokenGraphArena):
             self.states[bucket] = state
         if self.family == "prefill":
             if state.flash_seq_lens is None:
-                # FA v3 consumes host lengths during ATB Setup. Never share or
+                # FA consumes host lengths during ATB Setup. Never share or
                 # overwrite these between buckets: captures may retain hostData.
                 state.flash_seq_lens = torch.tensor(
                     [bucket], dtype=torch.int32, device="cpu", pin_memory=self.device.type != "cpu",
@@ -300,13 +298,20 @@ class NativeGraphArena(TokenGraphArena):
             self.qlens[0] = bucket
             self.starts_cpu[:2].copy_(torch.tensor([0, bucket], dtype=torch.int32))
             self.starts[:2].copy_(self.starts_cpu[:2], non_blocking=True)
-            self._prepare_prefill_mask(bucket, query_lens)
+            self._prepare_prefill_mask(state, bucket, query_lens)
         state.scheduled_query_lens = query_lens
         return state
 
-    def _prepare_prefill_mask(self, bucket, query_lens):
+    def _prepare_prefill_mask(self, state, bucket, query_lens):
+        # MASK_TYPE_NORM accepts an arbitrary additive mask. The compressed v3
+        # triangular optimization cannot represent cross-request masked tiles.
+        size = (bucket + 15) // 16 * 16
+        if state.prefill_mask_cpu is None:
+            state.prefill_mask_cpu = torch.full((size, size), float("-inf"), dtype=torch.float16)
+        self.prefill_mask_cpu = state.prefill_mask_cpu
+        self.prefill_mask = state.prefill_mask
         layout = (bucket, tuple(query_lens))
-        if layout == self._prefill_mask_layout:
+        if layout == state.prefill_mask_layout:
             return
         owners = torch.repeat_interleave(torch.arange(len(query_lens)), torch.tensor(query_lens))
         owners = torch.cat((owners, torch.full((bucket - sum(query_lens),), -1)))
@@ -316,23 +321,27 @@ class NativeGraphArena(TokenGraphArena):
         active.fill_(float("-inf"))
         active.masked_fill_(visible, 0)
         # Match AttentionMaskBuilder310._get_causal_mask / nd_to_nz_2d.
-        formatted = self.prefill_mask_cpu.reshape(1, COMPRESSED_MASK_SIZE, COMPRESSED_MASK_SIZE // 16, 16)
+        formatted = self.prefill_mask_cpu.reshape(1, size, size // 16, 16)
         formatted = formatted.transpose(1, 2).contiguous().to(self.device)
         if self.device.type != "cpu":
             import torch_npu
 
             formatted = torch_npu.npu_format_cast(formatted, NATIVE_MASK_FORMAT)
-        if self.prefill_mask is None:
-            self.prefill_mask = formatted
+        if state.prefill_mask is None:
+            state.prefill_mask = formatted
         else:
-            self.prefill_mask.copy_(formatted)
-        self._prefill_mask_layout = layout
+            state.prefill_mask.copy_(formatted)
+        self.prefill_mask = state.prefill_mask
+        state.prefill_mask_layout = layout
 
 
 @dataclass
 class NativeGraphState(TokenGraphState):
     scheduled_query_lens: tuple[int, ...] = ()
     flash_seq_lens: torch.Tensor | None = None
+    prefill_mask: torch.Tensor | None = None
+    prefill_mask_cpu: torch.Tensor | None = None
+    prefill_mask_layout: tuple | None = None
 
     def attach(self, metadata):
         super().attach(metadata)
@@ -340,7 +349,7 @@ class NativeGraphState(TokenGraphState):
         metadata.native_graph_state = self
         metadata.query_lens_cpu = self.arena.qlens[:len(self.plan.query_lens)]
         if self.arena.family == "prefill":
-            metadata.attn_mask = self.arena.prefill_mask
+            metadata.attn_mask = self.prefill_mask
 
 
 def validate_token_graph_config(config):

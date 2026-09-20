@@ -8,7 +8,7 @@ validation; the new native FA/PA graphs require the probes below on the target
 
 | Scheduler batch | Graph family | Operator |
 | --- | --- | --- |
-| All scheduled tokens are prompt tokens, no computed prefix | prefill | `_npu_flash_attention_v3` |
+| All scheduled tokens are prompt tokens, no computed prefix | prefill | `_npu_flash_attention` (normal mask) |
 | All prompts are complete and every request schedules one token | decode | `_npu_paged_attention` |
 | Cached/chunked prefill, mixed batches, multi-token verification | token | `_npu_paged_attention_splitfuse_v2` |
 
@@ -21,8 +21,8 @@ replace, or recapture missing graphs. No `graph_task_update` is used by this mod
 ## Fresh prefill representation
 
 All Q/K/V tokens in bucket T are packed into one virtual sequence with constant
-`seq_len=[T]`. FA v3 receives a separate immutable CPU int32 length tensor for
-each bucket, matching the op-plugin SelfAttention V3 test contract. It is not
+`seq_len=[T]`. FA receives a separate immutable CPU int32 length tensor for
+each bucket, matching the op-plugin SelfAttention host-length contract. It is not
 the device context-length buffer used by PA, and cannot be shared or overwritten
 when another bucket runs. A persistent device additive mask permits attention exactly when
 query and key belong to the same request and key position is not after query
@@ -31,14 +31,21 @@ position. Padding belongs to a separate virtual request; its KV write slots are
 
 Thus an 8-request partition and a 10-request partition reuse one FA graph at
 the same T, without changing the operator's lengths or tensor shapes. The mask
-is updated in place before replay. This requires the compressed FA v3 mask path
-to honor the block-diagonal mask; the probe compares eager and replay to an
-independent per-request CPU causal reference. If it fails, do not enable phase
+is updated in place before replay. The original FA v3 implementation failed the
+192-token eager probe on device: its compressed triangular mask cannot represent
+the masked lower-triangle regions between requests. The packed path now explicitly
+uses `_npu_flash_attention` with `MASK_TYPE_NORM`; the existing non-graph FA v3 path
+is unchanged. See the [compressed mask constraints](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/920beta1/acce/ascendtb/ascendtb_01_0358.html).
+The probe compares eager and replay to an independent per-request CPU causal
+reference. Normal-mask execution and replay still need target-device validation.
+If either fails, do not enable phase
 routing. No fallback to a different operator or runtime capture is performed.
 
-The first version rebuilds/uploads the 2048x2048 FP16 compressed-mask backing
-when the partition changes (8 MiB logical data). Identical consecutive layouts
-reuse it. This adds preparation cost, and packing may compute masked cross-request
+Each bucket owns an FP16 normal mask with both dimensions rounded up to 16,
+in NZ format. Its address and shape stay fixed across replay and bucket switches.
+Logical mask storage is `2 * ceil(T/16)^2 * 16^2` bytes per bucket; changed partitions
+rebuild/upload that bucket's mask, while identical layouts reuse it.
+This adds preparation cost, and packing may compute masked cross-request
 scores. Measure end-to-end latency and memory; do not assume a speedup over the
 previous token implementation. Only fresh prefill uses this representation.
 
