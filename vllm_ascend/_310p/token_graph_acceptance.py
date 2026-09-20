@@ -30,6 +30,7 @@ def worker_audit(worker, action="snapshot", phase=""):
                     event="dispatch",
                     mode=result[0].name,
                     bucket=result[1].num_tokens,
+                    family=getattr(result[1], "attention_family", "token"),
                     actual_reqs=values["num_reqs"],
                     scheduled=scheduled,
                     phase=worker._token_acceptance["phase"],
@@ -47,16 +48,24 @@ def worker_audit(worker, action="snapshot", phase=""):
             event = None
             if full:
                 entry = wrapper.concrete_aclgraph_entries.get(desc)
-                arena = getattr(runner, "_token_graph_arena", None)
+                family = getattr(desc, "attention_family", "token")
+                arena = (getattr(runner, "_native_graph_arenas", {}).get(family) if family != "token"
+                         else getattr(runner, "_token_graph_arena", None))
                 state = arena.states.get(desc.num_tokens) if arena is not None else None
                 if state is None:
-                    raise RuntimeError("FULL replay without token arena state")
-                counts = [0] * state.plan.actual_reqs
-                for row in state.plan.row_requests[: state.plan.actual_tokens]:
-                    counts[row] += 1
+                    raise RuntimeError(f"FULL replay without {family} arena state")
+                if family != "token":
+                    counts = list(state.scheduled_query_lens)
+                else:
+                    counts = [0] * state.plan.actual_reqs
+                    for row in state.plan.row_requests[: state.plan.actual_tokens]:
+                        counts[row] += 1
                 event = dict(
                     event="replay" if entry is not None and entry.aclgraph is not None else "capture",
                     bucket=desc.num_tokens,
+                    family=family,
+                    operator={"prefill": "_npu_flash_attention_v3", "decode": "_npu_paged_attention",
+                              "token": "_npu_paged_attention_splitfuse_v2"}[family],
                     actual_tokens=state.plan.actual_tokens,
                     actual_reqs=state.plan.actual_reqs,
                     scheduled=counts,
@@ -86,6 +95,7 @@ def worker_audit(worker, action="snapshot", phase=""):
                 entries.append(
                     dict(
                         bucket=desc.num_tokens,
+                        family=getattr(desc, "attention_family", "token"),
                         num_reqs=desc.num_reqs,
                         uniform=desc.uniform,
                         graph_id=id(entry.aclgraph),

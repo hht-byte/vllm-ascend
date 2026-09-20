@@ -8,7 +8,7 @@ NOT inferred from the successful context_lens-only experiment. Token layout
 keeps operator qLens constant and expresses causality using per-token contexts.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
@@ -17,6 +17,7 @@ CONFIG_KEY = "token_graph_310p"
 COMPRESSED_MASK_SIZE = 2048
 COMPRESSED_MASK_TYPE = 5
 PAD_SLOT = -1
+NATIVE_MASK_FORMAT = 29
 
 
 @dataclass(frozen=True)
@@ -24,18 +25,21 @@ class TokenGraphConfig:
     enabled: bool = False
     update_mode: str = "inplace"
     request_layout: str = "token"
+    phase_routing: bool = False
 
     @classmethod
     def from_vllm(cls, config):
         values = (config.additional_config or {}).get(CONFIG_KEY, {})
         if not isinstance(values, dict):
             raise ValueError(f"{CONFIG_KEY} must be an object")
-        unknown = set(values) - {"enabled", "update_mode", "request_layout"}
+        unknown = set(values) - {"enabled", "update_mode", "request_layout", "phase_routing"}
         if unknown:
             raise ValueError(f"Unknown {CONFIG_KEY} settings: {sorted(unknown)}")
         result = cls(**values)
         if type(result.enabled) is not bool:
             raise ValueError("enabled must be a boolean")
+        if type(result.phase_routing) is not bool:
+            raise ValueError("phase_routing must be a boolean")
         if result.update_mode not in ("inplace", "task_update"):
             raise ValueError("update_mode must be inplace or task_update")
         if result.request_layout not in ("token", "fixed", "active"):
@@ -44,7 +48,25 @@ class TokenGraphConfig:
             raise ValueError("active request views require task_update")
         if result.enabled and result.request_layout == "fixed" and result.update_mode == "inplace":
             raise ValueError("fixed/inplace cannot replay changing host qLens; use request_layout=token")
+        if result.phase_routing and (result.request_layout != "token" or result.update_mode != "inplace"):
+            raise ValueError("phase_routing requires request_layout=token and update_mode=inplace")
         return result
+
+
+def classify_graph_family(query_lens, computed_tokens, prompt_tokens):
+    """Classify scheduler rows before padding; verification belongs to token graphs."""
+    q, computed, prompts = (tuple(int(x) for x in values)
+                            for values in (query_lens, computed_tokens, prompt_tokens))
+    if not q or len(q) != len(computed) or len(q) != len(prompts):
+        raise ValueError("Graph routing requires matching nonempty scheduler rows")
+    if any(n <= 0 or c < 0 or p < 0 for n, c, p in zip(q, computed, prompts)):
+        raise ValueError("Invalid scheduler lengths")
+    # A step crossing the prompt boundary is not pure prefill.
+    if all(c < p and c + n <= p for n, c, p in zip(q, computed, prompts)):
+        return "prefill" if all(c == 0 for c in computed) else "token"
+    if all(n == 1 and c >= p for n, c, p in zip(q, computed, prompts)):
+        return "decode"
+    return "token"
 
 
 @dataclass(frozen=True)
@@ -233,6 +255,85 @@ class TokenGraphState:
             finally:
                 backend.npu.graph_task_update_end(stream)
             task.kwargs = kwargs
+
+
+class NativeGraphArena(TokenGraphArena):
+    """Persistent metadata for one native operator family, still keyed only by T."""
+
+    def __init__(self, max_tokens, max_reqs, max_blocks, max_context, device, family):
+        if family not in ("prefill", "decode"):
+            raise ValueError("Unknown native graph family")
+        self.family = family
+        # Decode has one row per padded token; native prefill retains multi-query rows.
+        layout = "token" if family == "decode" else "fixed"
+        super().__init__(max_tokens, max_reqs, max_blocks, max_context, device,
+                         TokenGraphConfig(request_layout=layout))
+        self.prefill_mask = None
+        self._prefill_mask_layout = None
+        self.prefill_mask_cpu = (torch.full((COMPRESSED_MASK_SIZE, COMPRESSED_MASK_SIZE), float("-inf"),
+                                          dtype=torch.float16) if family == "prefill" else None)
+
+    def prepare(self, bucket, query_lens, context_lens, blocks, slots):
+        query_lens, context_lens = tuple(query_lens), tuple(context_lens)
+        if self.family == "decode" and any(q != 1 for q in query_lens):
+            raise ValueError("PA graphs require one query per request")
+        if self.family == "prefill" and query_lens != context_lens:
+            raise ValueError("Flash prefill cannot consume cached prefixes")
+        state = super().prepare(bucket, query_lens, context_lens, blocks, slots)
+        if not isinstance(state, NativeGraphState):
+            state = NativeGraphState(self, state.plan)
+            self.states[bucket] = state
+        if self.family == "prefill":
+            # Pack the bucket into one virtual FA sequence. Request boundaries
+            # live in a device mask, so neither host qLens nor zero-length rows
+            # participate in FA graph replay. Padding is a separate sequence.
+            state.plan = replace(state.plan, query_lens=(bucket,), context_lens=(bucket,),
+                                 query_start_loc=(0, bucket))
+            self.context_cpu[0] = bucket
+            self.context[:1].copy_(self.context_cpu[:1], non_blocking=True)
+            self.qlens[0] = bucket
+            self.starts_cpu[:2].copy_(torch.tensor([0, bucket], dtype=torch.int32))
+            self.starts[:2].copy_(self.starts_cpu[:2], non_blocking=True)
+            self._prepare_prefill_mask(bucket, query_lens)
+        state.scheduled_query_lens = query_lens
+        return state
+
+    def _prepare_prefill_mask(self, bucket, query_lens):
+        layout = (bucket, tuple(query_lens))
+        if layout == self._prefill_mask_layout:
+            return
+        owners = torch.repeat_interleave(torch.arange(len(query_lens)), torch.tensor(query_lens))
+        owners = torch.cat((owners, torch.full((bucket - sum(query_lens),), -1)))
+        positions = torch.arange(bucket)
+        visible = ((owners[:, None] == owners[None, :]) & (positions[:, None] >= positions[None, :]))
+        active = self.prefill_mask_cpu[:bucket, :bucket]
+        active.fill_(float("-inf"))
+        active.masked_fill_(visible, 0)
+        # Match AttentionMaskBuilder310._get_causal_mask / nd_to_nz_2d.
+        formatted = self.prefill_mask_cpu.reshape(1, COMPRESSED_MASK_SIZE, COMPRESSED_MASK_SIZE // 16, 16)
+        formatted = formatted.transpose(1, 2).contiguous().to(self.device)
+        if self.device.type != "cpu":
+            import torch_npu
+
+            formatted = torch_npu.npu_format_cast(formatted, NATIVE_MASK_FORMAT)
+        if self.prefill_mask is None:
+            self.prefill_mask = formatted
+        else:
+            self.prefill_mask.copy_(formatted)
+        self._prefill_mask_layout = layout
+
+
+@dataclass
+class NativeGraphState(TokenGraphState):
+    scheduled_query_lens: tuple[int, ...] = ()
+
+    def attach(self, metadata):
+        super().attach(metadata)
+        del metadata.token_graph_state
+        metadata.native_graph_state = self
+        metadata.query_lens_cpu = self.arena.qlens[:len(self.plan.query_lens)]
+        if self.arena.family == "prefill":
+            metadata.attn_mask = self.arena.prefill_mask
 
 
 def validate_token_graph_config(config):

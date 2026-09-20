@@ -42,8 +42,11 @@ def compare_reports(eager, graph, buckets):
     initial, final = graph["initial_graphs"], graph["final_graphs"]
     if initial != final:
         errors.append("Graph entries/identities changed during measured workloads")
-    if sorted(entry["bucket"] for entry in final) != sorted(buckets):
-        errors.append("Expected exactly one FULL model graph per configured token bucket")
+    families = ("token", "prefill", "decode") if graph.get("phase_routing", False) else ("token",)
+    actual_keys = sorted((entry.get("family", "token"), entry["bucket"]) for entry in final)
+    expected_keys = sorted((family, bucket) for family in families for bucket in buckets)
+    if actual_keys != expected_keys:
+        errors.append("Expected exactly one FULL model graph per family and configured token bucket")
     if any(entry["num_reqs"] is not None or entry["uniform"] for entry in final):
         errors.append("Graph keys still depend on request count or uniform decode layout")
     replay = [event for event in graph["audit"] if event["event"] == "replay"]
@@ -63,6 +66,10 @@ def compare_reports(eager, graph, buckets):
     }
     # Report incomplete workload coverage explicitly, separate from correctness.
     missing = [f"bucket {bucket}: no replay" for bucket in buckets if not coverage[str(bucket)]["replays"]]
+    family_coverage = {family: sum(event.get("family", "token") == family for event in replay) for family in families}
+    for family, count in family_coverage.items():
+        if not count:
+            missing.append(f"family {family}: no actual replay")
     if not any(max(event["scheduled"], default=0) > 1 for event in replay):
         missing.append("No mixed/prefill query length > 1 executed through FULL replay")
     if not any(event.get("phase") == "decode" and event.get("decode_only") for event in replay):
@@ -82,6 +89,7 @@ def compare_reports(eager, graph, buckets):
         passed=not errors,
         errors=errors,
         coverage=coverage,
+        family_coverage=family_coverage,
         missing_coverage=missing,
         full_acceptance=not errors and not missing,
         timings=timings,
@@ -146,7 +154,8 @@ def run_child(args):
         if config.get(name, 1) != 1:
             raise ValueError("This acceptance script supports one device only")
     additional = config.setdefault("additional_config", {})
-    additional["token_graph_310p"] = dict(enabled=args.child == "graph", request_layout="token", update_mode="inplace")
+    additional["token_graph_310p"] = dict(enabled=args.child == "graph", request_layout="token",
+                                         update_mode="inplace", phase_routing=args.phase_routing)
     compilation = config.setdefault("compilation_config", {})
     if not isinstance(compilation, dict):
         raise ValueError("compilation_config must be a JSON object")
@@ -158,6 +167,7 @@ def run_child(args):
     inputs, manifest = load_inputs(args.cases)
     report = dict(
         mode=args.child,
+        phase_routing=args.phase_routing,
         config=config,
         manifest=manifest,
         runs=[],
@@ -243,6 +253,7 @@ def main():
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 8, 10, 20])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument("--phase-routing", action="store_true", help="Audit separate prefill, decode and token graphs")
     parser.add_argument(
         "--max-slowdown", type=float, help="Optional upper bound on graph/eager median latency per workload"
     )

@@ -108,6 +108,22 @@ class TestDispatcher(unittest.TestCase):
             self.assertEqual(dispatcher.dispatch(193)[0], Mode.NONE)
             self.assertEqual(dispatcher.dispatch(20, invalid_modes={Mode.FULL})[0], Mode.NONE)
 
+            config.additional_config = {"token_graph_310p": {"phase_routing": True}}
+            dispatcher = plugin.TokenGraphDispatcher310(config)
+            dispatcher.initialize_cudagraph_keys(Mode.FULL)
+            self.assertEqual(len(dispatcher.cudagraph_keys[Mode.FULL]), 9)
+            keys = set()
+            for family in ("token", "prefill", "decode"):
+                dispatcher.attention_family = family
+                mode, desc = dispatcher.dispatch(18)
+                self.assertEqual(mode, Mode.FULL)
+                self.assertEqual(desc.num_tokens, 20)
+                self.assertIsNone(desc.num_reqs)
+                keys.add(desc)
+            self.assertEqual(len(keys), 3)
+            captured = {desc for _, descs in dispatcher.get_capture_descs() for desc in descs}
+            self.assertEqual(captured, dispatcher.cudagraph_keys[Mode.FULL])
+
 
 def runner_harness(parent, namespace):
     source = ast.parse((ROOT / "vllm_ascend/_310p/model_runner_310p.py").read_text(encoding="utf-8"))
@@ -117,6 +133,7 @@ def runner_harness(parent, namespace):
         "_pad_query_start_loc_for_fia",
         "_model_forward",
         "_build_attention_metadata",
+        "_warmup_and_capture",
     }
     methods = [n for n in original.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
     node = ast.ClassDef(
@@ -132,6 +149,41 @@ def runner_harness(parent, namespace):
 
 
 class TestRunnerBoundaries(unittest.TestCase):
+    def test_startup_capture_selects_family_and_restores_it(self):
+        calls = []
+
+        class Parent:
+            def _warmup_and_capture(self, desc, mode, **kwargs):
+                calls.append((self._capture_graph_family, mode))
+
+        runner = runner_harness(Parent, {})()
+        runner._capture_graph_family = "token"
+        runner._warmup_and_capture(SimpleNamespace(attention_family="prefill"), Mode.FULL)
+        runner._warmup_and_capture(SimpleNamespace(attention_family="decode"), Mode.FULL)
+        self.assertEqual(calls, [("prefill", Mode.FULL), ("decode", Mode.FULL)])
+        self.assertEqual(runner._capture_graph_family, "token")
+
+    def test_native_dispatch_uses_scheduler_phase_before_padding(self):
+        tg = load(ROOT / "vllm_ascend/_310p/token_graph.py", "phase_graph_wiring_runtime")
+
+        class Parent:
+            def _determine_batch_execution_and_padding(self, **kwargs):
+                self.selected_family = self.cudagraph_dispatcher.attention_family
+                return Mode.FULL, Descriptor(20), False, None, None
+
+        runner = runner_harness(Parent, dict(CUDAGraphMode=Mode, classify_graph_family=tg.classify_graph_family))()
+        runner.token_graph_config = SimpleNamespace(enabled=True, phase_routing=True)
+        runner.cudagraph_dispatcher = SimpleNamespace(attention_family="token")
+        for q, computed, prompts, expected in [
+            ([1], [0], [1], "prefill"), ([1], [4], [4], "decode"),
+            ([3], [4], [4], "token"), ([3], [4], [8], "token"),
+        ]:
+            runner.input_batch = SimpleNamespace(num_computed_tokens_cpu=computed, num_prompt_tokens=prompts)
+            runner._determine_batch_execution_and_padding(sum(q), len(q), q, max(q), False)
+            self.assertEqual(runner.selected_family, expected)
+            self.assertEqual(runner._native_graph_active, expected != "token")
+            self.assertEqual(runner._token_graph_active, expected == "token")
+
     def test_warmup_build_uses_graph_metadata_without_changing_scheduler_count(self):
         tg = load(ROOT / "vllm_ascend/_310p/token_graph.py", "token_graph_wiring_runtime")
 

@@ -30,6 +30,24 @@ def reports():
 
 
 class TestAcceptance(unittest.TestCase):
+    def test_three_families_require_three_stable_graphs_and_real_replays(self):
+        eager, graph = reports()
+        graph["phase_routing"] = True
+        graph["initial_graphs"] = [dict(bucket=20, family=family, num_reqs=None, uniform=False, graph_id=i)
+                                   for i, family in enumerate(("token", "prefill", "decode"))]
+        graph["final_graphs"] = copy.deepcopy(graph["initial_graphs"])
+        result = accept.compare_reports(eager, graph, [20])
+        self.assertTrue(result["passed"])
+        self.assertIn("family prefill: no actual replay", result["missing_coverage"])
+        graph["audit"].extend([
+            dict(event="replay", bucket=20, family="prefill", actual_reqs=8, scheduled=[2] * 8),
+            dict(event="replay", bucket=20, family="decode", actual_reqs=10, scheduled=[1] * 10,
+                 phase="decode", decode_only=True),
+        ])
+        self.assertTrue(accept.compare_reports(eager, graph, [20])["full_acceptance"])
+        graph["audit"].append(dict(event="capture"))
+        self.assertFalse(accept.compare_reports(eager, graph, [20])["passed"])
+
     def test_identical_outputs_and_real_replay_pass(self):
         eager, graph = reports()
         self.assertTrue(accept.compare_reports(eager, graph, [20])["passed"])

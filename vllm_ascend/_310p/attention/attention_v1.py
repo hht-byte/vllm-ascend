@@ -112,6 +112,8 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
         state = getattr(attn_metadata, "token_graph_state", None)
+        if state is None:
+            state = getattr(attn_metadata, "native_graph_state", None)
         if state is not None:
             if (self.sliding_window is not None or self.alibi_slopes is not None
                     or self.kv_sharing_target_layer_name is not None
@@ -235,6 +237,12 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         Returns:
             The output tensor after flash attention.
         """
+        if getattr(attn_metadata, "native_graph_state", None) is not None:
+            # Fixed virtual sequence [T], with dynamic block-diagonal causal
+            # mask. No device -> host scalar reads inside capture.
+            return self._flash_attention(
+                query, key, value, attn_metadata.attn_mask, attn_metadata.seq_lens, output,
+            )
         real_tokens = int(attn_metadata.seq_lens.sum().item())
         seq_len = attn_metadata.seq_lens
         aligned_tokens = int(query.shape[0])
@@ -342,6 +350,14 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         Raises:
             NotImplementedError: If the attention state is not supported on 310P.
         """
+        native_state = getattr(attn_metadata, "native_graph_state", None)
+        if native_state is not None:
+            family = native_state.arena.family
+            if family == "prefill":
+                return self.forward_prefill_310(query, key, value, attn_metadata, output)
+            if family == "decode":
+                return self.forward_paged_attention(query, attn_metadata, output)
+            raise ValueError(f"Unknown 310P graph family: {family}")
         token_state = getattr(attn_metadata, "token_graph_state", None)
         if token_state is not None:
             if query.shape[0] != token_state.plan.bucket:

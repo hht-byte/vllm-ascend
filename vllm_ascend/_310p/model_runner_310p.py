@@ -52,7 +52,13 @@ from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
-from vllm_ascend._310p.token_graph import TokenGraphArena, TokenGraphConfig, validate_token_graph_config
+from vllm_ascend._310p.token_graph import (
+    NativeGraphArena,
+    TokenGraphArena,
+    TokenGraphConfig,
+    classify_graph_family,
+    validate_token_graph_config,
+)
 from vllm_ascend._310p.token_graph_dispatcher import TokenGraphDispatcher310
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.spec_decode.utils import (
@@ -85,18 +91,25 @@ class NPUModelRunner310(NPUModelRunner):
     _token_graph_active: bool = False
     _token_graph_dummy: bool = False
     _token_graph_warmup: bool = False
+    _native_graph_active: bool = False
+    _phase_graph_family: str = "token"
+    _capture_graph_family: str = "token"
+    _native_graph_warmup: bool = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.token_graph_config = TokenGraphConfig.from_vllm(self.vllm_config)
         self._token_graph_active = False
         self._token_graph_arena = None
+        self._native_graph_arenas = {}
         if self.token_graph_config.enabled:
             validate_token_graph_config(self.vllm_config)
             if self.enable_enpu or self.is_mm_prefix_lm:
                 raise ValueError("token_graph_310p does not support ENPU or prefix-LM attention")
             if not hasattr(torch_npu, "_npu_paged_attention_splitfuse_v2"):
                 raise ValueError("token_graph_310p requires compressed splitfuse_v2")
+            if self.token_graph_config.phase_routing and not hasattr(torch_npu, "_npu_flash_attention_v3"):
+                raise ValueError("phase_routing requires compressed flash_attention_v3")
             self.cudagraph_dispatcher = TokenGraphDispatcher310(self.vllm_config)
             logger.warning("Experimental 310P token graphs enabled; validate qLens and request-count replay on device.")
         self.input_batch = NPUInputBatch(
@@ -172,6 +185,17 @@ class NPUModelRunner310(NPUModelRunner):
         num_encoder_reqs: int = 0,
     ):
         if self.token_graph_config.enabled:
+            family = (getattr(self, "_capture_graph_family", "token")
+                      if getattr(self, "_token_graph_dummy", False) else "token")
+            if (getattr(self.token_graph_config, "phase_routing", False)
+                    and not getattr(self, "_token_graph_dummy", False)):
+                family = classify_graph_family(
+                    num_scheduled_tokens_np[:num_reqs],
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                    self.input_batch.num_prompt_tokens[:num_reqs],
+                )
+            if hasattr(self, "cudagraph_dispatcher"):
+                self.cudagraph_dispatcher.attention_family = family
             result = super()._determine_batch_execution_and_padding(
                 num_tokens=num_tokens,
                 num_reqs=num_reqs,
@@ -185,7 +209,9 @@ class NPUModelRunner310(NPUModelRunner):
                 force_num_active_loras=force_num_active_loras,
                 num_encoder_reqs=num_encoder_reqs,
             )
-            self._token_graph_active = result[0] == CUDAGraphMode.FULL
+            self._phase_graph_family = family
+            self._native_graph_active = result[0] == CUDAGraphMode.FULL and family != "token"
+            self._token_graph_active = result[0] == CUDAGraphMode.FULL and family == "token"
             return result
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
 
@@ -229,7 +255,14 @@ class NPUModelRunner310(NPUModelRunner):
         # 310P must capture SpecDecoding + splitfuse for SpecDecoding uniform decode graphs.
         if self._spec_dummy_capture:
             self.attn_state = AscendAttentionState.SpecDecoding
-        use_token_metadata = self._token_graph_active or self._token_graph_warmup
+        use_native_metadata = (getattr(self, "_native_graph_active", False)
+                               or getattr(self, "_native_graph_warmup", False))
+        use_token_metadata = self._token_graph_active or self._token_graph_warmup or use_native_metadata
+        if use_native_metadata:
+            self.attn_state = {
+                "prefill": AscendAttentionState.PrefillNoCache,
+                "decode": AscendAttentionState.DecodeOnly,
+            }[self._phase_graph_family]
         if use_token_metadata:
             # Host qLens and shared device metadata may still belong to the
             # previous replay. Drain it before any builder reuses those buffers.
@@ -252,6 +285,30 @@ class NPUModelRunner310(NPUModelRunner):
         qlens = (qsl[1:] - qsl[:-1]).tolist()
         contexts = self.optimistic_seq_lens_cpu[:num_reqs].tolist()
         block_table = self.input_batch.block_table[0].get_device_tensor()
+        if use_native_metadata:
+            family = self._phase_graph_family
+            if self._token_graph_dummy:
+                # PA capture has one query per operator row even if the generic
+                # upstream dummy divided a large T among max_num_seqs requests.
+                if family == "decode":
+                    qlens = [1] * num_reqs
+                    contexts = [self.max_model_len] * num_reqs
+                else:
+                    contexts = qlens
+            if family not in self._native_graph_arenas:
+                self._native_graph_arenas[family] = NativeGraphArena(
+                    max(self.compilation_config.cudagraph_capture_sizes), self.max_num_reqs,
+                    block_table.shape[1], self.max_model_len, self.device, family,
+                )
+            state = self._native_graph_arenas[family].prepare(
+                bucket, qlens, contexts, block_table,
+                self.input_batch.block_table[0].slot_mapping.gpu,
+            )
+            if self._token_graph_dummy:
+                state.arena.slots[:bucket].fill_(-1)
+            for value in unique_metadata.values():
+                state.attach(value)
+            return result
         if self._token_graph_arena is None:
             self._token_graph_arena = TokenGraphArena(
                 max(self.compilation_config.cudagraph_capture_sizes),
@@ -283,6 +340,7 @@ class NPUModelRunner310(NPUModelRunner):
     ) -> int:
         if self.token_graph_config.enabled and (
             cudagraph_runtime_mode == CUDAGraphMode.FULL or self._token_graph_warmup
+            or getattr(self, "_native_graph_warmup", False)
         ):
             # Keep scheduler metadata real. The token arena owns dummy requests
             # and fixed-capacity padding, including max_num_seqs + 1 cases.
@@ -690,6 +748,14 @@ class NPUModelRunner310(NPUModelRunner):
             total_num_scheduled_tokens,
         )
 
+    def _warmup_and_capture(self, desc, cudagraph_runtime_mode, **kwargs):
+        previous = self._capture_graph_family
+        self._capture_graph_family = getattr(desc, "attention_family", "token")
+        try:
+            return super()._warmup_and_capture(desc, cudagraph_runtime_mode, **kwargs)
+        finally:
+            self._capture_graph_family = previous
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -724,6 +790,11 @@ class NPUModelRunner310(NPUModelRunner):
             self._token_graph_warmup = (
                 self.token_graph_config.enabled and force_attention and not is_profile
                 and num_tokens in self.compilation_config.cudagraph_capture_sizes
+                and self._capture_graph_family == "token"
+            )
+            self._native_graph_warmup = (
+                self.token_graph_config.enabled and force_attention and not is_profile
+                and self._capture_graph_family != "token"
             )
             try:
                 return super()._dummy_run(
@@ -745,6 +816,8 @@ class NPUModelRunner310(NPUModelRunner):
                 self._spec_dummy_capture = False
                 self._token_graph_dummy = False
                 self._token_graph_warmup = False
+                self._native_graph_warmup = False
+                self._native_graph_active = False
 
     def _model_forward(
         self,
@@ -770,6 +843,12 @@ class NPUModelRunner310(NPUModelRunner):
             **model_kwargs,
         }
         run_model = partial(self.model, **model_inputs)
+        if (self.token_graph_config.enabled
+                and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and getattr(getattr(forward_context, "batch_descriptor", None), "attention_family", None) is not None):
+            # Startup captured this native family independently from token graphs.
+            # These direct 310P ops do not use mainline graph_task updates.
+            return run_model()
         if self.token_graph_config.enabled and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             if self._token_graph_arena is None:
                 raise RuntimeError("Token graph metadata was not prepared")
