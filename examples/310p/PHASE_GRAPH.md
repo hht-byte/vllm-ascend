@@ -18,6 +18,18 @@ partitions. For buckets `[20, 80, 192]`, startup captures nine FULL model graphs
 Existing startup capture guards remain enabled: runtime cannot lazily capture,
 replace, or recapture missing graphs. No `graph_task_update` is used by this mode.
 
+When token graphs are enabled, graph-mode resolution temporarily uses a capture
+query length of 1. Upstream speculative decoding would otherwise round every
+bucket to a multiple of `num_speculative_tokens + 1` and deduplicate the list.
+The real runner query length is restored after resolution, including on errors;
+the speculative token budget is unchanged. For example, the 24 buckets
+`[1,2,3,4,5,6,7,8,10,12,14,16,18,20,32,40,64,80,128,256,384,512,768,1024]`
+remain 24 buckets (72 graphs with phase routing) even with 15 speculative tokens.
+Other limits, including the model context and scheduler token cap, still apply.
+This protection does not add support for new speculative methods: the stock
+configuration validator currently allows only ngram, and externally integrated
+rollback implementations still require their own device acceptance.
+
 ## Fresh prefill representation
 
 All Q/K/V tokens in bucket T are packed into one virtual sequence with constant

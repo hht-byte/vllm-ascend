@@ -11,6 +11,7 @@ import ast
 import importlib.util
 import sys
 import unittest
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -124,6 +125,21 @@ class TestDispatcher(unittest.TestCase):
             captured = {desc for _, descs in dispatcher.get_capture_descs() for desc in descs}
             self.assertEqual(captured, dispatcher.cudagraph_keys[Mode.FULL])
 
+            config.speculative_config = SimpleNamespace(num_speculative_tokens=15)
+            sizes = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20,
+                     32, 40, 64, 80, 128, 256, 384, 512, 768, 1024]
+            config.compilation_config.cudagraph_capture_sizes = sizes
+            config.compilation_config.max_cudagraph_capture_size = 1024
+            dispatcher = plugin.TokenGraphDispatcher310(config)
+            dispatcher.initialize_cudagraph_keys(Mode.FULL, uniform_decode_query_len=1)
+            self.assertEqual(len(dispatcher.cudagraph_keys[Mode.FULL]), 72)
+            for family in ("token", "prefill", "decode"):
+                dispatcher.attention_family = family
+                for size in sizes:
+                    mode, desc = dispatcher.dispatch(size)
+                    self.assertEqual(mode, Mode.FULL)
+                    self.assertEqual(desc.num_tokens, size)
+
 
 def runner_harness(parent, namespace):
     source = ast.parse((ROOT / "vllm_ascend/_310p/model_runner_310p.py").read_text(encoding="utf-8"))
@@ -134,13 +150,15 @@ def runner_harness(parent, namespace):
         "_model_forward",
         "_build_attention_metadata",
         "_warmup_and_capture",
+        "temporary_modify_uniform_decode_query_len",
+        "_check_and_update_cudagraph_mode",
     }
     methods = [n for n in original.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
     node = ast.ClassDef(
         name="Runner", bases=[ast.Name(id="Parent", ctx=ast.Load())], keywords=[], body=methods, decorator_list=[]
     )
     tree = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
-    env = dict(namespace, Parent=parent)
+    env = dict(namespace, Parent=parent, contextmanager=contextmanager, _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN=1)
     # Future annotations let the harness omit irrelevant vLLM annotation imports.
     import __future__
 
@@ -149,6 +167,46 @@ def runner_harness(parent, namespace):
 
 
 class TestRunnerBoundaries(unittest.TestCase):
+    def test_speculative_graph_sizes_preserve_token_buckets_and_restore_query_length(self):
+        sizes = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20,
+                 32, 40, 64, 80, 128, 256, 384, 512, 768, 1024]
+        source = ROOT.parent / "vllm/vllm/config/compilation.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                      and n.name == "adjust_cudagraph_sizes_for_spec_decode")
+        env = {"round_up": lambda n, m: (n + m - 1) // m * m}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), env)
+
+        class Parent:
+            def _check_and_update_cudagraph_mode(self, *args):
+                if self.uniform_decode_query_len > 1:
+                    env["adjust_cudagraph_sizes_for_spec_decode"](
+                        self.compilation_config, self.uniform_decode_query_len, 1)
+                if self.fail:
+                    raise RuntimeError("setup failed")
+
+        for enabled, method_name, expected_count in [(True, "rollbackspec", 24),
+                                                     (False, "rollbackspec", 11),
+                                                     (False, "ngram", 24)]:
+            for fail in (False, True):
+                runner = runner_harness(Parent, {})()
+                runner.token_graph_config = SimpleNamespace(enabled=enabled)
+                runner.speculative_config = SimpleNamespace(method=method_name, num_speculative_tokens=15)
+                runner.uniform_decode_query_len = 16
+                runner.compilation_config = SimpleNamespace(
+                    cudagraph_capture_sizes=sizes.copy(), max_cudagraph_capture_size=1024)
+                runner.fail = fail
+                if fail:
+                    with self.assertRaisesRegex(RuntimeError, "setup failed"):
+                        runner._check_and_update_cudagraph_mode([], [])
+                else:
+                    runner._check_and_update_cudagraph_mode([], [])
+                self.assertEqual(len(runner.compilation_config.cudagraph_capture_sizes), expected_count)
+                if expected_count == 24:
+                    self.assertEqual(runner.compilation_config.cudagraph_capture_sizes, sizes)
+                self.assertEqual(runner.uniform_decode_query_len, 16)
+                self.assertEqual(runner.speculative_config.num_speculative_tokens, 15)
+
     def test_startup_capture_selects_family_and_restores_it(self):
         calls = []
 

@@ -155,11 +155,13 @@ class NPUModelRunner310(NPUModelRunner):
 
     @contextmanager
     def temporary_modify_uniform_decode_query_len(self):
-        # This is only needed for the 310P ngram path where dispatcher uses q_len=1
-        # while runner's default uniform_decode_query_len remains 1 + num_spec_tokens.
-        # TODO: remove this temporary override after upstream supports independent
-        # decode capture query_len for backend-specific paths.
-        if self.speculative_config is None or self.speculative_config.method != "ngram":
+        # Token graphs are keyed by total tokens, not speculative query length.
+        # Prevent upstream FULL graph setup from rounding/deduplicating every
+        # bucket to multiples of 1 + num_spec_tokens. Keep the legacy ngram
+        # override too, and restore the real runner query length after setup.
+        token_graph_enabled = self.token_graph_config.enabled
+        ngram = self.speculative_config is not None and self.speculative_config.method == "ngram"
+        if not token_graph_enabled and not ngram:
             yield
             return
 
@@ -899,8 +901,7 @@ class NPUModelRunner310(NPUModelRunner):
         attention_backends,
         kv_cache_groups,
     ) -> None:
-        # 910B does not need this branch because runner/dispatcher query_len are
-        # naturally consistent there. 310P ngram needs temporary alignment.
+        # Resolve 310P token buckets independently of speculative query length.
         with self.temporary_modify_uniform_decode_query_len():
             super()._check_and_update_cudagraph_mode(attention_backends, kv_cache_groups)
 
