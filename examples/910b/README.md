@@ -2,20 +2,28 @@
 
 This is an isolated device acceptance tool, not a production model-runner switch.
 It uses ND `[blocks, block_size, kv_heads, head_size]` caches and the native
-`_npu_paged_attention` operator. Query rows, device int32 context lengths and
+`_npu_paged_attention` operator. Query rows, int32 context lengths and
 block tables retain their addresses. Each scheduled query token gets its own
 PA row, with visible context `C-Q+j+1`; padding reads dummy block zero with
 context length one. KV is pre-populated, including the current query tokens.
 
-No task update or runtime recapture is used. Every bucket is captured before
+The default is now `--context-device cpu --update-mode task_update`, based on
+910B4 measurements: device lengths failed eager Setup; host lengths passed
+eager/capture but changed host lengths failed inplace replay. Each bucket owns
+a task-group handle and external event. Before replay, workspace is obtained
+for the current parameters and PA is reissued inside graph_task_update on a
+dedicated stream. No runtime recapture is used. Every bucket is captured before
 dynamic testing. Replay outputs are poisoned, synchronized and checked against
 an independent request-level CPU causal GQA reference **before** running eager
-again. This avoids eager setup accidentally refreshing state before replay.
+again. Output poisoning happens after task update as well. This avoids eager
+setup or execution during update accidentally satisfying the replay comparison.
+`--update-mode inplace` remains available as an explicit negative control.
 
 Start in a fresh process for each command:
 
 ```bash
 python examples/910b/probe_token_graph.py --buckets 20 --eager-only --output pa-eager.json
+python examples/910b/probe_token_graph.py --buckets 20 --context-device cpu --update-mode task_update --control contexts --output pa-host-update.json
 python examples/910b/probe_token_graph.py --buckets 20 --control inputs --output pa-inputs.json
 python examples/910b/probe_token_graph.py --buckets 20 --control contexts --output pa-contexts.json
 python examples/910b/probe_token_graph.py --buckets 20 --control blocks --output pa-blocks.json

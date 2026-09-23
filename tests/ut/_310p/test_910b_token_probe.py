@@ -2,6 +2,7 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -12,6 +13,29 @@ spec.loader.exec_module(probe)
 
 
 class TestProbe(unittest.TestCase):
+    def test_task_update_uses_handle_and_records_event_after_update(self):
+        calls = []
+        api = SimpleNamespace(
+            graph_task_update_begin=lambda s, h: calls.append(("begin", s, h)),
+            graph_task_update_end=lambda s: calls.append(("end", s)))
+        event = SimpleNamespace(record=lambda s: calls.append(("record", s)))
+        probe.update_task(api, "stream", "handle", lambda: calls.append("PA"), event)
+        self.assertEqual(calls, [("begin", "stream", "handle"), "PA",
+                                 ("end", "stream"), ("record", "stream")])
+
+    def test_update_failure_does_not_record_success_event(self):
+        calls = []
+        api = SimpleNamespace(graph_task_update_begin=lambda *a: None,
+                              graph_task_update_end=lambda *a: calls.append("end"))
+        event = SimpleNamespace(record=lambda *a: calls.append("record"))
+
+        def fail():
+            raise RuntimeError("PA first error")
+
+        with self.assertRaisesRegex(RuntimeError, "PA first error"):
+            probe.update_task(api, None, None, fail, event)
+        self.assertEqual(calls, [])
+
     def test_expansion_padding_and_request_boundaries(self):
         blocks = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
         contexts, tables = probe.expand(8, [3, 2], [5, 3], blocks)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""910B PA feasibility probe: startup capture, device metadata inplace replay.
+"""910B PA feasibility probe: startup capture, task update or inplace replay.
 
 This isolates attention with a pre-populated ND KV cache; it does not validate
 model integration, cache-write kernels, speculative acceptance, or performance.
@@ -9,6 +9,14 @@ import json
 from pathlib import Path
 
 import torch
+
+
+def update_task(api, stream, handle, forward, event):
+    # Preserve the first failure; do not attempt recovery inside a broken update.
+    api.graph_task_update_begin(stream, handle)
+    forward()
+    api.graph_task_update_end(stream)
+    event.record(stream)
 
 
 def expand(bucket, lengths, contexts, blocks):
@@ -74,7 +82,8 @@ def main():
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--graph-pool", choices=["private", "shared"], default="private")
     parser.add_argument("--eager-only", action="store_true")
-    parser.add_argument("--context-device", choices=["npu", "cpu"], default="npu",
+    parser.add_argument("--update-mode", choices=["task_update", "inplace"], default="task_update")
+    parser.add_argument("--context-device", choices=["npu", "cpu"], default="cpu",
                         help="CPU lengths are a diagnostic control, not proof of device-inplace support")
     parser.add_argument("--stream", choices=["side", "default"], default="side")
     parser.add_argument("--output", type=Path, default=Path("910b-token-graph.json"))
@@ -89,7 +98,7 @@ def main():
     import torch_npu  # Device dependency is deliberately lazy for CPU reference tests.
 
     report = {"passed": False, "config": {**vars(args), "output": str(args.output)},
-              "captures": 0, "cases": [], "stage": "init", "operator": "_npu_paged_attention"}
+              "captures": 0, "updates": 0, "cases": [], "stage": "init", "operator": "_npu_paged_attention"}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     try:
         torch.set_num_threads(1)
@@ -106,6 +115,7 @@ def main():
         base_blocks = torch.arange(1, 1 + 20 * width, dtype=torch.int32).reshape(20, width)
         stream = (torch.npu.default_stream(args.device) if args.stream == "default"
                   else torch.npu.Stream(device=args.device))
+        update_stream = torch.npu.Stream(device=args.device) if args.update_mode == "task_update" else None
         torch.npu.synchronize()
         pool = torch.npu.graph_pool_handle() if args.graph_pool == "shared" else None
         states = {}
@@ -147,11 +157,15 @@ def main():
                                 "block_ids_min_max": [int(tables.min()), int(tables.max())]}
             return expected
 
-        def run(state):
-            torch_npu._npu_paged_attention(
+        def parameters(state):
+            return dict(
                 query=state["q"], key_cache=key, value_cache=value,
                 num_heads=args.heads, num_kv_heads=args.kv_heads, scale_value=args.head_size ** -0.5,
                 block_table=state["blocks"], context_lens=state["lens"], out=state["out"])
+
+        def run(state):
+            extra = {"workspace": state["workspace"]} if "workspace" in state else {}
+            torch_npu._npu_paged_attention(**parameters(state), **extra)
 
         def check(state, expected, label):
             actual = state["out"][:len(expected)].float().cpu().clone()
@@ -182,10 +196,21 @@ def main():
                 torch.npu.synchronize()
                 check(state, expected, "startup eager")
                 if not args.eager_only:
+                    if args.update_mode == "task_update":
+                        report["stage"] = "capture_workspace"
+                        state["workspace"] = torch_npu._npu_paged_attention_get_workspace(**parameters(state))
+                        state["capture_workspace"] = state["workspace"]
+                        state["event"] = torch.npu.ExternalEvent()
                     report["stage"] = "capture"
                     graph = torch.npu.NPUGraph()
                     with torch.npu.graph(graph, stream=stream, pool=pool):
+                        if args.update_mode == "task_update":
+                            state["event"].wait(stream)
+                            state["event"].reset(stream)
+                            torch.npu.graph_task_group_begin(stream)
                         run(state)
+                        if args.update_mode == "task_update":
+                            state["handle"] = torch.npu.graph_task_group_end(stream)
                     state["graph"] = graph
                     report["captures"] += 1
                     print("[CAPTURE]", bucket, flush=True)
@@ -197,6 +222,21 @@ def main():
                         state = states[bucket]
                         expected = prepare(bucket, qlens, iteration)
                         if not args.eager_only:
+                            if args.update_mode == "task_update":
+                                # Drain input copies before Setup reads metadata.
+                                torch.npu.synchronize()
+                                report["stage"] = "update_workspace"
+                                previous_workspace = state["workspace"]
+                                state["workspace"] = torch_npu._npu_paged_attention_get_workspace(**parameters(state))
+                                report["stage"] = "task_update"
+                                with torch.npu.stream(update_stream):
+                                    update_task(torch.npu, update_stream, state["handle"],
+                                                lambda state=state: run(state), state["event"])
+                                torch.npu.synchronize()
+                                del previous_workspace
+                                report["updates"] += 1
+                            # Poison AFTER update, so executing PA during update
+                            # cannot accidentally satisfy the replay comparison.
                             state["out"].fill_(float("nan"))
                             torch.npu.synchronize()
                             report["stage"] = "replay"
