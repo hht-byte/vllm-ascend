@@ -74,8 +74,13 @@ def main():
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--graph-pool", choices=["private", "shared"], default="private")
     parser.add_argument("--eager-only", action="store_true")
+    parser.add_argument("--context-device", choices=["npu", "cpu"], default="npu",
+                        help="CPU lengths are a diagnostic control, not proof of device-inplace support")
+    parser.add_argument("--stream", choices=["side", "default"], default="side")
     parser.add_argument("--output", type=Path, default=Path("910b-token-graph.json"))
     args = parser.parse_args()
+    if args.stream == "default" and not args.eager_only:
+        parser.error("--stream default requires --eager-only; capture uses a side stream")
     if (min(args.buckets + [args.heads, args.kv_heads, args.head_size, args.block_size,
                            args.max_context, args.repeats]) <= 0
             or len(set(args.buckets)) != len(args.buckets) or args.heads % args.kv_heads
@@ -99,10 +104,17 @@ def main():
         key_cpu, value_cpu = (torch.randn(shape, dtype=dtype) for _ in range(2))
         key, value = key_cpu.to(device), value_cpu.to(device)
         base_blocks = torch.arange(1, 1 + 20 * width, dtype=torch.int32).reshape(20, width)
-        stream = torch.npu.Stream(device=args.device)
+        stream = (torch.npu.default_stream(args.device) if args.stream == "default"
+                  else torch.npu.Stream(device=args.device))
         torch.npu.synchronize()
         pool = torch.npu.graph_pool_handle() if args.graph_pool == "shared" else None
         states = {}
+
+        def describe(tensor):
+            return dict(shape=list(tensor.shape), dtype=str(tensor.dtype), device=str(tensor.device),
+                        stride=list(tensor.stride()), storage_offset=tensor.storage_offset(),
+                        ptr=tensor.data_ptr(),
+                        npu_format=torch_npu.get_npu_format(tensor) if tensor.device.type != "cpu" else None)
 
         def prepare(bucket, qlens, iteration):
             state = states[bucket]
@@ -127,7 +139,12 @@ def main():
             state["blocks"].copy_(tables)
             expected = reference(q, key_cpu, value_cpu, blocks, qlens, contexts)
             report["inputs"] = {"bucket": bucket, "scheduled": qlens, "contexts": contexts,
-                                "operator_contexts": lens.tolist()}
+                                "operator_contexts": lens.tolist(), "stream": str(stream),
+                                "query": describe(state["q"]), "key_cache": describe(key),
+                                "value_cache": describe(value), "output": describe(state["out"]),
+                                "context_lens": describe(state["lens"]),
+                                "block_table": describe(state["blocks"]),
+                                "block_ids_min_max": [int(tables.min()), int(tables.max())]}
             return expected
 
         def run(state):
@@ -154,11 +171,13 @@ def main():
             for bucket in sorted(args.buckets, reverse=True):
                 state = {"q": torch.empty(bucket, args.heads, args.head_size, dtype=dtype, device=device),
                          "out": torch.empty(bucket, args.heads, args.head_size, dtype=dtype, device=device),
-                         "lens": torch.ones(bucket, dtype=torch.int32, device=device),
+                         "lens": torch.ones(bucket, dtype=torch.int32,
+                                            device="cpu" if args.context_device == "cpu" else device),
                          "blocks": torch.zeros(bucket, width, dtype=torch.int32, device=device)}
                 states[bucket] = state
                 expected = prepare(bucket, cases(bucket, args.control)[0], 0)
                 report["stage"] = "eager_warmup"
+                print("[EAGER INPUTS]", json.dumps(report["inputs"]), flush=True)
                 run(state)
                 torch.npu.synchronize()
                 check(state, expected, "startup eager")

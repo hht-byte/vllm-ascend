@@ -44,3 +44,24 @@ and software stack. It does not validate cache-write kernels, FULL-model replay,
 rollback custom_class proposals/acceptance, distributed execution, quantized KV,
 or performance. Timing is intentionally not reported: CPU reference and explicit
 synchronization make this a correctness probe. Production routing remains unchanged.
+
+## Isolating eager Setup failures
+
+`PagedAttentionOperation setup failed` before capture is not evidence of a graph
+replay failure. The first eager call now prints all tensor descriptors, including
+NPU format, storage offset, strides, length device and block-index range.
+The op-plugin 910B PA tests use host context lengths. Compare that contract
+explicitly without silently switching the device-inplace probe:
+
+```bash
+python examples/910b/probe_token_graph.py --buckets 20 --eager-only --context-device cpu --output pa-host-eager.json
+python examples/910b/probe_token_graph.py --buckets 20 --eager-only --context-device npu --output pa-device-eager.json
+```
+
+If both fail, repeat the CPU case with `--stream default` to isolate side-stream
+setup. Default-stream mode is restricted to eager-only. Preserve the first ATB
+error from `/root/ascend/log/atb` (or the log directory printed by ATB) together
+with the JSON. The generic Python Setup exception does not identify the rejected
+parameter. Synchronous launch can be used for a separate eager-only diagnosis,
+but must be removed before graph testing. A successful host-length eager test
+does not establish host-inplace replay: op-plugin may clone host input tensors.
