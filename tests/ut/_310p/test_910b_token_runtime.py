@@ -66,6 +66,33 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(meta.num_actual_tokens, 20)
         self.assertIs(meta.pa_token_graph_state, self.state)
 
+    def test_capture_shares_workspace_between_matching_layers(self):
+        self.backend._npu_paged_attention_get_workspace.side_effect = lambda **kw: object()
+        for i in range(28):
+            self.capture(f"layer{i}")
+        self.assertEqual(self.backend._npu_paged_attention_get_workspace.call_count, 1)
+        self.assertEqual(len({id(t.capture_workspace) for t in self.state.tasks.values()}), 1)
+
+    def test_update_allocates_once_per_geometry_not_per_layer(self):
+        self.backend._npu_paged_attention_get_workspace.side_effect = lambda **kw: object()
+        self.capture("layer0")
+        self.capture("layer1")
+        old = self.state.tasks["layer0"].workspace
+        self.backend.reset_mock()
+        self.state.update(self.backend, self.stream)
+        self.assertEqual(self.backend._npu_paged_attention_get_workspace.call_count, 1)
+        self.assertIs(self.state.tasks["layer0"].workspace, self.state.tasks["layer1"].workspace)
+        self.assertIsNot(self.state.tasks["layer0"].workspace, old)
+        self.assertIs(self.state.tasks["layer0"].capture_workspace, old)
+
+    def test_different_geometry_does_not_share_capture_workspace(self):
+        self.backend._npu_paged_attention_get_workspace.side_effect = lambda **kw: object()
+        self.capture("layer0")
+        self.state.attention(self.backend, "other", self.q[:, :4].contiguous(), self.cache, self.cache,
+                             self.out[:, :4].contiguous(), 4, 2, 0.125)
+        self.assertEqual(self.backend._npu_paged_attention_get_workspace.call_count, 2)
+        self.assertIsNot(self.state.tasks["layer0"].workspace, self.state.tasks["other"].workspace)
+
     def test_update_order_and_workspace_lifetime(self):
         self.capture()
         task = self.state.tasks["layer0"]

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in PA token graphs: CPU lengths are refreshed through task update."""
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,12 +40,25 @@ class PATask:
     capture_workspace: Any
 
 
+def workspace_key(kwargs):
+    """Sharing excludes addresses but includes all tensor layouts and PA attributes.
+
+    Within one state, every layer uses the same block table and context lengths.
+    The runner serializes updates and replays; overlapping graphs are unsupported.
+    """
+    tensors = tuple((tuple(kwargs[name].shape), tuple(kwargs[name].stride()),
+                     kwargs[name].dtype, kwargs[name].device, kwargs[name].storage_offset())
+                    for name in ("query", "key_cache", "value_cache", "out", "block_table", "context_lens"))
+    return tensors, kwargs["num_heads"], kwargs["num_kv_heads"], kwargs["scale_value"]
+
+
 @dataclass
 class PAGraphState:
     arena: PAGraphArena
     plan: Any
     tasks: dict[str, PATask] = field(default_factory=dict)
     updates: int = 0
+    capture_workspaces: dict = field(default_factory=dict)
 
     def attach(self, metadata):
         # Do not replace scheduler/common metadata used by sampling or rollback.
@@ -63,7 +77,14 @@ class PAGraphState:
             return output
         if layer_name in self.tasks:
             raise RuntimeError(f"Repeated PA capture for layer {layer_name}")
-        workspace = backend._npu_paged_attention_get_workspace(**kwargs)
+        key = workspace_key(kwargs)
+        if key not in self.capture_workspaces:
+            self.capture_workspaces[key] = backend._npu_paged_attention_get_workspace(**kwargs)
+            logging.getLogger(__name__).info(
+                "910B PA capture workspace: bucket=%s geometry=%s bytes=%s first_layer=%s",
+                bucket, len(self.capture_workspaces), getattr(self.capture_workspaces[key], "nbytes", None), layer_name,
+            )
+        workspace = self.capture_workspaces[key]
         stream = backend.npu.current_stream()
         event = backend.npu.ExternalEvent()
         event.wait(stream)
@@ -77,9 +98,16 @@ class PAGraphState:
     def update(self, backend, stream):
         # Caller drains previous replay and input copies. Strong refs retain all
         # captured activations, caches, host buffers and workspace allocations.
+        # get_workspace allocates a tensor, rather than merely querying bytes.
+        # Reuse it across matching, serial layer tasks. A fresh per-update map
+        # still accounts for changing lengths/tiling; do not assume a size bound.
+        workspaces = {}
         with backend.npu.stream(stream):
             for task in self.tasks.values():
-                workspace = backend._npu_paged_attention_get_workspace(**task.kwargs)
+                key = workspace_key(task.kwargs)
+                if key not in workspaces:
+                    workspaces[key] = backend._npu_paged_attention_get_workspace(**task.kwargs)
+                workspace = workspaces[key]
                 backend.npu.graph_task_update_begin(stream, task.handle)
                 backend._npu_paged_attention(**task.kwargs, workspace=workspace)
                 backend.npu.graph_task_update_end(stream)

@@ -68,6 +68,15 @@ write padding; scheduler request boundaries and speculative token counts remain 
 Each layer's PA task is updated before replay using host context lengths. Cache
 writes remain in the graph before attention. Explicit synchronization and per-layer
 workspace refresh prioritize correctness; benchmark before drawing performance conclusions.
+Layers with matching PA tensor layouts/attributes share one workspace per bucket.
+Each update refreshes one workspace per matching layout, shared by its serial tasks.
+Capture logs report the allocated bytes per layout. Capture allocations stay alive
+for graph lifetime; previous update allocations remain alive until replacement tasks
+finish updating. This prevents workspace retention from growing with layer count.
+If capture still runs out of memory, lower `gpu_memory_utilization` in the model
+configuration to reserve more memory outside the KV cache budget, then restart the
+process. This is separate from the layer-sharing fix; full-model peak memory must
+still be measured on the device.
 
 Use the shared acceptance harness (it selects the backend for both child processes):
 
