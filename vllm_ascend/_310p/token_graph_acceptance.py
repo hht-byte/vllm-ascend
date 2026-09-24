@@ -64,11 +64,13 @@ def worker_audit(worker, action="snapshot", phase=""):
                     event="replay" if entry is not None and entry.aclgraph is not None else "capture",
                     bucket=desc.num_tokens,
                     family=family,
-                    operator={"prefill": "_npu_flash_attention", "decode": "_npu_paged_attention",
-                              "token": "_npu_paged_attention_splitfuse_v2"}[family],
+                    operator=("_npu_paged_attention" if getattr(runner, "token_graph_910b_enabled", False)
+                              else {"prefill": "_npu_flash_attention", "decode": "_npu_paged_attention",
+                                    "token": "_npu_paged_attention_splitfuse_v2"}[family]),
                     actual_tokens=state.plan.actual_tokens,
                     actual_reqs=state.plan.actual_reqs,
                     scheduled=counts,
+                    task_updates=getattr(state, "updates", 0),
                     decode_only=getattr(runner.attn_state, "name", "") == "DecodeOnly",
                     phase=worker._token_acceptance["phase"],
                 )

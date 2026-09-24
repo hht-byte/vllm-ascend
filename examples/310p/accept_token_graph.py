@@ -54,6 +54,12 @@ def compare_reports(eager, graph, buckets):
         errors.append("No actual FULL graph replay observed; eager fallback cannot pass acceptance")
     if any(event["event"] == "capture" for event in graph["audit"]):
         errors.append("Unexpected capture during measured workloads")
+    if graph.get("backend") == "910b":
+        if graph["startup"]["graphs"] != initial:
+            errors.append("910B graphs were not all captured at startup")
+        if any(event.get("operator") != "_npu_paged_attention" or event.get("task_updates", 0) < 1
+               for event in replay):
+            errors.append("910B replay did not use updated PA tasks")
     coverage = {
         str(bucket): {
             "replays": sum(event["bucket"] == bucket for event in replay),
@@ -154,8 +160,13 @@ def run_child(args):
         if config.get(name, 1) != 1:
             raise ValueError("This acceptance script supports one device only")
     additional = config.setdefault("additional_config", {})
-    additional["token_graph_310p"] = dict(enabled=args.child == "graph", request_layout="token",
-                                         update_mode="inplace", phase_routing=args.phase_routing)
+    if args.backend == "910b":
+        additional["token_graph_310p"] = dict(enabled=False)
+        additional["token_graph_910b"] = dict(enabled=args.child == "graph")
+    else:
+        additional["token_graph_910b"] = dict(enabled=False)
+        additional["token_graph_310p"] = dict(enabled=args.child == "graph", request_layout="token",
+                                             update_mode="inplace", phase_routing=args.phase_routing)
     compilation = config.setdefault("compilation_config", {})
     if not isinstance(compilation, dict):
         raise ValueError("compilation_config must be a JSON object")
@@ -167,6 +178,7 @@ def run_child(args):
     inputs, manifest = load_inputs(args.cases)
     report = dict(
         mode=args.child,
+        backend=args.backend,
         phase_routing=args.phase_routing,
         config=config,
         manifest=manifest,
@@ -253,6 +265,7 @@ def main():
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 8, 10, 20])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument("--backend", choices=("310p", "910b"), default="310p")
     parser.add_argument("--phase-routing", action="store_true", help="Audit separate prefill, decode and token graphs")
     parser.add_argument(
         "--max-slowdown", type=float, help="Optional upper bound on graph/eager median latency per workload"
@@ -266,6 +279,8 @@ def main():
         parser.error("duplicate bucket/batch sizes are not allowed")
     if any(value is not None and value <= 0 for value in (args.max_slowdown, args.max_peak_gib)):
         parser.error("performance/memory bounds must be positive")
+    if args.backend == "910b" and args.phase_routing:
+        parser.error("910B currently supports token PA graphs only")
     args.out = args.out.resolve()
     if args.child:
         run_child(args)

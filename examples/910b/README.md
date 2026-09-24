@@ -51,7 +51,48 @@ Passing this probe establishes only PA attention replay for the tested shapes
 and software stack. It does not validate cache-write kernels, FULL-model replay,
 rollback custom_class proposals/acceptance, distributed execution, quantized KV,
 or performance. Timing is intentionally not reported: CPU reference and explicit
-synchronization make this a correctness probe. Production routing remains unchanged.
+synchronization make this a correctness probe. Default production routing remains unchanged.
+
+## Experimental full-model acceptance
+
+The 910B4 CPU-context/task-update probe passed 3 graphs and 28 cases on the
+reported torch 2.10.0 / torch_npu 2.10.0.post4 stack. Full-model integration
+still requires device acceptance, including real KV writes and speculative rollback.
+
+Enable the opt-in runner with `additional_config={"token_graph_910b":{"enabled":true}}`,
+`async_scheduling=false`, and `compilation_config.cudagraph_mode="FULL"`.
+Startup captures one PA graph per total-token bucket. All phases currently use
+the token layout; 310P phase routing is separate. Requests beyond the configured
+buckets use the normal eager path. Metadata is expanded only for PA and cache
+write padding; scheduler request boundaries and speculative token counts remain intact.
+Each layer's PA task is updated before replay using host context lengths. Cache
+writes remain in the graph before attention. Explicit synchronization and per-layer
+workspace refresh prioritize correctness; benchmark before drawing performance conclusions.
+
+Use the shared acceptance harness (it selects the backend for both child processes):
+
+```bash
+python examples/310p/accept_token_graph.py --backend 910b \
+  --config model-config.json --cases model-cases.json \
+  --buckets 20 80 192 --out model-910b-acceptance
+```
+
+The existing model-config/cases JSON format is unchanged. Keep `custom_class`
+speculative settings in model-config when testing that path; the harness does not
+replace the custom class or draft count. First run a non-speculative baseline,
+then repeat with the actual custom class in a separate output directory. Offline
+generation does not reproduce every streaming rollback: the application's streaming
+finish/rejection/rollback workloads require an additional eager-versus-graph check.
+
+Acceptance checks exact generated tokens, unchanged graph identities, request-independent
+keys, PA task updates, and completion of all captures before workload warmup.
+`missing_coverage` must be empty; set `--max-slowdown` and `--max-peak-gib` to supply
+performance and memory acceptance bounds. Retain eager.log, graph.log and summary.json.
+
+Initial scope: V1, one device, homogeneous causal full attention, floating-point KV,
+no sliding windows, sinks, ALiBi, LoRA, KV transfer or ENPU. Speculation is limited to
+ngram/custom_class (no draft model graph). Distributed and other attention backends
+are not validated by this implementation.
 
 ## Isolating eager Setup failures
 

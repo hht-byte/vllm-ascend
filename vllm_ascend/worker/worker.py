@@ -511,7 +511,15 @@ class NPUWorker(WorkerBase):
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)
         # Init ModelRunner here, so that we have access to self.device.
-        if self.use_v2_model_runner:
+        from vllm_ascend.attention.token_graph_910b import enabled as pa_token_graph_enabled
+
+        if pa_token_graph_enabled(self.vllm_config):
+            if self.use_v2_model_runner:
+                raise ValueError("token_graph_910b requires model runner V1")
+            from vllm_ascend.worker.token_graph_910b import TokenGraphRunner910B
+
+            self.model_runner = TokenGraphRunner910B(self.vllm_config, self.device)
+        elif self.use_v2_model_runner:
             logger.warning("npu model runner v2 is in developing, some features doesn't work for now.")
             from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
 

@@ -30,6 +30,16 @@ def reports():
 
 
 class TestAcceptance(unittest.TestCase):
+    def test_910b_requires_startup_capture_and_updated_pa(self):
+        eager, graph = reports()
+        graph["backend"] = "910b"
+        graph["startup"] = dict(graphs=copy.deepcopy(graph["initial_graphs"]))
+        self.assertFalse(accept.compare_reports(eager, graph, [20])["passed"])
+        graph["audit"][0].update(operator="_npu_paged_attention", task_updates=1)
+        self.assertTrue(accept.compare_reports(eager, graph, [20])["passed"])
+        graph["startup"]["graphs"] = []
+        self.assertFalse(accept.compare_reports(eager, graph, [20])["passed"])
+
     def test_three_families_require_three_stable_graphs_and_real_replays(self):
         eager, graph = reports()
         graph["phase_routing"] = True

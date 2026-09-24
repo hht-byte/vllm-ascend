@@ -1532,6 +1532,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
             query, key, value, output_padded = self.reshape_and_cache(
                 query, key, value, kv_cache, attn_metadata, output
             )
+        pa_state = getattr(attn_metadata, "pa_token_graph_state", None)
+        if pa_state is not None:
+            if (self.sliding_window is not None or self.sinks is not None or self.alibi_slopes is not None
+                    or not attn_metadata.causal or self.attn_type != AttentionType.DECODER):
+                raise ValueError("910B token PA graphs support ordinary causal attention only")
+            return pa_state.attention(
+                torch_npu, layer.layer_name, query, self.key_cache, self.value_cache,
+                output, self.num_heads, self.num_kv_heads, self.scale,
+            )
         # pooling model branch
         if attn_metadata.model_runner_type == "pooling" and not attn_metadata.causal:
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
