@@ -30,6 +30,24 @@ def reports():
 
 
 class TestAcceptance(unittest.TestCase):
+    def test_native_full_ratio_and_fallback_are_explicit(self):
+        eager, graph = reports()
+        eager.update(initial_graphs=[1], final_graphs=[1],
+                     audit=[dict(event="replay"), dict(event="dispatch", mode="FULL")])
+        result = accept.compare_reports(eager, graph, [20])
+        result["warnings"] = []
+        accept.label_baseline(result, "native_full", eager)
+        self.assertTrue(result["native_full_only"])
+        self.assertEqual(result["timings"]["prefill/b8"]["native_full_over_token_graph"], 1)
+        self.assertNotIn("eager_over_graph", result["timings"]["prefill/b8"])
+        eager["audit"] = [dict(event="dispatch", mode="NONE")]
+        result = accept.compare_reports(eager, graph, [20])
+        result["warnings"] = []
+        accept.label_baseline(result, "native_full", eager)
+        self.assertFalse(result["native_full_only"])
+        self.assertTrue(result["errors"])
+        self.assertTrue(result["warnings"])
+
     def test_910b_requires_startup_capture_and_updated_pa(self):
         eager, graph = reports()
         graph["backend"] = "910b"

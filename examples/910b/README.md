@@ -103,6 +103,28 @@ no sliding windows, sinks, ALiBi, LoRA, KV transfer or ENPU. Speculation is limi
 ngram/custom_class (no draft model graph). Distributed and other attention backends
 are not validated by this implementation.
 
+### Compare against native FULL graphs
+
+Native FULL already buckets tokens and updates attention parameters. Its uniform
+decode descriptors and operator selection differ from the token PA path; native
+FULL is not an eager baseline. To measure the incremental benefit directly:
+
+```bash
+python examples/310p/accept_token_graph.py --backend 910b --baseline native_full \
+  --config model-config.json --cases model-cases.json \
+  --buckets 20 80 192 --out native-full-vs-token
+```
+
+This runs native_full and token graph in separate processes with identical inputs,
+seed, scheduling settings and requested buckets. Native bucket resolution is kept
+unchanged (including speculative rounding); resolved graph keys are reported.
+The ratio `native_full_over_token_graph` is native median latency divided by token
+graph median latency: above 1 favors token graph, below 1 favors native FULL.
+Check `native_full_only`, dispatch counts, graph counts and memory alongside ratios.
+A baseline with fallback is marked explicitly; it is not a pure FULL replay comparison.
+The prefill/decode labels denote generation workloads, not isolated attention kernel
+timings. Repeat runs in fresh output directories to assess timing variability.
+
 ## Isolating eager Setup failures
 
 `PagedAttentionOperation setup failed` before capture is not evidence of a graph

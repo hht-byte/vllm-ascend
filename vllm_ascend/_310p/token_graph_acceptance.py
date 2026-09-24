@@ -14,6 +14,7 @@ def worker_audit(worker, action="snapshot", phase=""):
 
     runner = worker.model_runner
     if action == "install":
+        native_full = phase == "native_full"
         if hasattr(worker, "_token_acceptance"):
             raise RuntimeError("Acceptance audit already installed")
         worker._token_acceptance = {"events": [], "phase": "warmup"}
@@ -46,7 +47,14 @@ def worker_audit(worker, action="snapshot", phase=""):
             desc = context.batch_descriptor
             full = context.cudagraph_runtime_mode.name == "FULL" and wrapper.runtime_mode.name == "FULL"
             event = None
-            if full:
+            if full and native_full:
+                entry = wrapper.concrete_aclgraph_entries.get(desc)
+                dispatch = next(e for e in reversed(worker._token_acceptance["events"])
+                                if e["event"] == "dispatch")
+                kind = "replay" if entry is not None and entry.aclgraph is not None else "capture"
+                event = dict(dispatch, event=kind,
+                             family="native_full", actual_tokens=sum(dispatch["scheduled"]))
+            elif full:
                 entry = wrapper.concrete_aclgraph_entries.get(desc)
                 family = getattr(desc, "attention_family", "token")
                 arena = (getattr(runner, "_native_graph_arenas", {}).get(family) if family != "token"

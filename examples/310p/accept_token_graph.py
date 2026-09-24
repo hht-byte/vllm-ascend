@@ -133,6 +133,29 @@ def load_inputs(path):
     return inputs, manifest
 
 
+def label_baseline(summary, baseline, report):
+    summary["baseline"] = baseline
+    if baseline != "native_full":
+        return
+    events = report["audit"]
+    dispatches = [e for e in events if e["event"] == "dispatch"]
+    summary["native_full_only"] = bool(dispatches) and all(e["mode"] == "FULL" for e in dispatches)
+    summary["native_full_graphs"] = report["final_graphs"]
+    if not any(e["event"] == "replay" for e in events):
+        summary["errors"].append("Native FULL baseline performed no observed FULL replay")
+    if report["initial_graphs"] != report["final_graphs"] or any(e["event"] == "capture" for e in events):
+        summary["errors"].append("Native FULL baseline captured or changed graphs during measurement")
+    if not summary["native_full_only"]:
+        summary["warnings"].append("Native FULL baseline includes fallback; ratio compares execution strategies")
+        summary["full_acceptance"] = False
+    for result in summary["timings"].values():
+        result["native_full_seconds"] = result.pop("eager_seconds")
+        result["token_graph_seconds"] = result.pop("graph_seconds")
+        result["native_full_median_seconds"] = result.pop("eager_median_seconds")
+        result["token_graph_median_seconds"] = result.pop("graph_median_seconds")
+        result["native_full_over_token_graph"] = result.pop("eager_over_graph")
+
+
 def run_child(args):
     import torch
     import torch_npu
@@ -171,7 +194,7 @@ def run_child(args):
     if not isinstance(compilation, dict):
         raise ValueError("compilation_config must be a JSON object")
     compilation.update(
-        cudagraph_mode="FULL" if args.child == "graph" else "NONE",
+        cudagraph_mode="NONE" if args.child == "eager" else "FULL",
         cudagraph_capture_sizes=args.buckets,
         max_cudagraph_capture_size=max(args.buckets),
     )
@@ -198,7 +221,7 @@ def run_child(args):
             raise RuntimeError("Expected one worker snapshot")
         return snapshots[0]
 
-    report["startup"] = rpc("install")
+    report["startup"] = rpc("install", "native_full" if args.child == "native_full" else "")
     phases = [("prefill", 1), ("decode", args.max_tokens)]
     for phase, limit in phases:
         for batch_size in args.batch_sizes:
@@ -266,12 +289,14 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--backend", choices=("310p", "910b"), default="310p")
+    parser.add_argument("--baseline", choices=("eager", "native_full"), default="eager",
+                        help="Reference execution; native_full disables token graph but retains FULL mode")
     parser.add_argument("--phase-routing", action="store_true", help="Audit separate prefill, decode and token graphs")
     parser.add_argument(
-        "--max-slowdown", type=float, help="Optional upper bound on graph/eager median latency per workload"
+        "--max-slowdown", type=float, help="Optional upper bound on token graph/baseline median latency"
     )
     parser.add_argument("--max-peak-gib", type=float, help="Optional upper bound on graph worker peak reserved GiB")
-    parser.add_argument("--child", choices=("eager", "graph"), help=argparse.SUPPRESS)
+    parser.add_argument("--child", choices=("eager", "native_full", "graph"), help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.repeats < 1 or args.max_tokens < 2 or min(args.buckets + args.batch_sizes) < 1:
         parser.error("positive sizes/repeats and max-tokens >= 2 required")
@@ -292,7 +317,7 @@ def main():
     if env.get("ASCEND_LAUNCH_BLOCKING") == "1":
         parser.error("Unset ASCEND_LAUNCH_BLOCKING before graph acceptance")
     env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-    for mode in ("eager", "graph"):
+    for mode in (args.baseline, "graph"):
         command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], "--child", mode]
         print(f"[START] {mode}; log: {args.out / (mode + '.log')}", flush=True)
         with (args.out / f"{mode}.log").open("w", encoding="utf-8") as log:
@@ -300,7 +325,7 @@ def main():
         if result.returncode:
             write_json(args.out / "summary.json", dict(passed=False, failed_process=mode, returncode=result.returncode))
             raise SystemExit(f"{mode} failed; inspect {args.out / (mode + '.log')}")
-    eager = json.loads((args.out / "eager.json").read_text(encoding="utf-8"))
+    eager = json.loads((args.out / f"{args.baseline}.json").read_text(encoding="utf-8"))
     graph = json.loads((args.out / "graph.json").read_text(encoding="utf-8"))
     summary = compare_reports(eager, graph, args.buckets)
     summary["memory_bytes"] = {
@@ -314,21 +339,21 @@ def main():
                 *(run["memory"]["peak_reserved"] for run in report["runs"]),
             ),
         )
-        for mode, report in (("eager", eager), ("graph", graph))
+        for mode, report in ((args.baseline, eager), ("graph", graph))
     }
     summary["dispatch_counts"] = {
         mode: {
             path: sum(event["event"] == "dispatch" and event.get("mode") == path for event in report["audit"])
             for path in ("NONE", "FULL", "PIECEWISE")
         }
-        for mode, report in (("eager", eager), ("graph", graph))
+        for mode, report in ((args.baseline, eager), ("graph", graph))
     }
     if eager["manifest"] != graph["manifest"]:
         summary["errors"].append("Input files changed between processes")
         summary["passed"] = summary["full_acceptance"] = False
     summary["warnings"] = [
         f"{mode}: storage_offset warning remains unresolved"
-        for mode in ("eager", "graph")
+        for mode in (args.baseline, "graph")
         if "storage_offset" in (args.out / f"{mode}.log").read_text(encoding="utf-8", errors="replace")
     ]
     if summary["warnings"]:
@@ -339,13 +364,14 @@ def main():
     else:
         for workload, result in summary["timings"].items():
             if result["graph_median_seconds"] > args.max_slowdown * result["eager_median_seconds"]:
-                summary["errors"].append(f"{workload}: graph/eager latency exceeds {args.max_slowdown}")
+                summary["errors"].append(f"{workload}: graph/{args.baseline} latency exceeds {args.max_slowdown}")
     if args.max_peak_gib is None:
         summary["pending_reviews"].append("Memory reported; no peak-reserved GiB acceptance bound supplied")
     elif summary["memory_bytes"]["graph"]["max_peak_reserved"] > args.max_peak_gib * 1024**3:
         summary["errors"].append("Graph peak reserved memory exceeds configured GiB bound")
     if summary["pending_reviews"]:
         summary["full_acceptance"] = False
+    label_baseline(summary, args.baseline, eager)
     if summary["errors"]:
         summary["passed"] = summary["full_acceptance"] = False
     write_json(args.out / "summary.json", summary)
