@@ -59,7 +59,7 @@ class SummaryAlignmentTest(unittest.TestCase):
                 {"ws_id": "ws-a", "seg": 1,
                  "received_at": "2026-10-19T00:00:10.500+00:00",
                  "done_at": "2026-10-19T00:00:11+00:00",
-                 "commit_latency_ms": 500},
+                 "commit_latency_ms": 500, "queue_size": 3},
                 {"ws_id": "ws-b", "seg": 1,
                  "received_at": "2026-10-19T00:00:21+00:00",
                  "done_at": "2026-10-19T00:00:22+00:00",
@@ -80,6 +80,8 @@ class SummaryAlignmentTest(unittest.TestCase):
             self.assertEqual(data["npu_utilization_pct"]["mean"], 40)
             self.assertEqual(data["formal_commit_count"], 1)
             self.assertEqual(data["commit_latency_ms"]["mean"], 500)
+            self.assertEqual(data["service_queue_size"]["mean"], 3)
+            self.assertEqual(data["audio_blocks_pending_at_commit"]["mean"], 2)
             rows = [json.loads(line) for line in aligned.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["metrics_at_receive"]["offset_ms"], -300)

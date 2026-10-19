@@ -34,6 +34,8 @@ python streaming_prespec_monitor.py sample \
 
 也可用 `received_at`、`consumed_at`、`done_at` 三个带日期和时区的 ISO-8601 时间戳代替两个毫秒字段。服务日志的 `atime` 只有 `HH:MM:SS.mmm`，必须先由现有分析器补上日期与时区；跨午夜要正确递增日期。不要把 `inference submit` 当作 commit 后 finish 推理起点。空 commit 用 `is_empty_commit=true` 标记。若将伪请求期间及其后的正式 commit 区分为 `phase=current`/`phase=downstream`，汇总会分别计算两组 P95；未标注时只报告全部正式 commit。
 
+这里的 `queue_size` 是 commit 把 `None` 哨兵放入**当前段的音频队列之后**取得的长度，至少包含一个 `None`。汇总保留原值 `service_queue_size`，另给 `audio_blocks_pending_at_commit = queue_size - 1`：例如 3 表示还有 2 个音频块待消费。`service_queue_wait_ms` 是 commit 到达至协程消费哨兵的时间，可能包含正在运行的流式 chunk 推理及其后续音频块处理；它不是 vLLM 请求排队时间。只有采样字段 `queue_waiting` 表示 vLLM waiting 请求数。
+
 从测试脚本记录实际 `sustained_test` 开始、结束的 UTC 时间。若测试脚本与服务不在同一台机器，先校验时钟同步；服务端时间标记更可靠。监控和日志必须属于同一 `run_id`/并发档位。
 
 ```bash
@@ -47,7 +49,7 @@ python streaming_prespec_monitor.py summarize \
   --out baseline-c5-summary.json
 ```
 
-窗口是 `[test-start, test-end)`，按 commit 的 `received_at` 归属；窗口内收到而结束后完成的 commit 仍计入。`--aligned-out` 为每条正式 commit 找与 `received_at` 最近的 metrics/NPU 读数，默认最大时间差 3 秒，输出带符号的 `offset_ms`（正数表示读数在 commit 到达后）；超限时匹配为 `null`。它只方便检查时间邻近关系，不代表读数就是 commit 当时的设备状态。旧样本没有分项时间戳时退回使用轮询开始的 `time_utc`，对齐精度较低。`--commits` 可省略，但此时只有队列和利用率画像，无法判断正式提交时延是否被伪请求影响。`summary.json` 区分空 commit、服务队列等待、vLLM 等待请求数，并报告 NPU 缺样比例。
+窗口是 `[test-start, test-end)`，按 commit 的 `received_at` 归属；窗口内收到而结束后完成的 commit 仍计入。`--aligned-out` 为每条正式 commit 找与 `received_at` 最近的 metrics/NPU 读数，默认最大时间差 3 秒，输出带符号的 `offset_ms`（正数表示读数在 commit 到达后）；超限时匹配为 `null`。它只方便检查时间邻近关系，不代表读数就是 commit 当时的设备状态。旧样本没有分项时间戳时退回使用轮询开始的 `time_utc`，对齐精度较低。`--commits` 可省略，但此时只有队列和利用率画像，无法判断正式提交时延是否被伪请求影响。`summary.json` 区分空 commit、段级音频队列等待、vLLM 等待请求数，并报告 NPU 缺样比例。
 
 ## 3. 同负载对照
 

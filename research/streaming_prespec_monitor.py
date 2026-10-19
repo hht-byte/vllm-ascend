@@ -252,6 +252,7 @@ def summarize(args: argparse.Namespace) -> None:
     commit_latency = []
     queue_wait = []
     service_queue_size = []
+    audio_blocks_pending = []
     phase_values: dict[str, dict[str, list[float]]] = {}
     empty = 0
     keys = set()
@@ -284,6 +285,8 @@ def summarize(args: argparse.Namespace) -> None:
         size = _number(row, "queue_size")
         if size is not None:
             service_queue_size.append(size)
+            if size >= 1:
+                audio_blocks_pending.append(size - 1)  # commit already enqueued None
         phase = row.get("phase")
         if phase in {"current", "downstream"}:
             values = phase_values.setdefault(phase, {"latency": [], "queue_wait": []})
@@ -308,6 +311,7 @@ def summarize(args: argparse.Namespace) -> None:
         "commit_latency_ms": stats(commit_latency),
         "service_queue_wait_ms": stats(queue_wait),
         "service_queue_size": stats(service_queue_size),
+        "audio_blocks_pending_at_commit": stats(audio_blocks_pending),
         "by_phase": {phase: {"commit_latency_ms": stats(values["latency"]),
                              "service_queue_wait_ms": stats(values["queue_wait"])}
                      for phase, values in phase_values.items()},
