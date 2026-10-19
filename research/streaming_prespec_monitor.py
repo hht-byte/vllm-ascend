@@ -137,10 +137,14 @@ def sample(args: argparse.Namespace) -> None:
             now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             monotonic_ns = time.monotonic_ns()
             metrics = read_metrics(args.metrics_url, args.timeout)
+            metrics_time_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             npu = read_npu(command, pattern, args.timeout)
+            npu_time_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             output.write(json.dumps({"run_id": args.run_id, "time_utc": now,
                                      "monotonic_ns": monotonic_ns,
                                      "poll_ms": (time.monotonic_ns() - monotonic_ns) / 1e6,
+                                     "metrics_time_utc": metrics_time_utc,
+                                     "npu_time_utc": npu_time_utc,
                                      "metrics": metrics, "npu": npu},
                                     ensure_ascii=False) + "\n")
             output.flush()
@@ -186,17 +190,65 @@ def _is_true(value: object) -> bool:
     return value is True or str(value).lower() in {"true", "1", "yes"}
 
 
+def _utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"timestamp needs a timezone: {value}")
+    return parsed.astimezone(timezone.utc)
+
+
+def _sample_time(row: dict, source: str) -> datetime:
+    value = row.get(f"{source}_time_utc") or row.get("time_utc")
+    if not value:
+        raise ValueError("sample has no time_utc")
+    return _utc(value)
+
+
+def _nearest_sample(rows: list[dict], source: str, received: datetime,
+                    max_gap_ms: float) -> dict | None:
+    if not rows:
+        return None
+    row = min(rows, key=lambda item: abs((_sample_time(item, source) - received).total_seconds()))
+    offset_ms = round((_sample_time(row, source) - received).total_seconds() * 1000, 3)
+    if abs(offset_ms) > max_gap_ms:
+        return None
+    values = row[source]
+    fields = ("waiting", "running") if source == "metrics" else ("utilization_pct",)
+    return {"sample_time_utc": row.get(f"{source}_time_utc") or row["time_utc"],
+            "offset_ms": offset_ms,
+            **{name: values.get(name) for name in fields}}
+
+
 def summarize(args: argparse.Namespace) -> None:
     samples = load_rows(args.samples)
     if any(row.get("run_id") != args.run_id for row in samples):
         raise ValueError("samples contain another run_id")
-    waiting = [float(row["metrics"]["waiting"]) for row in samples
+    if bool(args.test_start_utc) != bool(args.test_end_utc):
+        raise ValueError("--test-start-utc and --test-end-utc must be supplied together")
+    start = _utc(args.test_start_utc) if args.test_start_utc else None
+    end = _utc(args.test_end_utc) if args.test_end_utc else None
+    if start and start >= end:
+        raise ValueError("test window must have start before end")
+    def in_window(point: datetime) -> bool:
+        return start is None or start <= point < end
+    metrics_samples = [row for row in samples if in_window(_sample_time(row, "metrics"))]
+    npu_samples = [row for row in samples if in_window(_sample_time(row, "npu"))]
+    samples = [row for row in samples if in_window(_utc(row["time_utc"]))]
+    waiting = [float(row["metrics"]["waiting"]) for row in metrics_samples
                if row.get("metrics", {}).get("waiting") is not None]
-    running = [float(row["metrics"]["running"]) for row in samples
+    running = [float(row["metrics"]["running"]) for row in metrics_samples
                if row.get("metrics", {}).get("running") is not None]
-    utilization = [float(row["npu"]["utilization_pct"]) for row in samples
+    utilization = [float(row["npu"]["utilization_pct"]) for row in npu_samples
                    if row.get("npu", {}).get("utilization_pct") is not None]
     commits = load_rows(args.commits) if args.commits else []
+    if args.aligned_out and not args.commits:
+        raise ValueError("--aligned-out requires --commits")
+    if start or args.aligned_out:
+        for row in commits:
+            if not row.get("received_at"):
+                raise ValueError("each commit needs received_at for time alignment")
+        commits = [row for row in commits if in_window(_utc(row["received_at"]))]
+    aligned = []
     commit_latency = []
     queue_wait = []
     service_queue_size = []
@@ -212,6 +264,13 @@ def summarize(args: argparse.Namespace) -> None:
         if _is_true(row.get("is_empty_commit", False)):
             empty += 1
             continue
+        if args.aligned_out:
+            received = _utc(row["received_at"])
+            aligned.append({**row,
+                            "metrics_at_receive": _nearest_sample(
+                                metrics_samples, "metrics", received, args.max_align_gap_ms),
+                            "npu_at_receive": _nearest_sample(
+                                npu_samples, "npu", received, args.max_align_gap_ms)})
         latency = _number(row, "commit_latency_ms")
         if latency is None:
             latency = _ms_between(row.get("received_at"), row.get("done_at"))
@@ -234,13 +293,16 @@ def summarize(args: argparse.Namespace) -> None:
                 values["queue_wait"].append(wait)
     result = {
         "run_id": args.run_id, "concurrency": args.concurrency,
+        "test_start_utc": args.test_start_utc, "test_end_utc": args.test_end_utc,
         "sample_count": len(samples),
+        "metrics_sample_count": len(metrics_samples),
+        "npu_sample_count": len(npu_samples),
         "queue_waiting": stats(waiting), "queue_running": stats(running),
         "npu_utilization_pct": stats(utilization),
         "queue_nonzero_fraction": sum(x > 0 for x in waiting) / len(waiting)
         if waiting else None,
-        "npu_missing_fraction": 1 - len(utilization) / len(samples)
-        if samples else None,
+        "npu_missing_fraction": 1 - len(utilization) / len(npu_samples)
+        if npu_samples else None,
         "formal_commit_count": len(commits) - empty,
         "empty_commit_count": empty,
         "commit_latency_ms": stats(commit_latency),
@@ -253,6 +315,10 @@ def summarize(args: argparse.Namespace) -> None:
     }
     Path(args.out).write_text(json.dumps(result, ensure_ascii=False, indent=2),
                               encoding="utf-8")
+    if args.aligned_out:
+        Path(args.aligned_out).write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in aligned),
+            encoding="utf-8")
 
 
 def compare(args: argparse.Namespace) -> None:
@@ -296,6 +362,10 @@ def main() -> None:
     report.add_argument("--concurrency", type=int, required=True)
     report.add_argument("--samples", required=True)
     report.add_argument("--commits", help="optional per-formal-commit JSONL or CSV")
+    report.add_argument("--test-start-utc", help="inclusive ISO-8601 test start with timezone")
+    report.add_argument("--test-end-utc", help="exclusive ISO-8601 test end with timezone")
+    report.add_argument("--aligned-out", help="optional per-commit JSONL with nearest monitor readings")
+    report.add_argument("--max-align-gap-ms", type=float, default=3000)
     report.add_argument("--out", required=True)
     diff = sub.add_parser("compare")
     diff.add_argument("--baseline", required=True)
@@ -307,6 +377,8 @@ def main() -> None:
             parser.error("interval, duration and timeout must be positive")
         sample(args)
     elif args.action == "summarize":
+        if args.max_align_gap_ms < 0:
+            parser.error("--max-align-gap-ms must be nonnegative")
         summarize(args)
     else:
         compare(args)
