@@ -9,11 +9,11 @@ python streaming_prespec_monitor.py sample \
   --run-id baseline-c5 \
   --metrics-url http://127.0.0.1:8000/metrics \
   --npu-cmd-json '["npu-smi","info"]' \
-  --duration 135 --interval 1 \
+  --duration 135 --metrics-interval 0.1 --interval 1 \
   --out baseline-c5-samples.jsonl
 ```
 
-脚本按 `--interval` 尝试轮询 vLLM `running`/`waiting` 请求数、KV 占用以及原始 NPU 命令输出；若命令耗时超过间隔，实际采样会更稀疏。`time_utc` 是轮询开始时间，`metrics_time_utc` 和 `npu_time_utc` 分别是读取完成时间，后两者用于对齐。先查看一条 `npu.raw`，根据**该机器实际输出**增加 `--npu-util-regex`，捕获组必须命名为 `util`。例如输出为 `AICore Usage(%): 42` 时可用：
+脚本并行轮询：`--metrics-interval` 控制 vLLM `running`/`waiting` 与 KV 指标（默认 0.1 秒），`--interval` 控制 NPU 命令（默认 1 秒）。每行 JSONL 只含一种来源的读数，`metrics_sample_count` 与 `npu_sample_count` 分别计数；旧版同时包含两种来源的采样文件仍可汇总。若单次读取超过间隔，该来源的实际采样会更稀疏，但不会阻塞另一来源。`time_utc` 是该次轮询开始时间，`metrics_time_utc` 或 `npu_time_utc` 是读取完成时间。更密的指标采样仍可能漏掉短暂 vLLM 排队；要确认每次请求是否等待，需在 vLLM 调度处记录提交和首次运行时间。先查看一条 `npu.raw`，根据**该机器实际输出**增加 `--npu-util-regex`，捕获组必须命名为 `util`。例如输出为 `AICore Usage(%): 42` 时可用：
 
 ```bash
 --npu-util-regex 'AICore Usage\(%\):\s*(?P<util>\d+(?:\.\d+)?)'

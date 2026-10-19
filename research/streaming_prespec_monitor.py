@@ -15,8 +15,10 @@ import re
 import subprocess
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 
 
 GAUGES = {
@@ -131,28 +133,37 @@ def sample(args: argparse.Namespace) -> None:
         raise FileExistsError(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + args.duration
-    next_tick = time.monotonic()
+    write_lock = Lock()
     with path.open("x", encoding="utf-8") as output:
-        while time.monotonic() < deadline:
-            now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-            monotonic_ns = time.monotonic_ns()
-            metrics = read_metrics(args.metrics_url, args.timeout)
-            metrics_time_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-            npu = read_npu(command, pattern, args.timeout)
-            npu_time_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-            output.write(json.dumps({"run_id": args.run_id, "time_utc": now,
-                                     "monotonic_ns": monotonic_ns,
-                                     "poll_ms": (time.monotonic_ns() - monotonic_ns) / 1e6,
-                                     "metrics_time_utc": metrics_time_utc,
-                                     "npu_time_utc": npu_time_utc,
-                                     "metrics": metrics, "npu": npu},
-                                    ensure_ascii=False) + "\n")
-            output.flush()
-            next_tick += args.interval
-            if next_tick < time.monotonic():
-                next_tick = time.monotonic() + args.interval
-            time.sleep(max(0, min(next_tick - time.monotonic(),
-                                  deadline - time.monotonic())))
+        def poll(source: str, interval: float, reader) -> None:
+            next_tick = time.monotonic()
+            while time.monotonic() < deadline:
+                now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                monotonic_ns = time.monotonic_ns()
+                value = reader()
+                done = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                row = {"run_id": args.run_id, "time_utc": now,
+                       "monotonic_ns": monotonic_ns,
+                       "poll_ms": (time.monotonic_ns() - monotonic_ns) / 1e6,
+                       f"{source}_time_utc": done, source: value}
+                with write_lock:
+                    output.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    output.flush()
+                next_tick += interval
+                if next_tick < time.monotonic():
+                    next_tick = time.monotonic() + interval
+                time.sleep(max(0, min(next_tick - time.monotonic(),
+                                      deadline - time.monotonic())))
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            tasks = [executor.submit(poll, "npu", args.interval,
+                                     lambda: read_npu(command, pattern, args.timeout))]
+            if args.metrics_url:
+                tasks.append(executor.submit(
+                    poll, "metrics", getattr(args, "metrics_interval", args.interval),
+                    lambda: read_metrics(args.metrics_url, args.timeout)))
+            for task in tasks:
+                task.result()
 
 
 def load_rows(path: str) -> list[dict]:
@@ -231,8 +242,10 @@ def summarize(args: argparse.Namespace) -> None:
         raise ValueError("test window must have start before end")
     def in_window(point: datetime) -> bool:
         return start is None or start <= point < end
-    metrics_samples = [row for row in samples if in_window(_sample_time(row, "metrics"))]
-    npu_samples = [row for row in samples if in_window(_sample_time(row, "npu"))]
+    metrics_samples = [row for row in samples if "metrics" in row
+                       and in_window(_sample_time(row, "metrics"))]
+    npu_samples = [row for row in samples if "npu" in row
+                   and in_window(_sample_time(row, "npu"))]
     samples = [row for row in samples if in_window(_utc(row["time_utc"]))]
     waiting = [float(row["metrics"]["waiting"]) for row in metrics_samples
                if row.get("metrics", {}).get("waiting") is not None]
@@ -358,6 +371,7 @@ def main() -> None:
     capture.add_argument("--npu-cmd-json", default='["npu-smi","info"]')
     capture.add_argument("--npu-util-regex")
     capture.add_argument("--interval", type=float, default=1.0)
+    capture.add_argument("--metrics-interval", type=float, default=0.1)
     capture.add_argument("--duration", type=float, required=True)
     capture.add_argument("--timeout", type=float, default=2.0)
     capture.add_argument("--out", required=True)
@@ -377,8 +391,9 @@ def main() -> None:
     diff.add_argument("--out", required=True)
     args = parser.parse_args()
     if args.action == "sample":
-        if args.interval <= 0 or args.duration <= 0 or args.timeout <= 0:
-            parser.error("interval, duration and timeout must be positive")
+        if (args.interval <= 0 or args.metrics_interval <= 0 or
+                args.duration <= 0 or args.timeout <= 0):
+            parser.error("intervals, duration and timeout must be positive")
         sample(args)
     elif args.action == "summarize":
         if args.max_align_gap_ms < 0:

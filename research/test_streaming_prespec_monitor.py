@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -28,12 +29,43 @@ class SummaryAlignmentTest(unittest.TestCase):
             with patch.object(monitor, "read_metrics", return_value={"waiting": 0, "running": 1}), \
                     patch.object(monitor, "read_npu", return_value={"utilization_pct": 20}):
                 monitor.sample(args)
-            row = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
-            start = datetime.fromisoformat(row["time_utc"])
-            metrics_done = datetime.fromisoformat(row["metrics_time_utc"])
-            npu_done = datetime.fromisoformat(row["npu_time_utc"])
-            self.assertLessEqual(start, metrics_done)
-            self.assertLessEqual(metrics_done, npu_done)
+            rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual({"metrics", "npu"}, {key for row in rows
+                                                  for key in ("metrics", "npu") if key in row})
+            for row in rows:
+                source = "metrics" if "metrics" in row else "npu"
+                self.assertLessEqual(datetime.fromisoformat(row["time_utc"]),
+                                     datetime.fromisoformat(row[f"{source}_time_utc"]))
+
+    def test_slow_npu_does_not_block_metrics_polling(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPT.parent) as directory:
+            output = Path(directory) / "samples.jsonl"
+            summary = Path(directory) / "summary.json"
+            args = argparse.Namespace(
+                run_id="c5", npu_cmd_json='["npu-smi"]', npu_util_regex=None,
+                out=str(output), duration=0.25, interval=1.0,
+                metrics_interval=0.03, metrics_url="http://example.invalid/metrics",
+                timeout=1.0,
+            )
+            def slow_npu(*_args):
+                time.sleep(0.15)
+                return {"utilization_pct": 20}
+            with patch.object(monitor, "read_metrics", return_value={"waiting": 0, "running": 1}), \
+                    patch.object(monitor, "read_npu", side_effect=slow_npu):
+                monitor.sample(args)
+            rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+            metrics_count = sum("metrics" in row for row in rows)
+            npu_count = sum("npu" in row for row in rows)
+            self.assertGreaterEqual(metrics_count, 3)
+            self.assertEqual(npu_count, 1)
+            result = subprocess.run([
+                sys.executable, str(SCRIPT), "summarize", "--run-id", "c5",
+                "--concurrency", "5", "--samples", str(output), "--out", str(summary),
+            ], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(summary.read_text(encoding="utf-8"))
+            self.assertEqual(data["metrics_sample_count"], metrics_count)
+            self.assertEqual(data["npu_sample_count"], npu_count)
 
     def test_excludes_pretest_samples_and_aligns_commit_by_utc(self):
         with tempfile.TemporaryDirectory(dir=SCRIPT.parent) as directory:
