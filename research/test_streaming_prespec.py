@@ -4,7 +4,7 @@ from dataclasses import replace
 
 from streaming_prespec import (AdmissionPolicy, LoadSnapshot,
                                PreSpecCoordinator, RepairExtendProducer,
-                               ShadowRequest)
+                               ShadowRequest, VerifiedRollback)
 
 
 class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
@@ -57,14 +57,19 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_producer_verifies_old_then_extends_on_isolated_branch(self):
         calls = []
+        test_case = self
+        repaired_state = object()
+        verified = VerifiedRollback((20, 99), repaired_state)
 
         class Branch:
             async def verify_and_repair_old(self, rollback, budget):
                 calls.append(("verify", rollback, budget))
-                return (20, 99)
+                return verified
 
-            async def extend(self, budget):
-                calls.append(("extend", budget))
+            async def extend_from_verified(self, result, budget):
+                test_case.assertIs(result, verified)
+                test_case.assertIs(result.continuation_state, repaired_state)
+                calls.append(("extend", result.token_ids, budget))
                 return (30, 31)
 
             async def close(self):
@@ -78,7 +83,7 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         produced = await RepairExtendProducer(Backend())(self.request(), 4)
         self.assertEqual(produced, (20, 99, 30, 31))
         self.assertEqual(calls, [("open", 1), ("verify", (20, 21), 4),
-                                 ("extend", 2), ("close",)])
+                                 ("extend", (20, 99), 2), ("close",)])
 
     async def test_producer_closes_branch_when_verification_fails(self):
         closed = False
@@ -87,7 +92,7 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             async def verify_and_repair_old(self, rollback, budget):
                 raise RuntimeError("backend failed")
 
-            async def extend(self, budget):
+            async def extend_from_verified(self, result, budget):
                 self.fail("should not extend")
 
             async def close(self):
@@ -99,6 +104,28 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 return Branch()
 
         with self.assertRaisesRegex(RuntimeError, "backend failed"):
+            await RepairExtendProducer(Backend())(self.request(), 4)
+        self.assertTrue(closed)
+
+    async def test_producer_rejects_raw_tokens_without_verified_state(self):
+        closed = False
+
+        class Branch:
+            async def verify_and_repair_old(self, rollback, budget):
+                return (20, 99)  # Tokens alone do not prove corrected KV state.
+
+            async def extend_from_verified(self, verified, budget):
+                raise AssertionError("must not extend an unverified state")
+
+            async def close(self):
+                nonlocal closed
+                closed = True
+
+        class Backend:
+            async def open_shadow(self, request):
+                return Branch()
+
+        with self.assertRaisesRegex(TypeError, "VerifiedRollback"):
             await RepairExtendProducer(Backend())(self.request(), 4)
         self.assertTrue(closed)
 

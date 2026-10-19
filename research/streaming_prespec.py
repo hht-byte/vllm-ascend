@@ -93,13 +93,26 @@ Clock = Callable[[], int]
 ProbeSink = Callable[[CandidateProbe], None]
 
 
+@dataclass(frozen=True)
+class VerifiedRollback:
+    """Corrected rollback suffix plus adapter-owned shadow continuation state."""
+
+    token_ids: tuple[int, ...]
+    continuation_state: object
+
+
 class ShadowBranch(Protocol):
-    """Adapter-owned, disposable inference state with no authoritative KV alias."""
+    """Wrap the existing rollback verifier on disposable, non-authoritative KV.
+
+    ``extend_from_verified`` must continue from the corrected state returned by
+    ``verify_and_repair_old``, never from the raw rollback hypothesis.
+    """
 
     async def verify_and_repair_old(self, rollback_tokens: tuple[int, ...],
-                                    budget: int) -> Sequence[int]: ...
+                                    budget: int) -> VerifiedRollback: ...
 
-    async def extend(self, budget: int) -> Sequence[int]: ...
+    async def extend_from_verified(self, verified: VerifiedRollback,
+                                   budget: int) -> Sequence[int]: ...
 
     async def close(self) -> None: ...
 
@@ -109,7 +122,7 @@ class ShadowBackend(Protocol):
 
 
 class RepairExtendProducer:
-    """Verify/repair rollback tokens, then decode new midpoint-audio text."""
+    """Reuse rollback verification, then extend its corrected shadow state."""
 
     def __init__(self, backend: ShadowBackend) -> None:
         self.backend = backend
@@ -118,13 +131,22 @@ class RepairExtendProducer:
                        max_candidate_tokens: int) -> tuple[int, ...]:
         branch = await self.backend.open_shadow(request)
         try:
-            old = tuple(await branch.verify_and_repair_old(
+            verified = await branch.verify_and_repair_old(
                 request.rollback_tokens[:max_candidate_tokens],
-                max_candidate_tokens))
+                max_candidate_tokens)
+            if not isinstance(verified, VerifiedRollback):
+                raise TypeError("rollback verifier must return VerifiedRollback")
+            if verified.continuation_state is None:
+                raise ValueError("rollback verifier returned no continuation state")
+            old = verified.token_ids
+            if not isinstance(old, tuple) or not all(
+                    isinstance(token, int) and token >= 0 for token in old):
+                raise ValueError("rollback verifier returned invalid token IDs")
             if len(old) > max_candidate_tokens:
                 raise ValueError("repaired old suffix exceeds candidate budget")
             remaining = max_candidate_tokens - len(old)
-            extension = tuple(await branch.extend(remaining)) if remaining else ()
+            extension = (tuple(await branch.extend_from_verified(verified, remaining))
+                         if remaining else ())
             if len(extension) > remaining:
                 raise ValueError("new continuation exceeds candidate budget")
             return old + extension

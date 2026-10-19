@@ -21,13 +21,13 @@ python commit_overlap.py --commits baseline-c20-commits.jsonl \
 
 ## 接入现有服务
 
-模型端为 `ShadowBackend.open_shadow(request)` 实现私有推理状态。返回的 branch 必须提供：
+模型端为 `ShadowBackend.open_shadow(request)` 实现私有推理状态。这里应**调用服务已经实现的回滚投机验证逻辑**，把上一轮回滚 token 当草稿，在中点已到达音频上运行；不要另写一套 token 匹配或直接沿旧草稿续写。返回的 branch 必须提供：
 
-1. `verify_and_repair_old(rollback_tokens, budget)`：在 `request.audio_pcm_f32le` 所含的**已到达**音频条件下验证旧回滚后缀，首个分歧处修正，返回修订后的后缀 token；
-2. `extend(budget)`：沿同一私有 branch 自回归生成新增音频对应的 token；
+1. `verify_and_repair_old(rollback_tokens, budget)`：在 `request.stable_prefix_tokens` 与 `request.audio_pcm_f32le` 所含的**已到达**音频条件下，复用现有 rollback verifier 验证旧回滚后缀，在首个分歧处修正，并返回 `VerifiedRollback(token_ids=修订后的后缀, continuation_state=修正后的私有 KV/解码状态)`；
+2. `extend_from_verified(verified, budget)`：必须从传入的 `verified.continuation_state` 继续自回归生成新增音频对应的 token，不能从未验证的旧 KV 或原始 `rollback_tokens` 直接续写；
 3. `close()`：包括取消和异常路径，都释放 request、KV 和模型侧资源。
 
-branch 不得复用权威 request 的可变 KV、slot mapping 或输出缓冲。`RepairExtendProducer` 按以上顺序调用，并受 `max_candidate_tokens` 限制。候选 token **不是最终结果**，消费模式只能交给现有 target verifier 在完整正式音频上重新验证。
+branch 不得复用权威 request 的可变 KV、slot mapping 或输出缓冲。`VerifiedRollback.token_ids` 只含验证/修正后的旧后缀，`continuation_state` 是适配器管理的不透明私有状态；两者必须对应同一前缀与中点音频快照。`RepairExtendProducer` 按以上顺序调用，拒绝只返回 token 列表而没有修正后状态的适配器结果，并受 `max_candidate_tokens` 限制。候选 token **不是最终结果**，消费模式仍须交给已有的权威 target verifier 在完整正式音频上重新验证。
 
 在服务进程创建一个 `PreSpecCoordinator(RepairExtendProducer(backend), policy)`。默认 `shadow_only=True`，正式路径仍使用原来的 rollback draft/target-only 逻辑。可传 `on_probe` 记录每次权威 chunk/finish 开始时的候选状态；写盘应通过 `logging.handlers.QueueHandler` 等非阻塞队列，避免测量本身拖慢正式路径：
 
