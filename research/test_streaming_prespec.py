@@ -286,6 +286,53 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(coordinator.finish_formal("ws-1", 1, (20, 21, 99)))
         await coordinator.close_session("ws-1")
 
+    async def test_probe_records_readiness_at_chunk_submit_without_waiting(self):
+        probes = []
+        async def producer(request, budget):
+            return (20, 21)
+
+        coordinator = PreSpecCoordinator(producer, self.policy, clock=lambda: self.now,
+                                         on_probe=probes.append)
+        coordinator.maybe_start(self.request(), self.load(), 200)
+        await asyncio.sleep(0)
+        self.now += 35_000_000
+        self.assertIsNone(coordinator.begin_authoritative_chunk(
+            "ws-1", audio_epoch=1, prefix_version=2,
+            full_audio_end_samples=64_000))
+        self.assertEqual(probes[-1].boundary, "chunk")
+        self.assertEqual(probes[-1].status, "ready_shadow_only")
+        self.assertEqual(probes[-1].ready_lead_ms, 35)
+        coordinator.end_authoritative_chunk(
+            "ws-1", audio_epoch=1, target_continuation_tokens=(20, 21))
+        coordinator.begin_formal("ws-1", 1, 2, 64_000)
+        self.assertEqual(probes[-1].status, "previously_used")
+        coordinator.finish_formal("ws-1", 1, ())
+        await coordinator.close_session("ws-1")
+
+    async def test_probe_records_pending_shadow_and_sink_failure_isolated(self):
+        started = asyncio.Event()
+        probes = []
+        async def producer(request, budget):
+            started.set()
+            await asyncio.Future()
+
+        def sink(probe):
+            probes.append(probe)
+            raise RuntimeError("probe writer failed")
+
+        coordinator = PreSpecCoordinator(producer, self.policy, clock=lambda: self.now,
+                                         on_probe=sink)
+        coordinator.maybe_start(self.request(), self.load(), 200)
+        await started.wait()
+        self.assertIsNone(coordinator.begin_authoritative_chunk(
+            "ws-1", audio_epoch=1, prefix_version=2,
+            full_audio_end_samples=64_000))
+        self.assertEqual(probes[-1].status, "pending")
+        self.assertEqual(coordinator.probe_error_count, 1)
+        coordinator.end_authoritative_chunk(
+            "ws-1", audio_epoch=1, target_continuation_tokens=())
+        await coordinator.close_session("ws-1")
+
     async def test_force_mode_allows_shadow_measurement_under_load(self):
         async def producer(request, budget):
             return (20,)

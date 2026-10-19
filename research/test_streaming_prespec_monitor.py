@@ -18,6 +18,29 @@ SCRIPT = Path(__file__).with_name("streaming_prespec_monitor.py")
 
 
 class SummaryAlignmentTest(unittest.TestCase):
+    def test_compare_reports_p99_latency_and_audio_queue_wait(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPT.parent) as directory:
+            root = Path(directory)
+            baseline = root / "baseline.json"
+            probe = root / "probe.json"
+            output = root / "comparison.json"
+            base = {"run_id": "base", "concurrency": 20,
+                    "commit_latency_ms": {"p95": 300, "p99": 370},
+                    "service_queue_wait_ms": {"p95": 50, "p99": 160},
+                    "queue_waiting": {"p95": 0, "p99": 0},
+                    "npu_utilization_pct": {"p95": 52, "p99": 54},
+                    "by_phase": {}}
+            changed = {**base, "run_id": "probe",
+                       "commit_latency_ms": {"p95": 290, "p99": 365},
+                       "service_queue_wait_ms": {"p95": 55, "p99": 170}}
+            baseline.write_text(json.dumps(base), encoding="utf-8")
+            probe.write_text(json.dumps(changed), encoding="utf-8")
+            monitor.compare(argparse.Namespace(
+                baseline=str(baseline), probe=str(probe), out=str(output)))
+            deltas = json.loads(output.read_text(encoding="utf-8"))["deltas"]
+            self.assertEqual(deltas["commit_latency_ms_p99"], -5)
+            self.assertEqual(deltas["service_queue_wait_ms_p99"], 10)
+
     def test_sample_records_separate_source_completion_times(self):
         with tempfile.TemporaryDirectory(dir=SCRIPT.parent) as directory:
             output = Path(directory) / "samples.jsonl"

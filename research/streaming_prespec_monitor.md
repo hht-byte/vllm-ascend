@@ -62,4 +62,4 @@ python streaming_prespec_monitor.py compare \
   --out c5-comparison.json
 ```
 
-先看正式 commit P95、服务队列等待 P95，以及 `current`/`downstream` 分组是否上升；同时看采样到的 vLLM waiting 和 NPU 利用率。低利用率或利用率上升本身都不能证明可投机。该脚本只输出描述性差值，不自动宣称“无时延影响”；真机结论还需要重复运行、实际到达负载核对及预先设定的可接受退化阈值。
+先看正式 commit P95/P99、段级音频队列等待 P95/P99，以及 `current`/`downstream` 分组是否上升；同时看采样到的 vLLM waiting 和 NPU 利用率。低利用率或利用率上升本身都不能证明可投机。该脚本只输出描述性差值，不自动宣称“无时延影响”；真机结论还需要重复运行、实际到达负载核对及预先设定的可接受退化阈值。

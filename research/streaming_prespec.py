@@ -77,8 +77,20 @@ class Evaluation:
     ready_lead_ms: float
 
 
+@dataclass(frozen=True)
+class CandidateProbe:
+    session_id: str
+    audio_epoch: int
+    boundary: Literal["chunk", "formal"]
+    target_start_ns: int
+    status: str
+    ready_lead_ms: float | None = None
+    request_id: str | None = None
+
+
 Producer = Callable[[ShadowRequest, int], Awaitable[Sequence[int]]]
 Clock = Callable[[], int]
+ProbeSink = Callable[[CandidateProbe], None]
 
 
 class ShadowBranch(Protocol):
@@ -131,13 +143,16 @@ class PreSpecCoordinator:
     def __init__(self, producer: Producer,
                  policy: AdmissionPolicy = AdmissionPolicy(), *,
                  clock: Clock = time.monotonic_ns,
-                 shadow_only: bool = True) -> None:
+                 shadow_only: bool = True,
+                 on_probe: ProbeSink | None = None) -> None:
         self.producer = producer
         self.policy = policy
         if policy.admission_mode not in ("gated", "force"):
             raise ValueError("admission_mode must be gated or force")
         self.clock = clock
         self.shadow_only = shadow_only
+        self.on_probe = on_probe
+        self.probe_error_count = 0
         self._tasks: dict[tuple[str, int], asyncio.Task[Candidate]] = {}
         self._reserved: set[asyncio.Task[Candidate]] = set()
         self._task_sessions: dict[asyncio.Task[Candidate], str] = {}
@@ -222,14 +237,18 @@ class PreSpecCoordinator:
         if audio_epoch is not None and (prefix_version is None or
                                         full_audio_end_samples is None):
             raise ValueError("chunk candidate needs prefix version and audio end")
+        started_ns = self.clock()
         previous_active = self._active_chunks.get(session_id, 0)
         self._active_chunks[session_id] = previous_active + 1
         key = (session_id, audio_epoch) if audio_epoch is not None else None
         task = self._tasks.pop(key, None) if key is not None else None
         self._cancel_pending_shadows()
-        if key is None or key in self._selected:
+        if key is None:
             return None
-        return self._select_candidate(task, key, prefix_version,
+        if key in self._selected:
+            self._emit_probe(key, "chunk", started_ns, "already_selected")
+            return None
+        return self._select_candidate(task, key, "chunk", started_ns, prefix_version,
                                       full_audio_end_samples,
                                       allow_candidate and not previous_active)
 
@@ -259,27 +278,55 @@ class PreSpecCoordinator:
                                   target_continuation_tokens)
         return None
 
+    def _emit_probe(self, key: tuple[str, int],
+                    boundary: Literal["chunk", "formal"], started_ns: int,
+                    status: str, candidate: Candidate | None = None) -> None:
+        if self.on_probe is None:
+            return
+        probe = CandidateProbe(
+            key[0], key[1], boundary, started_ns, status,
+            (started_ns - candidate.ready_ns) / 1e6 if candidate else None,
+            candidate.request_id if candidate else None)
+        try:
+            self.on_probe(probe)
+        except Exception:
+            self.probe_error_count += 1  # Measurement must not fail target work.
+
     def _select_candidate(self, task: asyncio.Task[Candidate] | None,
-                          key: tuple[str, int], prefix_version: int,
+                          key: tuple[str, int],
+                          boundary: Literal["chunk", "formal"], started_ns: int,
+                          prefix_version: int,
                           full_audio_end_samples: int,
                           allow_candidate: bool) -> Candidate | None:
         if task is None:
+            self._emit_probe(key, boundary, started_ns,
+                             "previously_used" if key in self._launched else "not_started")
             return None
         if not task.done():
             task.cancel()
+            self._emit_probe(key, boundary, started_ns, "pending")
             return None
         self._reserved.discard(task)
         try:
             candidate = task.result()
         except (asyncio.CancelledError, Exception):
+            self._emit_probe(key, boundary, started_ns, "failed")
             return None
-        if (not allow_candidate
-                or candidate.base_prefix_version != prefix_version
-                or candidate.audio_epoch != key[1]
+        if not allow_candidate:
+            self._emit_probe(key, boundary, started_ns, "disallowed", candidate)
+            return None
+        if candidate.base_prefix_version != prefix_version:
+            self._emit_probe(key, boundary, started_ns, "version_mismatch", candidate)
+            return None
+        if (candidate.audio_epoch != key[1]
                 or candidate.visible_audio_end_samples > full_audio_end_samples):
+            self._emit_probe(key, boundary, started_ns, "audio_mismatch", candidate)
             return None
         self._selected[key] = candidate
-        self._selected_at_ns[key] = self.clock()
+        self._selected_at_ns[key] = started_ns
+        self._emit_probe(key, boundary, started_ns,
+                         "ready_shadow_only" if self.shadow_only else "ready_consumed",
+                         candidate)
         return None if self.shadow_only else candidate
 
     def begin_formal(self, session_id: str, audio_epoch: int,
@@ -290,14 +337,16 @@ class PreSpecCoordinator:
         key = (session_id, audio_epoch)
         if key in self._begun:
             raise ValueError(f"formal boundary already begun: {key}")
+        started_ns = self.clock()
         previous_active = self._active_formals.get(session_id, 0)
         self._active_formals[session_id] = previous_active + 1
         self._begun.add(key)
         task = self._tasks.pop(key, None)
         self._cancel_pending_shadows()
         if key in self._selected:
+            self._emit_probe(key, "formal", started_ns, "already_selected")
             return None
-        return self._select_candidate(task, key, prefix_version,
+        return self._select_candidate(task, key, "formal", started_ns, prefix_version,
                                       full_audio_end_samples,
                                       allow_candidate and not previous_active)
 

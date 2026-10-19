@@ -349,15 +349,20 @@ def compare(args: argparse.Namespace) -> None:
               "decision": "inconclusive_without_matched_load_and_latency_margin"}
     for key in ("commit_latency_ms", "service_queue_wait_ms", "queue_waiting",
                 "npu_utilization_pct"):
-        old = baseline[key]["p95"]
-        new = probe[key]["p95"]
-        result["deltas"][key + "_p95"] = new - old if old is not None and new is not None else None
+        for percentile_name in ("p95", "p99"):
+            old = baseline[key].get(percentile_name)
+            new = probe[key].get(percentile_name)
+            result["deltas"][key + "_" + percentile_name] = (
+                new - old if old is not None and new is not None else None)
     for phase in ("current", "downstream"):
         for key in ("commit_latency_ms", "service_queue_wait_ms"):
-            old = baseline.get("by_phase", {}).get(phase, {}).get(key, {}).get("p95")
-            new = probe.get("by_phase", {}).get(phase, {}).get(key, {}).get("p95")
-            result["deltas"][phase + "_" + key + "_p95"] = (
-                new - old if old is not None and new is not None else None)
+            for percentile_name in ("p95", "p99"):
+                old = (baseline.get("by_phase", {}).get(phase, {})
+                       .get(key, {}).get(percentile_name))
+                new = (probe.get("by_phase", {}).get(phase, {})
+                       .get(key, {}).get(percentile_name))
+                result["deltas"][phase + "_" + key + "_" + percentile_name] = (
+                    new - old if old is not None and new is not None else None)
     Path(args.out).write_text(json.dumps(result, ensure_ascii=False, indent=2),
                               encoding="utf-8")
 
