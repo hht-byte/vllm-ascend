@@ -25,7 +25,9 @@ python commit_overlap.py --commits baseline-c20-commits.jsonl \
 
 核心改动集中在 `qwen3_asr_async.py`：复用现有 external draft 构造和 engine 的 verify → correction → decode 链路。连接层只通知中点/commit/清理；路由层复用已经注入的 ASR 实例。仍直接使用 `PreSpecCoordinator(producer, ...)`，无需为了接入实现分阶段 `ShadowBackend`/KV 接口。
 
-**音频输入合同：正式请求和预投机请求都提交截至各自时刻的完整累计音频，沿用现有服务的请求构造规则。** 服务端只用新增音频采样计数决定何时尝试预投机；不根据 KV 命中情况裁剪音频、不选择 KV 复用范围。音频编码/前缀/KV 是否可复用，以及复用多少，交给 vLLM-Ascend 按实际请求和缓存状态判断。
+**特性边界：预投机与窗口缓存相互解耦。** 本方案不新增窗口缓存的开关、适配器、namespace 或释放逻辑，也不以窗口缓存开启或关闭作为接入条件。
+
+**音频输入合同：正式请求和预投机请求都提交截至各自时刻的完整累计音频，沿用现有服务的请求构造规则。** 服务端用新增音频采样计数决定何时尝试预投机；KV 复用由 vLLM-Ascend 判断。
 
 ### 一、先完成实例接线：这里给出实际新增代码
 
@@ -208,7 +210,7 @@ helper 的职责可以复用现有函数，不要求机械增加三个类或三�
 这三个 helper **不在当前 `streaming_prespec.py` 中**。完成步骤 1–5 后仍需新增它们，不能只复制调用语句。按以下顺序处理：
 
 1. 在 `async_streaming_transcribe()` 中找到 `external draft` 构造、现有完整音频/prompt 构造及 `engine.generate` 调用；先把“构造请求”部分提取为 `_build_stream_request()`，原正式路径改为调用它，保留原参数和结果处理。
-2. 新增 `_run_prespec(snapshot, budget)`：用相同的请求构造规则提交中点时刻的完整累计音频，把旧回滚 token 放入同一个 external draft 字段；使用独立 request ID 和请求级 SamplingParams，迭代 engine 原始输出，返回 P0 后的最终 token tuple；finally 使用现有 abort/流关闭代码。不要为 shadow 强制旁路已有缓存路径。
+2. 新增 `_run_prespec(snapshot, budget)`：用相同的请求构造规则提交中点时刻的完整累计音频，把旧回滚 token 放入同一个 external draft 字段；使用独立 request ID 和请求级 SamplingParams，迭代 engine 原始输出，返回 P0 后的最终 token tuple；finally 使用现有 abort/流关闭代码。
 3. 新增 `try_start_prespec(...)`：在前述条件成立时组装 `ShadowRequest` 的服务侧扩展快照，并调用 `self.prespec.maybe_start(...)`；本函数不 await 推理。
 
 不能仅凭函数职责摘要确定的映射集中在这里：engine 实例的实际属性名、external draft 字段结构、prompt 构造实参、ASRStreamingState 的音频/token 字段。这些必须复制你的现有实现。这里没有把虚构的 `engine.generate(draft_tokens=...)` 当成可直接粘贴的 vLLM API。
@@ -225,17 +227,13 @@ shadow 的单次 engine 请求必须做完：
 
 U0 进入**现有 external draft 字段**，不拼进不可修改的 prompt。C1 不含 P0、不含被拒绝的旧 token。候选预算初始取 `min(实验预算, kmax)`，`kmax<=0` 或现有回滚路径不生效时跳过；不能照搬固定 8。SamplingParams 及 external draft 容器要按请求复制后修改，不能原地改共享配置。若 engine 输出是累计 token IDs，保存最终累计值；不能每次 `extend()` 导致重复拼接。
 
-**shadow 不调用 `async_streaming_transcribe()`、`async_finish_streaming_transcribe()` 或 `_yield_delta_text()`。** 前两者修改 buffer/audio_accum/正式状态，后者计算已发送 delta、写全局统计并释放窗口缓存 session。shadow 自己消费 engine 输出，不 yield `ChunkInferenceEvent`/delta/done、不写回真实 state；单独记录请求类别和统计。引擎自身的全局 spec decode 计数也可能包含 shadow，baseline/probe 比较时不能当成纯正式请求接受率。
+**shadow 不调用 `async_streaming_transcribe()`、`async_finish_streaming_transcribe()` 或 `_yield_delta_text()`。** 前两者修改 buffer/audio_accum/正式状态，后者计算已发送 delta 并写正式转写统计。shadow 自己消费 engine 输出，不 yield `ChunkInferenceEvent`/delta/done、不写回真实 state；单独记录请求类别和统计。引擎自身的全局 spec decode 计数也可能包含 shadow，baseline/probe 比较时不能当成纯正式请求接受率。
 
-#### 缓存职责：服务端传完整输入，引擎决定复用
+#### 请求生命周期：只管理预投机自己的请求
 
-撤回前版“shadow 强制选择全量分支以绕过窗口缓存”的建议。**传完整音频不等于关闭缓存或要求全部重算。** 正式和 shadow 均沿用现有输入协议、请求构造及缓存配置；服务端只新增预投机时机和草稿来源，不探测或控制 KV 命中范围。
+给 shadow 分配独立 request ID。取消时只 abort 这个请求，并关闭它的输出迭代器；正式请求和正式 session 继续按原生命周期运行。正常完成时保存候选 token，供下一正式请求通过已有 verifier 验证。
 
-服务端给 shadow 分配独立 request ID，并仅取消/结束这个请求；vLLM-Ascend 负责请求的解码状态和可共享缓存的正确管理。独立请求不要求物理复制全部 KV，也不禁止引擎共享可复用前缀。服务端不手工拷贝、裁剪、回滚或释放 KV block。
-
-仍需保留的是**业务生命周期隔离**：shadow 不更新正式文本/state，不触发整个正式会话的结束。按你给出的函数职责，`_yield_delta_text()` 带有正式结果处理及会话释放副作用，因此 shadow 使用纯 engine 输出收集路径；若原请求包装器维护会话元数据，调用其请求级清理接口，不误调用结束正式 session 的接口。这是请求归属管理，不是服务端判断 KV 能否复用。
-
-用引擎现有的缓存命中、computed tokens、prefill 等指标观察实际成本；不能仅凭“输入相同前缀”断言缓存必然命中，也不能把完整音频输入等同于全量重编码。
+shadow 不更新正式文本/state，也不触发整个正式会话的结束。适配时复用请求构造和 engine 推理部分，正式结果发送及状态写回仍由原正式路径负责。验证/修正后的续写状态由推理引擎管理。
 
 #### 快照具体包含什么
 
@@ -386,7 +384,7 @@ if self.prespec is not None:
 验收只保留直接相关的检查：
 
 1. 中点出现 `prespec-...` 请求；确认旧草稿有拒绝时，后续 decode 从 correction 状态继续。
-2. 正式 chunk submit 的 `ready_shadow_only/pending`、候选连续匹配长度与成本分开记录；shadow 不产生客户端事件、不改正式 state、不释放正式缓存。
+2. 正式 chunk submit 的 `ready_shadow_only/pending`、候选连续匹配长度与成本分开记录；shadow 不产生客户端事件、不改正式 state、不结束正式 session。
 3. 提前 commit、短尾 skip、断连时，无泄漏请求和未配对计数；注意 Python 取消不等于 NPU kernel 已抢占。
 4. 同音频/同并发 baseline 与 probe 比较正式 P95/P99、队列等待及总计算成本；在离线回放验证经 verifier 消费后的 token/提交边界等价，再启用消费模式。
 
