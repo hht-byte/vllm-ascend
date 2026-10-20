@@ -25,6 +25,8 @@ python commit_overlap.py --commits baseline-c20-commits.jsonl \
 
 核心改动集中在 `qwen3_asr_async.py`：复用现有 external draft 构造和 engine 的 verify → correction → decode 链路。连接层只通知中点/commit/清理；路由层复用已经注入的 ASR 实例。仍直接使用 `PreSpecCoordinator(producer, ...)`，无需为了接入实现分阶段 `ShadowBackend`/KV 接口。
 
+**音频输入合同：正式请求和预投机请求都提交截至各自时刻的完整累计音频，沿用现有服务的请求构造规则。** 服务端只用新增音频采样计数决定何时尝试预投机；不根据 KV 命中情况裁剪音频、不选择 KV 复用范围。音频编码/前缀/KV 是否可复用，以及复用多少，交给 vLLM-Ascend 按实际请求和缓存状态判断。
+
 ### 一、先完成实例接线：这里给出实际新增代码
 
 #### 步骤 1：复制模块并添加 import
@@ -167,22 +169,37 @@ if self.prespec is not None:
     )
 ```
 
-`try_start_prespec()` 放在模型类中，读模型的 buffer/P0/U0；它仅在以下条件满足时调用现有 `maybe_start()`：
+`try_start_prespec()` 放在模型类中，读取完整音频快照、P0/U0 和音频截止位置计数；不假定现有 `buffer` 字段是增量还是全量。它仅在以下条件满足时调用现有 `maybe_start()`：
 
 1. segment 未 commit、当前段音频队列无积压、上一轮正式推理已结束。commit 后合并剩余音频的路径不启动 shadow。
-2. 剩余 buffer 位于 `[中点, chunk_size_samples)`；对 2 s chunk，就是 `[16000, 32000)`。buffer 是尚未进入正式 chunk 的新增音频，而非整个累计音频长度。
+2. 自上次正式请求的音频截止位置以来，新增音频量 `new_audio_samples` 位于 `[中点, chunk_size_samples)`；对 2 s chunk，就是 `[16000, 32000)`。这只是触发计数，传给引擎的音频仍是完整累计音频。
 3. 按**下一次正式请求的现有回滚规则**可以得到合法 U0。包括 `unfixed_chunk_num` 的预热条件、`unfixed_token_num` 和 `kmax`，不要另写固定“最后 5 个 token”的拆分。
 4. 当前段尚未成功启动过预投机；正式队列、负载、剩余时间是否允许，再由协调器判定。
 
 这里检查队列是防止消费协程追赶积压时制造“伪空档”：如果下一正式 chunk 所需音频已经在队列里，只是还没取出，就不应再起 shadow。段级队列非空是这一额外跳过条件，不能把它当作 `LoadSnapshot.waiting`（vLLM 等待请求数）。
 
-预算按**尚缺的采样数**估计：`(chunk_size_samples - buffer_samples) / 16000`，结合实际接收节奏；不能在完成上一次推理后重新假定还有整整 1 s。VAD 仍可能提前 commit，取消只是尽力让路，不保证 NPU kernel 立即退出。
+计数和请求输入明确分开（变量对应原服务的实际音频/采样位置）：
+
+```python
+# 两个截止位置使用同一采样坐标；不读取任何 KV 命中信息。
+new_audio_samples = current_audio_end_samples - last_formal_audio_end_samples
+
+# 构造 ShadowRequest 时：
+window_audio_samples = new_audio_samples  # 保留已有字段名，仅供中点判断
+audio_pcm_f32le = complete_audio.astype("<f4", copy=True).tobytes()
+```
+
+`last_formal_audio_end_samples` 在正式请求提交时记录该请求实际包含的音频截止位置；不是推理完成时间，也不是引擎已缓存到的位置。`current_audio_end_samples` 对应当前完整音频快照的截止位置，不能包含还未纳入快照的队列数据。`complete_audio` 直接使用原服务按完整输入合同构造的音频，不用 `new_audio_samples` 去切掉历史前缀。
+
+例如上一次正式输入是本段 `[0, 2s]`：到 3 s 时，触发计数是 1 s，预投机传 `[0, 3s]`；到 4 s 时，正式请求仍传 `[0, 4s]`。两次请求分别可能命中多少缓存，均由引擎决定。
+
+预算按**距离下一正式提交尚缺的采样数**估计：`(chunk_size_samples - new_audio_samples) / 16000`，结合实际接收节奏；不能在完成上一次推理后重新假定还有整整 1 s。VAD 仍可能提前 commit，取消只是尽力让路，不保证 NPU kernel 立即退出。
 
 ### 四、模型侧新增 helper：哪些代码仍需从原函数提取
 
 | 建议 helper | 责任 |
 |---|---|
-| `_build_stream_request(...)` | 从原 `async_streaming_transcribe()` 提取下一次请求的 P0/U0、prompt/音频视图和 external draft 打包逻辑；显式传入草稿和缓存策略，不改真实流式状态 |
+| `_build_stream_request(...)` | 从原 `async_streaming_transcribe()` 提取 P0/U0、完整音频/prompt 和 external draft 打包逻辑；传入本次完整输入及草稿，不新增服务端 KV 复用判断，不改真实流式状态 |
 | `try_start_prespec(...)` | 上节的中点检查、不可变快照、调用 `self.prespec.maybe_start()` |
 | `_run_prespec(snapshot, budget)` | 用独立 `prespec-...` request ID 调用同一个 engine，只收集候选 token，取消/异常时 abort 并关闭流 |
 
@@ -190,8 +207,8 @@ helper 的职责可以复用现有函数，不要求机械增加三个类或三�
 
 这三个 helper **不在当前 `streaming_prespec.py` 中**。完成步骤 1–5 后仍需新增它们，不能只复制调用语句。按以下顺序处理：
 
-1. 在 `async_streaming_transcribe()` 中找到 `external draft` 构造、全量 prompt 构造及 `engine.generate` 调用；先把“构造请求”部分提取为 `_build_stream_request()`，原正式路径改为调用它，保留原参数和结果处理。
-2. 新增 `_run_prespec(snapshot, budget)`：调用该构造器的全量分支，把旧回滚 token 放入同一个 external draft 字段；使用独立 request ID 和请求级 SamplingParams，迭代 engine 原始输出，返回 P0 后的最终 token tuple；finally 使用现有 abort/流关闭代码。
+1. 在 `async_streaming_transcribe()` 中找到 `external draft` 构造、现有完整音频/prompt 构造及 `engine.generate` 调用；先把“构造请求”部分提取为 `_build_stream_request()`，原正式路径改为调用它，保留原参数和结果处理。
+2. 新增 `_run_prespec(snapshot, budget)`：用相同的请求构造规则提交中点时刻的完整累计音频，把旧回滚 token 放入同一个 external draft 字段；使用独立 request ID 和请求级 SamplingParams，迭代 engine 原始输出，返回 P0 后的最终 token tuple；finally 使用现有 abort/流关闭代码。不要为 shadow 强制旁路已有缓存路径。
 3. 新增 `try_start_prespec(...)`：在前述条件成立时组装 `ShadowRequest` 的服务侧扩展快照，并调用 `self.prespec.maybe_start(...)`；本函数不 await 推理。
 
 不能仅凭函数职责摘要确定的映射集中在这里：engine 实例的实际属性名、external draft 字段结构、prompt 构造实参、ASRStreamingState 的音频/token 字段。这些必须复制你的现有实现。这里没有把虚构的 `engine.generate(draft_tokens=...)` 当成可直接粘贴的 vLLM API。
@@ -199,7 +216,7 @@ helper 的职责可以复用现有函数，不要求机械增加三个类或三�
 shadow 的单次 engine 请求必须做完：
 
 ```text
-中点音频 + 稳定前缀 P0 + external draft U0
+截至中点的完整累计音频 + 稳定前缀 P0 + external draft U0
     → 现有 verifier 验证 U0
     → 首个分歧处修正
     → 从修正后的状态继续 decode，直到预算或 EOS
@@ -210,13 +227,15 @@ U0 进入**现有 external draft 字段**，不拼进不可修改的 prompt。C1
 
 **shadow 不调用 `async_streaming_transcribe()`、`async_finish_streaming_transcribe()` 或 `_yield_delta_text()`。** 前两者修改 buffer/audio_accum/正式状态，后者计算已发送 delta、写全局统计并释放窗口缓存 session。shadow 自己消费 engine 输出，不 yield `ChunkInferenceEvent`/delta/done、不写回真实 state；单独记录请求类别和统计。引擎自身的全局 spec decode 计数也可能包含 shadow，baseline/probe 比较时不能当成纯正式请求接受率。
 
-#### 窗口缓存：第一版给 shadow 选现有全量 prompt 分支
+#### 缓存职责：服务端传完整输入，引擎决定复用
 
-按你的描述，服务已有窗口缓存/全量 prompt 两条构造路径。第一版为 shadow 显式选择全量路径，formal 保持原配置；不要临时关闭 `self` 上的全局缓存开关，否则会影响并发正式请求。两条路径的音频上下文、语言和 P0 必须在语义上对应。
+撤回前版“shadow 强制选择全量分支以绕过窗口缓存”的建议。**传完整音频不等于关闭缓存或要求全部重算。** 正式和 shadow 均沿用现有输入协议、请求构造及缓存配置；服务端只新增预投机时机和草稿来源，不探测或控制 KV 命中范围。
 
-这样 shadow 不操作正式窗口缓存会话，也不需要调用它的 `release_session()`。独立 engine request ID 不能自动隔离按 session 键保存的缓存元数据：本仓库 `WindowedRequestAdapter.build_request()` 会更新 `_states[session_id]`，`release_session()` 会删除该键。你的部署版本需核对；不能把 shadow 的释放指向正式 session。
+服务端给 shadow 分配独立 request ID，并仅取消/结束这个请求；vLLM-Ascend 负责请求的解码状态和可共享缓存的正确管理。独立请求不要求物理复制全部 KV，也不禁止引擎共享可复用前缀。服务端不手工拷贝、裁剪、回滚或释放 KV block。
 
-后续若测得重复编码成本过高，再给 shadow 配独立 cache session/namespace，并验证自己的释放只影响自己。全量路径的额外 encoder/prefill 成本必须计入实验结论；这不是零成本复用正式 KV。
+仍需保留的是**业务生命周期隔离**：shadow 不更新正式文本/state，不触发整个正式会话的结束。按你给出的函数职责，`_yield_delta_text()` 带有正式结果处理及会话释放副作用，因此 shadow 使用纯 engine 输出收集路径；若原请求包装器维护会话元数据，调用其请求级清理接口，不误调用结束正式 session 的接口。这是请求归属管理，不是服务端判断 KV 能否复用。
+
+用引擎现有的缓存命中、computed tokens、prefill 等指标观察实际成本；不能仅凭“输入相同前缀”断言缓存必然命中，也不能把完整音频输入等同于全量重编码。
 
 #### 快照具体包含什么
 
@@ -224,9 +243,9 @@ U0 进入**现有 external draft 字段**，不拼进不可修改的 prompt。C1
 |---|---|
 | `session_id / audio_epoch` | 最小版固定 `ws_id / seg_id`；见后面的每段一次限制 |
 | P0 / U0 / `base_prefix_version` | 从共享的下一正式请求构造逻辑取；正式结果、有效 prompt/语言/context 或音频上下文起点变化时更新版本 |
-| 音频 | 按正式音频视图，把已进入累计上下文及当前剩余 buffer 正确组合一次，再复制为 16 kHz mono float32 小端 bytes；不能只拿新增 1 s，也不能重复拼接已在 audio_accum 的部分 |
+| 音频 | 复用原服务的完整音频构造规则，快照截至此刻的完整累计音频，复制为 16 kHz mono float32 小端 bytes；不能按新增量或猜测的 KV 命中长度裁剪历史输入 |
 | 音频截止位置 | 快照实际包含的会话绝对采样位置；正式领取时比较实际送入该请求的位置，不能用更大的接收端计数 |
-| `window_audio_samples / deadline_ns` | 尚未进入正式 chunk 的样本数 / 同进程单调时钟的预计下一正式提交时刻 |
+| `window_audio_samples / deadline_ns` | `current_audio_end_samples - last_formal_audio_end_samples`，仅供触发/预算判断；实际音频 payload 仍是完整累计音频 / 同进程单调时钟的预计下一正式提交时刻 |
 | 模型条件 | 冻结当前段的语言、context、prompt 及请求级采样条件；processor、模型常量可共享 |
 
 `ShadowRequest` 目前只有通用音频/token/版本字段，**没有语言/context/prompt 字段**。服务侧须用扩展快照携带实际请求构造器读取的这些条件，例如继承 `ShadowRequest` 并添加不可变字段，再由 `_run_prespec()` 读取；不能后台启动后再从活跃 session 取可变条件，也不要 deepcopy 整个 ASR state/engine。
@@ -371,4 +390,4 @@ if self.prespec is not None:
 3. 提前 commit、短尾 skip、断连时，无泄漏请求和未配对计数；注意 Python 取消不等于 NPU kernel 已抢占。
 4. 同音频/同并发 baseline 与 probe 比较正式 P95/P99、队列等待及总计算成本；在离线回放验证经 verifier 消费后的 token/提交边界等价，再启用消费模式。
 
-服务源码到位后需确认的具体代码点只有：external draft 的打包字段及 kmax 约束、P0/U0 的实际拆分、raw output token 的含义、buffer/audio_accum 是否重叠、engine abort/生成器关闭方式、窗口缓存释放的实际键和范围。当前描述足以确定挂点，但不能替代这些逐行核对或 910B 验证。
+服务源码到位后需确认的具体代码点只有：external draft 的打包字段及 kmax 约束、P0/U0 的实际拆分、raw output token 的含义、现有完整音频构造规则及采样截止计数、engine abort/生成器关闭方式、请求级清理与正式 session 结束的调用边界。KV 的可复用范围由引擎决定，不是服务端适配项。当前描述不能替代这些逐行核对或 910B 验证。

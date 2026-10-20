@@ -1,8 +1,10 @@
 """Service-side coordinator for an isolated, midpoint ASR shadow request.
 
-The model adapter supplies ``producer``. Its request must use separate model/KV
-state, verify/repair the old rollback suffix on the midpoint audio, then extend
-it with newly arrived audio. This module never modifies authoritative state.
+The model adapter supplies ``producer`` and submits the complete audio input
+available at the midpoint under the existing service input contract. The engine
+owns request state and decides encoder/prefix/KV reuse. The producer verifies
+and repairs the old rollback suffix, then extends that corrected result. This
+module never modifies authoritative state or chooses cached audio/KV ranges.
 """
 
 from __future__ import annotations
@@ -16,6 +18,13 @@ from uuid import uuid4
 
 @dataclass(frozen=True)
 class ShadowRequest:
+    """Full audio snapshot plus timing metadata, not a cache-delta request.
+
+    ``window_audio_samples`` is the audio progress since the last formal input
+    cutoff, used only for admission. ``audio_pcm_f32le`` holds the complete audio
+    input at this snapshot's cutoff; it must not be sliced to that progress count.
+    """
+
     session_id: str
     audio_epoch: int
     base_prefix_version: int
@@ -102,10 +111,12 @@ class VerifiedRollback:
 
 
 class ShadowBranch(Protocol):
-    """Wrap the existing rollback verifier on disposable, non-authoritative KV.
+    """Optional engine adapter for a non-authoritative request's decode state.
 
     ``extend_from_verified`` must continue from the corrected state returned by
-    ``verify_and_repair_old``, never from the raw rollback hypothesis.
+    ``verify_and_repair_old``, never from the raw rollback hypothesis. The engine
+    decides physical cache sharing; this interface does not require the service
+    to copy KV or decide reusable ranges.
     """
 
     async def verify_and_repair_old(self, rollback_tokens: tuple[int, ...],
