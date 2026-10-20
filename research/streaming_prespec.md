@@ -1,11 +1,12 @@
 # 流式音频中点预投机：服务端接入件
 
-本目录提供两个独立工具：
+本目录提供以下工具：
 
 - `commit_overlap.py` 用现有逐 commit JSONL/CSV 检查前一条正式 commit 的重叠；若提供服务 DEBUG 日志，还检查**同一段内流式 chunk 推理与 commit 等待**的重叠。
 - `streaming_prespec.py` 管理中点 shadow 请求、低负载 admission、候选版本、正式边界取消和 shadow 候选质量评估。
+- `streaming_prespec_helpers.py` 提供三个模型 helper 的实现；服务只需接入原有请求打包代码，并映射本地音频/token 字段，见第四节。
 
-这两个文件不依赖 vLLM/Ascend，可以复制到 910B 服务项目。当前仓库没有运行中的 `realtime_connection.py` 和 `qwen3_asr_async.py`，因此模型适配器需要在服务项目中实现；**没有模型适配器时不会发送任何伪请求**。
+这些文件可以复制到 910B 服务项目，模块导入不依赖 vLLM/Ascend。当前仓库没有运行中的 `realtime_connection.py` 和 `qwen3_asr_async.py`，实际请求打包仍需接到服务已有的回滚投机实现；**只有协调器、没有模型接线时不会发送任何伪请求**。
 
 ## 先验证“上一轮推理尚未完成”的解释
 
@@ -33,14 +34,17 @@ python commit_overlap.py --commits baseline-c20-commits.jsonl \
 
 #### 步骤 1：复制模块并添加 import
 
-把本仓库的 `research/streaming_prespec.py` 复制为服务项目中的 `qwen_asr/inference/streaming_prespec.py`。在 `qwen3_asr_async.py` 顶部新增：
+把本仓库的 `research/streaming_prespec.py` 和 `research/streaming_prespec_helpers.py` 一起复制到服务项目的 `qwen_asr/inference/`。在 `qwen3_asr_async.py` 顶部新增：
 
 ```python
 from qwen_asr.inference.streaming_prespec import (
     AdmissionPolicy,
     PreSpecCoordinator,
 )
+from qwen_asr.inference.streaming_prespec_helpers import PreSpecModelHelpers
 ```
+
+把现有类声明改为 `class Qwen3ASRModelAsync(PreSpecModelHelpers, Qwen3ASRModel):`，原有类体保留。这个 mixin 没有构造函数，只提供第四节的三个方法；若此前自行添加过同名占位方法，应替换它们，避免覆盖 mixin 的实现。
 
 下面的代码分为两类：**新增代码**可放入指定位置；**原代码形态**只用于定位，因为没有你的函数原文。原有变量、构造参数不能用示例中的省略号替换。
 
@@ -49,7 +53,7 @@ from qwen_asr.inference.streaming_prespec import (
 放在 `class Qwen3ASRModelAsync` 内，与 `async_streaming_transcribe()` 同一级缩进。这是本方案新增的方法，不是现有 API：
 
 ```python
-def enable_prespec(self, *, enabled, kmax, chunk_size_sec=2.0,
+def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
                    candidate_tokens=8, on_probe=None):
     # 仅在服务启动、连接尚未创建时调用一次。
     self.prespec = None
@@ -60,6 +64,9 @@ def enable_prespec(self, *, enabled, kmax, chunk_size_sec=2.0,
     midpoint_samples = int(chunk_size_sec * 16000 / 2)
     if midpoint_samples <= 0:
         raise ValueError("prespec midpoint must contain at least one sample")
+    if engine is None or not callable(getattr(self, "_pack_stream_request", None)):
+        raise ValueError("prespec requires engine and the existing request packer")
+    self.prespec_engine = engine  # 引用已创建的同一个 engine，不创建第二个
 
     self.prespec = PreSpecCoordinator(
         producer=self._run_prespec,
@@ -74,7 +81,7 @@ def enable_prespec(self, *, enabled, kmax, chunk_size_sec=2.0,
     )
 ```
 
-这个方法只创建协调器，**不实现推理**。`self._run_prespec` 需要按后面的“模型侧新增 helper”一节接到已有 engine；在它完成以前使用 `enabled=False`，不能据此宣称服务已接通。`on_probe` 可传现有非阻塞日志回调；未传时不会自动输出 probe 日志。
+这个方法创建协调器并保存 engine 引用。`self._run_prespec` 已由 mixin 提供；第四节的 `_pack_stream_request` 接到已有实现前仍使用 `enabled=False`。`on_probe` 可传现有非阻塞日志回调；未传时不会自动输出 probe 日志。
 
 #### 步骤 3：修改 `AsyncLLM()` 的返回位置
 
@@ -92,6 +99,7 @@ model = cls(...)  # 原有构造参数逐字保留
 model.enable_prespec(
     enabled=False,       # 全部模型适配完成后，受控实验再改成 True
     kmax=kmax,           # 对应你从 speculative config 读出的现有局部变量
+    engine=engine,      # 对应本函数已创建的 AsyncLLMEngine 实例变量
     chunk_size_sec=2.0,  # 必须与 set_streaming_params 的实际值一致
 )
 return model
@@ -144,7 +152,7 @@ AsyncLLM() 构造 model，并设置 model.prespec
 | `websocket_router.py`：三个函数 | **不改代码**；具体见步骤 4 |
 | `qwen3_asr_async.py`：`AsyncLLM()` | **插入一处调用**：在返回实例前调用新增 `enable_prespec()`，具体见步骤 2–3 |
 | 同文件 `init_streaming_state()` | 初始化 `state.prespec_prefix_version=0`；`ws_id/seg_id` 通过新增可选参数传入流式函数，具体见第五、六节 |
-| 同文件 `async_streaming_transcribe()` | **每个正式 chunk 内部**，在准备好正式音频/P0、尚未把 external draft 写进请求时领取候选；实际 engine 输出迭代结束后配对退出 |
+| 同文件 `async_streaming_transcribe()` | **每个正式 chunk 内部**，在准备好正式音频/保留前缀、尚未把 external draft 写进请求时领取候选；实际 engine 输出迭代结束后配对退出 |
 | 同文件 `_yield_delta_text()` | 正式输出流程保留；若外层拿不到原始 token IDs，增加一个可选的“最终 token 回调”，用于评估；shadow 不调用此函数 |
 | 同文件 `async_finish_streaming_transcribe()` | 第一版保留原 finish 路径；commit 到达已取消 shadow 并标记正式任务，finish 不重复领取候选 |
 | `realtime_connection.py`：`_process_segment()` | 每次 `async for ... async_streaming_transcribe(...)` 完整结束后尝试中点；最外层 `finally` 配对结束该段的 commit 标记 |
@@ -162,20 +170,15 @@ AsyncLLM() 构造 model，并设置 model.prespec
 async for item in self.asr.async_streaming_transcribe(audio, state):
     await self._send_stream_item(item)
 
-# 新增同步 helper；内部只做检查/快照和 maybe_start，不等待 shadow。
-if self.prespec is not None:
-    self.asr.try_start_prespec(
-        state, ws_id=ws_id, seg_id=seg_id,
-        committed=segment.committed,
-        audio_queue_empty=segment.audio_queue.empty(),
-    )
+# 在这里插入第四节 4.5 的 try_start_prespec 调用。
+# 它需要明确传入完整音频和下一次回滚拆分结果，不再只传一个 state。
 ```
 
-`try_start_prespec()` 放在模型类中，读取完整音频快照、P0/U0 和音频截止位置计数；不假定现有 `buffer` 字段是增量还是全量。它仅在以下条件满足时调用现有 `maybe_start()`：
+`try_start_prespec()` 由模型 mixin 提供，接收完整音频、保留前缀、回滚草稿和采样截止位置；不读取任何假定的 `buffer` 字段。具体实参见第四节 4.5。它仅在以下条件满足时调用现有 `maybe_start()`：
 
 1. segment 未 commit、当前段音频队列无积压、上一轮正式推理已结束。commit 后合并剩余音频的路径不启动 shadow。
 2. 自上次正式请求的音频截止位置以来，新增音频量 `new_audio_samples` 位于 `[中点, chunk_size_samples)`；对 2 s chunk，就是 `[16000, 32000)`。这只是触发计数，传给引擎的音频仍是完整累计音频。
-3. 按**下一次正式请求的现有回滚规则**可以得到合法 U0。包括 `unfixed_chunk_num` 的预热条件、`unfixed_token_num` 和 `kmax`，不要另写固定“最后 5 个 token”的拆分。
+3. 按**下一次正式请求的现有回滚规则**可以得到合法回滚草稿。包括 `unfixed_chunk_num` 的预热条件、`unfixed_token_num` 和 `kmax`，不要另写固定“最后 5 个 token”的拆分。
 4. 当前段尚未成功启动过预投机；正式队列、负载、剩余时间是否允许，再由协调器判定。
 
 这里检查队列是防止消费协程追赶积压时制造“伪空档”：如果下一正式 chunk 所需音频已经在队列里，只是还没取出，就不应再起 shadow。段级队列非空是这一额外跳过条件，不能把它当作 `LoadSnapshot.waiting`（vLLM 等待请求数）。
@@ -197,60 +200,299 @@ audio_pcm_f32le = complete_audio.astype("<f4", copy=True).tobytes()
 
 预算按**距离下一正式提交尚缺的采样数**估计：`(chunk_size_samples - new_audio_samples) / 16000`，结合实际接收节奏；不能在完成上一次推理后重新假定还有整整 1 s。VAD 仍可能提前 commit，取消只是尽力让路，不保证 NPU kernel 立即退出。
 
-### 四、模型侧新增 helper：哪些代码仍需从原函数提取
+### 四、模型侧 helper：直接复制的代码与需要搬出的原代码
 
-| 建议 helper | 责任 |
-|---|---|
-| `_build_stream_request(...)` | 从原 `async_streaming_transcribe()` 提取 P0/U0、完整音频/prompt 和 external draft 打包逻辑；传入本次完整输入及草稿，不新增服务端 KV 复用判断，不改真实流式状态 |
-| `try_start_prespec(...)` | 上节的中点检查、不可变快照、调用 `self.prespec.maybe_start()` |
-| `_run_prespec(snapshot, budget)` | 用独立 `prespec-...` request ID 调用同一个 engine，只收集候选 token，取消/异常时 abort 并关闭流 |
+#### 4.1 先用明确名字说明三个 token 序列
 
-helper 的职责可以复用现有函数，不要求机械增加三个类或三套输入类型。优先只提取请求构造的小段代码，正式路径的 delta 处理继续使用 `_yield_delta_text()`。
+| 本文变量名 | 含义 | 放在哪里 |
+|---|---|---|
+| `stable_prefix_token_ids` | 按**下一次正式请求的既有回滚规则**，本次要保留、不作为草稿重新验证的文本前缀 | 现有完整 prompt 的文本前缀部分；不是整个多模态 prompt |
+| `rollback_draft_token_ids` | 上一轮输出中，本次需要重新验证的回滚后缀 | 已实现的 external draft 字段 |
+| `candidate_token_ids` | 用当前完整音频验证、修正旧草稿后，继续生成得到的后缀 | 仅暂存；下一正式请求可把它作为 external draft 再验证 |
 
-这三个 helper **不在当前 `streaming_prespec.py` 中**。完成步骤 1–5 后仍需新增它们，不能只复制调用语句。按以下顺序处理：
+“保留前缀”只描述当前回滚算法的拆分，不额外声称这些文本永远不会变化。协调器原有字段 `stable_prefix_tokens`、`rollback_tokens`、`Candidate.token_ids` 分别对应上述三项，不需要改它的接口。
 
-1. 在 `async_streaming_transcribe()` 中找到 `external draft` 构造、现有完整音频/prompt 构造及 `engine.generate` 调用；先把“构造请求”部分提取为 `_build_stream_request()`，原正式路径改为调用它，保留原参数和结果处理。
-2. 新增 `_run_prespec(snapshot, budget)`：用相同的请求构造规则提交中点时刻的完整累计音频，把旧回滚 token 放入同一个 external draft 字段；使用独立 request ID 和请求级 SamplingParams，迭代 engine 原始输出，返回 P0 后的最终 token tuple；finally 使用现有 abort/流关闭代码。
-3. 新增 `try_start_prespec(...)`：在前述条件成立时组装 `ShadowRequest` 的服务侧扩展快照，并调用 `self.prespec.maybe_start(...)`；本函数不 await 推理。
-
-不能仅凭函数职责摘要确定的映射集中在这里：engine 实例的实际属性名、external draft 字段结构、prompt 构造实参、ASRStreamingState 的音频/token 字段。这些必须复制你的现有实现。这里没有把虚构的 `engine.generate(draft_tokens=...)` 当成可直接粘贴的 vLLM API。
-
-shadow 的单次 engine 请求必须做完：
+例如，保留前缀为 `[10, 11]`，旧草稿为 `[20, 21]`。当前音频下引擎接受 `20`、把 `21` 修正为 `99`，然后生成 `30`：
 
 ```text
-截至中点的完整累计音频 + 稳定前缀 P0 + external draft U0
-    → 现有 verifier 验证 U0
-    → 首个分歧处修正
-    → 从修正后的状态继续 decode，直到预算或 EOS
-    → C1 = 接受的旧后缀 + 修正 token + 新生成 token
+输入：完整累计音频 [0, 3s]
+      prompt 中的保留前缀 [10, 11]
+      external draft    [20, 21]
+引擎：验证 20 → 修正 21 为 99 → 在 [10, 11, 20, 99] 上继续生成 30
+返回：candidate_token_ids = (20, 99, 30)
 ```
 
-U0 进入**现有 external draft 字段**，不拼进不可修改的 prompt。C1 不含 P0、不含被拒绝的旧 token。候选预算初始取 `min(实验预算, kmax)`，`kmax<=0` 或现有回滚路径不生效时跳过；不能照搬固定 8。SamplingParams 及 external draft 容器要按请求复制后修改，不能原地改共享配置。若 engine 输出是累计 token IDs，保存最终累计值；不能每次 `extend()` 导致重复拼接。
+候选既不包含 `[10, 11]`，也不保留被拒绝的 `21`。**验证与续写在同一次 engine 请求中完成**；服务不拆成两次请求，不自行重建验证后的 KV。总预算包括“接受/修正旧草稿的 token + 新续写 token”；预算用尽或 EOS 时可能没有额外续写，这不等于跳过验证。
 
-**shadow 不调用 `async_streaming_transcribe()`、`async_finish_streaming_transcribe()` 或 `_yield_delta_text()`。** 前两者修改 buffer/audio_accum/正式状态，后者计算已发送 delta 并写正式转写统计。shadow 自己消费 engine 输出，不 yield `ChunkInferenceEvent`/delta/done、不写回真实 state；单独记录请求类别和统计。引擎自身的全局 spec decode 计数也可能包含 shadow，baseline/probe 比较时不能当成纯正式请求接受率。
+#### 4.2 哪些已提供，哪些必须从你的函数搬出
 
-#### 请求生命周期：只管理预投机自己的请求
+三个完整方法已放在同目录 [streaming_prespec_helpers.py](streaming_prespec_helpers.py)，第一节的 mixin 导入后即可使用：
 
-给 shadow 分配独立 request ID。取消时只 abort 这个请求，并关闭它的输出迭代器；正式请求和正式 session 继续按原生命周期运行。正常完成时保存候选 token，供下一正式请求通过已有 verifier 验证。
+| 方法 | 已实现的代码 | 你需要修改的部分 |
+|---|---|---|
+| `try_start_prespec(...)` | 中点/队列检查、独立输入快照、截止时间、`maybe_start` | 在调用处把实际音频/token/采样参数传进来，见 4.5 |
+| `_build_stream_request(request, budget)` | 请求级采样参数副本、预算、调用原有打包逻辑、独立 request ID | 提供下面的 `_pack_stream_request` |
+| `_run_prespec(request, budget)` | `generate`、累计输出收集、截止时间、异常/取消时 abort 与关闭迭代器 | 初始化时传入已有 engine；若本地 fork 改了输出接口，按 4.6 核对 |
 
-shadow 不更新正式文本/state，也不触发整个正式会话的结束。适配时复用请求构造和 engine 推理部分，正式结果发送及状态写回仍由原正式路径负责。验证/修正后的续写状态由推理引擎管理。
+**需要从 `async_streaming_transcribe()` 搬出的模型请求代码集中到 `_pack_stream_request` 一处。** 它不是另一个待设计的推理模块，而是把你现有代码移入一个纯打包函数：
 
-#### 快照具体包含什么
+1. 找到 `engine.generate(...)` 前构造完整音频、processor 输入、prompt token IDs、`TokensPrompt` 的代码。保留其中的语言/context、特殊 token 和音频占位符规则。
+2. 找到已实现回滚投机中把草稿放入 external draft 的代码，包括 fork 所需的其他元数据；逐字保留字段结构。
+3. 把这两段放入模型类的 `_pack_stream_request`。输入改为下面五个显式形参；输出改成 `generate` 使用的关键字参数字典。不搬入真实 state 写回、delta 发送、统计更新或 `generate` 调用。
 
-| 内容 | 从哪里取 / 规则 |
+接口固定如下；这是**唯一需要填入原服务代码的模板**，不能原样作为完整函数运行：
+
+```python
+def _pack_stream_request(
+    self, *, full_audio_pcm_f32le, stable_prefix_token_ids,
+    draft_token_ids, model_context, sampling_params,
+):
+    full_audio = np.frombuffer(full_audio_pcm_f32le, dtype="<f4").copy()
+
+    # 在这里搬入上述两段原代码：
+    # - 原来的完整音频输入变量 → full_audio
+    # - 原来的保留文本前缀     → stable_prefix_token_ids
+    # - 原来的待验证草稿       → draft_token_ids
+    # - 原来从 state 读取的语言/context/prompt → model_context 中对应值
+    # - 原来共享的采样参数     → 传入的 sampling_params
+    # 搬入后应得到原有 prompt 和其他 generate 实参。
+    #
+    # 不要写 prompt_token_ids += draft_token_ids。
+    # external draft 若写在 SamplingParams.extra_args 中，就修改此处副本；
+    # 若写在 prompt 或 generate 额外实参中，则保留原有位置和字段名。
+
+    return dict(
+        prompt=prompt,                        # 搬入的代码构造
+        sampling_params=sampling_params,      # 必须返回传入的这一对象
+        **other_generate_kwargs,              # 搬入的其他实参；没有则用 {}
+    )
+```
+
+`np` 用服务已有的 `import numpy as np`。`other_generate_kwargs` 不含 `prompt/sampling_params/request_id`，也不能混入未提交的旧草稿版本。`model_context` 是小字典，携带这段代码真正读取的语言、context、模板等；不放整个 state、engine、processor 或设备 tensor。后台打包只读取这个快照；processor 和只读模型常量可以从 `self` 取。
+
+**这里没有猜测你的 external draft 字段名。** 函数职责摘要不足以还原自定义协议；本模板的注释区必须用你已经工作的代码填上。测试里的 `test_draft` 只是 mock 字段，不能搬到服务。
+
+正式路径也复用 `_pack_stream_request`，避免两个版本漂移。它保留原预算和输出处理；不要让正式请求调用限定 shadow 预算的 `_build_stream_request`：
+
+```python
+request_kwargs = self._pack_stream_request(
+    full_audio_pcm_f32le=complete_audio.astype("<f4", copy=False).tobytes(),
+    stable_prefix_token_ids=stable_prefix_token_ids,
+    draft_token_ids=draft_token_ids,  # 第五节选择就绪候选或原回滚草稿
+    model_context=model_context,
+    sampling_params=deepcopy(formal_sampling_params),
+)
+stream = engine.generate(**request_kwargs, request_id=formal_request_id)
+# stream 交回原有 _yield_delta_text 迭代逻辑；其后状态写回保持原位置。
+```
+
+上述局部变量映射到原函数已有值，`deepcopy` 来自 `copy`。保留前缀/回滚草稿的拆分规则也沿用原代码：检查 `unfixed_chunk_num` 预热、`unfixed_token_num` 与 `kmax`，在中点按“下次正式请求”规则只读计算，不能为获得草稿先执行一次正式状态回滚。
+
+#### 4.3 请求快照与三个 helper 的完整函数体
+
+下面直接展示 `streaming_prespec_helpers.py` 的实现。使用第一节的 mixin 时不必再复制这些函数到模型类。
+
+```python
+import asyncio
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any
+
+if __package__:
+    from .streaming_prespec import LaunchDecision, ShadowRequest
+else:
+    from streaming_prespec import LaunchDecision, ShadowRequest
+
+
+@dataclass(frozen=True, kw_only=True)
+class ModelShadowRequest(ShadowRequest):
+    # Private copies of small request settings, never the live ASR state/engine.
+    model_context: dict[str, Any]
+    sampling_params: Any
+
+
+class PreSpecModelHelpers:
+    """Mixin for Qwen3ASRModelAsync, or copy these three methods into that class.
+
+    Set ``prespec_engine`` to the existing shared engine before enabling.
+    Supply ``_pack_stream_request`` as documented; it must not mutate live state.
+    ``prespec`` is the existing PreSpecCoordinator, or None when disabled.
+    """
+
+    def try_start_prespec(
+        self, *, ws_id, seg_id, prefix_version, full_audio_pcm_f32le,
+        current_audio_end_samples, last_formal_audio_end_samples,
+        chunk_size_samples, stable_prefix_token_ids, rollback_draft_token_ids,
+        model_context, sampling_params, committed, audio_queue_empty,
+        load=None, predicted_draft_ms=0.0,
+    ):
+        coordinator = getattr(self, "prespec", None)
+        if coordinator is None:
+            return LaunchDecision(False, "disabled")
+        if committed:
+            return LaunchDecision(False, "committed")
+        if not audio_queue_empty:
+            return LaunchDecision(False, "audio_backlog")
+        new_samples = current_audio_end_samples - last_formal_audio_end_samples
+        if chunk_size_samples <= 0 or new_samples < 0:
+            raise ValueError("invalid chunk size or audio cutoffs")
+        if new_samples < coordinator.policy.midpoint_samples:
+            return LaunchDecision(False, "before_midpoint")
+        if new_samples >= chunk_size_samples:
+            return LaunchDecision(False, "formal_chunk_due")
+        if not rollback_draft_token_ids:
+            return LaunchDecision(False, "no_rollback_draft")
+        # Take the time before copying so snapshot overhead consumes the budget.
+        deadline_ns = coordinator.clock() + int(
+            (chunk_size_samples - new_samples) / 16000 * 1e9)
+        audio_bytes = bytes(full_audio_pcm_f32le)
+        if not audio_bytes or len(audio_bytes) % 4:
+            raise ValueError("audio must be complete mono float32 LE PCM")
+        request = ModelShadowRequest(
+            session_id=ws_id, audio_epoch=seg_id,
+            base_prefix_version=prefix_version,
+            visible_audio_end_samples=current_audio_end_samples,
+            window_audio_samples=new_samples,
+            audio_pcm_f32le=audio_bytes,
+            stable_prefix_tokens=tuple(stable_prefix_token_ids),
+            rollback_tokens=tuple(rollback_draft_token_ids),
+            deadline_ns=deadline_ns,
+            model_context=deepcopy(model_context),
+            sampling_params=deepcopy(sampling_params),
+        )
+        return coordinator.maybe_start(request, load, predicted_draft_ms)
+
+    def _build_stream_request(self, request, budget):
+        params = deepcopy(request.sampling_params)
+        params.max_tokens = budget
+        params.min_tokens = 0
+        params.n = 1
+        if getattr(params, "best_of", None) is not None:
+            params.best_of = 1
+        # Use the service's installed vLLM enum, without a vLLM import here.
+        params.output_kind = type(params.output_kind).CUMULATIVE
+        kwargs = self._pack_stream_request(
+            full_audio_pcm_f32le=request.audio_pcm_f32le,
+            stable_prefix_token_ids=list(request.stable_prefix_tokens),
+            draft_token_ids=list(request.rollback_tokens[:budget]),
+            model_context=deepcopy(request.model_context),
+            sampling_params=params,
+        )
+        if "prompt" not in kwargs or kwargs.get("sampling_params") is not params:
+            raise ValueError("packer must return prompt and supplied sampling_params")
+        kwargs = dict(kwargs)
+        kwargs["request_id"] = request.request_id
+        return kwargs
+
+    async def _run_prespec(self, request, budget):
+        kwargs = self._build_stream_request(request, budget)
+        # Let an already-ready formal/commit callback cancel before submission.
+        await asyncio.sleep(0)
+        remaining_seconds = (request.deadline_ns - self.prespec.clock()) / 1e9
+        if remaining_seconds <= 0:
+            raise TimeoutError("prespec deadline passed during request preparation")
+        stream = self.prespec_engine.generate(**kwargs)
+        finished = False
+        candidate_token_ids = ()
+        try:
+            async with asyncio.timeout(remaining_seconds):
+                async for output in stream:
+                    if output.outputs:
+                        if len(output.outputs) != 1:
+                            raise ValueError("prespec requires one output sequence")
+                        completion = output.outputs[0]
+                        # Cumulative IDs replace the previous snapshot.
+                        candidate_token_ids = tuple(completion.token_ids)
+                        if completion.finish_reason == "abort":
+                            raise RuntimeError("prespec engine request aborted")
+                    finished = output.finished
+            if not finished or not candidate_token_ids:
+                raise RuntimeError("prespec stream ended without a completed candidate")
+            if len(candidate_token_ids) > budget:
+                raise ValueError("engine output exceeds the candidate token budget")
+            return candidate_token_ids
+        finally:
+            try:
+                if not finished:
+                    await self.prespec_engine.abort(request.request_id)
+            finally:
+                await stream.aclose()
+```
+
+这份代码明确完成了此前需要自行补写的部分：
+
+- `try_start_prespec` 是同步函数，只调用 `maybe_start` 创建后台 task；它不会等待生成，也不会推进上次正式音频截止位置。
+- `ModelShadowRequest` 在通用 `ShadowRequest` 上补了 `model_context/sampling_params`。创建时深拷贝小配置、音频转 bytes、token 转 tuple；它不持有真实 state。
+- `_build_stream_request` 给每次 shadow 建立参数副本，设置累计输出、单序列及总 token 上限；已有回滚草稿最多传入该上限。
+- `_run_prespec` 只取引擎给出的**已验证输出**，累计输出用覆盖赋值，不重复拼接；流异常结束时不发布半截候选。
+- 提前 commit/正式 chunk 导致取消时，只 abort 自己的 `prespec-...` 请求。到预估下一正式提交时间仍未结束也会取消；正式路径没有 await shadow 的操作。
+
+截止时间覆盖剩余生成时间，并扣除快照/打包已经花掉的时间；同步 processor 工作仍会占用事件循环，不能通过 `create_task` 或 timeout 自动抢占，应把这部分 CPU 成本计入实验。
+
+#### 4.4 两个必须明确维护的音频计数
+
+在 `ASRStreamingState` 的字段定义中新增：
+
+```python
+prespec_last_formal_audio_end_samples: int = 0
+```
+
+此处示例统一使用**段内采样坐标**：段首为 0，`current_audio_end_samples` 是完整段音频快照的样本数。每个正式 chunk 取得它实际要发送的完整音频后、提交 engine 前记录：
+
+```python
+state.prespec_last_formal_audio_end_samples = this_chunk_audio_end
+```
+
+中点只读取这个字段。假设已有正式输入长 32000 samples，目前完整音频长 48000，则新增量是 16000；shadow 向引擎发送全部 48000。shadow 完成后该字段仍是 32000。第五节的正式领取同样使用段内 `this_chunk_audio_end`；不要一处段内、一处会话绝对坐标。第六节 commit 入口不领取候选，接收端总数不能用于这两项计数。
+
+#### 4.5 第三节挂点具体传什么
+
+在第三节的挂点，先通过模型现有代码**只读取得**下表的五组值；拿到后调用如下。`complete_audio` 等是局部别名，不能据此假定服务存在同名字段：
+
+| 实参来源 | 取值方式 |
 |---|---|
-| `session_id / audio_epoch` | 最小版固定 `ws_id / seg_id`；见后面的每段一次限制 |
-| P0 / U0 / `base_prefix_version` | 从共享的下一正式请求构造逻辑取；正式结果、有效 prompt/语言/context 或音频上下文起点变化时更新版本 |
-| 音频 | 复用原服务的完整音频构造规则，快照截至此刻的完整累计音频，复制为 16 kHz mono float32 小端 bytes；不能按新增量或猜测的 KV 命中长度裁剪历史输入 |
-| 音频截止位置 | 快照实际包含的会话绝对采样位置；正式领取时比较实际送入该请求的位置，不能用更大的接收端计数 |
-| `window_audio_samples / deadline_ns` | `current_audio_end_samples - last_formal_audio_end_samples`，仅供触发/预算判断；实际音频 payload 仍是完整累计音频 / 同进程单调时钟的预计下一正式提交时刻 |
-| 模型条件 | 冻结当前段的语言、context、prompt 及请求级采样条件；processor、模型常量可共享 |
+| `complete_audio` | 截至当前已经消费音频的完整段音频。复用现有全量构造规则，不猜 `buffer` 含义，不按缓存命中截断 |
+| `stable_prefix_token_ids / rollback_draft_token_ids` | 按下次正式请求的既有回滚规则，只读计算；不生效时草稿传空列表 |
+| `model_context` | 原打包代码需要的语言/context/prompt 小配置 |
+| `formal_sampling_params` | 本段本次请求原本使用的采样参数；helper 会复制 |
+| `chunk_size_samples` | 本段实际 chunk 大小，例如 2 s = 32000 |
 
-`ShadowRequest` 目前只有通用音频/token/版本字段，**没有语言/context/prompt 字段**。服务侧须用扩展快照携带实际请求构造器读取的这些条件，例如继承 `ShadowRequest` 并添加不可变字段，再由 `_run_prespec()` 读取；不能后台启动后再从活跃 session 取可变条件，也不要 deepcopy 整个 ASR state/engine。
+若这些值目前只在模型函数内部可见，把“读取这五组值 + 以下调用”放回模型的只读包装方法，连接层仅传 state 和队列/commit 状态；不要在连接层重新实现 tokenizer 或回滚算法。五组值的实际字段名尚需按服务源码映射，这部分没有伪造可以直接访问的 state 成员。
+
+```python
+if self.prespec is not None and not segment.committed and segment.audio_queue.empty():
+    decision = self.asr.try_start_prespec(
+        ws_id=ws_id, seg_id=seg_id,
+        prefix_version=state.prespec_prefix_version,
+        full_audio_pcm_f32le=complete_audio.astype("<f4", copy=False).tobytes(),
+        current_audio_end_samples=int(complete_audio.size),
+        last_formal_audio_end_samples=state.prespec_last_formal_audio_end_samples,
+        chunk_size_samples=chunk_size_samples,
+        stable_prefix_token_ids=stable_prefix_token_ids,
+        rollback_draft_token_ids=rollback_draft_token_ids,
+        model_context=model_context,
+        sampling_params=formal_sampling_params,
+        committed=segment.committed,
+        audio_queue_empty=segment.audio_queue.empty(),
+        load=None,               # 第一节的 force 实验模式
+        predicted_draft_ms=0.0,   # force 不使用它；gated 时必须换成实测预算
+    )
+    # 可把 decision.launched/reason 接入原有日志。
+```
+
+#### 4.6 输出接口假设与当前验证范围
+
+helper 使用 `engine.generate(**kwargs)` 返回异步生成器、`await engine.abort(request_id)` 取消、`output.outputs[0].token_ids` 返回 prompt 之后的 token，以及 `output.finished` 表示结束的接口。对应公共接口参考 [vLLM AsyncLLM](https://docs.vllm.ai/en/stable/api/vllm/v1/engine/async_llm/)；累计输出选择见 [SamplingParams](https://docs.vllm.ai/en/stable/api/vllm/sampling_params/)。本地 fork 若改变了这些接口，需调整 `_run_prespec` 的相应取值，不能把文本重新 tokenize 代替原始输出 IDs。
+
+普通 vLLM 输出不包含 prompt token，因此代码没有再切掉 `len(stable_prefix_token_ids)`；否则会丢失候选开头。引擎完成标记之后才发布候选。若你修改过输出为“整个序列”或只报告增量，先还原此合同。
+
+shadow 不调用正式转写/finish/`_yield_delta_text`，不发送客户端事件、不修改正式 state；引擎全局统计仍可能包含 shadow，需按 request ID 单独分析。
+
+本地 mock 用例覆盖完整音频、输入隔离、旧草稿传递、纠正后输出的收集、累计输出去重、跳过条件、取消及异常清理。**它验证适配逻辑，不证明真实 verifier 已正确执行，也不证明 910B 上的时延收益。** 实际服务接通后还需看一次旧草稿被拒绝后继续 decode 的日志，并比较 baseline/probe 正式 P95/P99。
 
 ### 五、正式 chunk：在函数内部替换草稿来源
 
-挂点在 `async_streaming_transcribe()` 的**每次切 chunk 推理循环内部**：正式音频和 P0 已确定，external draft 尚未打包。只在外面包一次函数调用会漏掉同次调用的后续 chunk。
+挂点在 `async_streaming_transcribe()` 的**每次切 chunk 推理循环内部**：正式音频和保留前缀已确定，external draft 尚未打包。只在外面包一次函数调用会漏掉同次调用的后续 chunk。
 
 **先把连接/段标识传到这个函数，不能假设局部变量已经存在。** 在原 `async_streaming_transcribe()` 参数列表末尾新增可选参数 `prespec_ws_id=None, prespec_seg_id=None`（保留原有参数）；把 `_process_segment()` 中对它的调用改为：
 
@@ -276,10 +518,11 @@ if prespec is not None:
     )
 raw_target_tokens = ()
 try:
-    draft = candidate.token_ids if candidate is not None else original_rollback
-    # 用 draft 构造现有 external draft，然后执行原 engine.generate。
+    draft_token_ids = (candidate.token_ids if candidate is not None
+                       else rollback_draft_token_ids)
+    # 用 draft_token_ids 调用 4.2 的 _pack_stream_request，再执行原 engine.generate。
     # 这里保留原来的 async for ... _yield_delta_text(...) 与 yield item。
-    # 保存这次实际生成的、P0 之后且业务回滚之前的原始 token IDs。
+    # 保存这次实际生成的、保留前缀之后且业务回滚之前的原始 token IDs。
 finally:
     if prespec is not None:
         evaluation = prespec.end_authoritative_chunk(
@@ -290,7 +533,7 @@ finally:
 
 仅推理成功时将返回的 Evaluation 计入匹配率。若现有局部变量拿不到 raw token，在 `_yield_delta_text()` 增加可选 `on_final_tokens` 回调，交回最终原始 IDs；不要把异步生成器改成 await 函数，也不要从 delta 文本重新 tokenize。try/finally 必须覆盖实际输出迭代；清理调用者时显式关闭/退出生成器，使 finally 及时执行，不能依赖垃圾回收。
 
-`shadow_only=True` 时 candidate 恒为 None，正式路径仍用原 U0，但协调器会比较就绪 C1 与正式原始输出。切换消费模式后，C1 仍经过现有 verifier 在完整正式音频上重新验证。推理失败/中断的空 token 只用于释放生命周期，不计为候选拒绝率。
+`shadow_only=True` 时 candidate 恒为 None，正式路径仍用原回滚草稿，但协调器会比较就绪预投机候选与正式原始输出。切换消费模式后，预投机候选仍经过现有 verifier 在完整正式音频上重新验证。推理失败/中断的空 token 只用于释放生命周期，不计为候选拒绝率。
 
 ### 六、commit 与清理：给出插入代码和字段初始化
 
@@ -375,7 +618,7 @@ if self.prespec is not None:
 
 ### 七、最小版范围与验证
 
-当前协调器按 `(session_id, audio_epoch)` 去重，最小版继续 `audio_epoch=seg_id`，**每段最多成功启动一次**。选择段内第一个已有合法 U0 的中点，例如 2 s 正式结果之后，累计到 3 s 时为 4 s chunk 起草。没有合法 U0 的首个窗口跳过；不能跨 VAD 段借用旧 token。`seg-24/chunk-0` 若是新段首次推理，本版不能据其等待日志声称可获得预投机收益。
+当前协调器按 `(session_id, audio_epoch)` 去重，最小版继续 `audio_epoch=seg_id`，**每段最多成功启动一次**。选择段内第一个已有合法回滚草稿的中点，例如 2 s 正式结果之后，累计到 3 s 时为 4 s chunk 起草。没有合法回滚草稿的首个窗口跳过；不能跨 VAD 段借用旧 token。`seg-24/chunk-0` 若是新段首次推理，本版不能据其等待日志声称可获得预投机收益。
 
 要覆盖每个 2 s 窗口，下一步需把 `(ws, seg, chunk/window)` 候选 epoch 与段级 commit 生命周期拆开，并在每次 chunk 结束回收对应 epoch。**仅把 `audio_epoch=seg` 改成 `chunk_id` 不够**：chunk 可能跨段重号，且现有 finish_formal 不会回收所有窗口。此改动不属于本次文档适配，当前代码仍是每段一次接口。
 
@@ -388,4 +631,4 @@ if self.prespec is not None:
 3. 提前 commit、短尾 skip、断连时，无泄漏请求和未配对计数；注意 Python 取消不等于 NPU kernel 已抢占。
 4. 同音频/同并发 baseline 与 probe 比较正式 P95/P99、队列等待及总计算成本；在离线回放验证经 verifier 消费后的 token/提交边界等价，再启用消费模式。
 
-服务源码到位后需确认的具体代码点只有：external draft 的打包字段及 kmax 约束、P0/U0 的实际拆分、raw output token 的含义、现有完整音频构造规则及采样截止计数、engine abort/生成器关闭方式、请求级清理与正式 session 结束的调用边界。KV 的可复用范围由引擎决定，不是服务端适配项。当前描述不能替代这些逐行核对或 910B 验证。
+服务源码到位后需确认的具体代码点只有：external draft 的打包字段及 kmax 约束、保留前缀/回滚草稿的实际拆分、raw output token 的含义、现有完整音频构造规则及采样截止计数、engine abort/生成器关闭方式、请求级清理与正式 session 结束的调用边界。KV 的可复用范围由引擎决定，不是服务端适配项。当前描述不能替代这些逐行核对或 910B 验证。
