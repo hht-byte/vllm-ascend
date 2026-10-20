@@ -2,9 +2,10 @@ import asyncio
 import unittest
 from enum import Enum
 from types import SimpleNamespace
+import numpy as np
 
 from streaming_prespec import AdmissionPolicy, PreSpecCoordinator
-from streaming_prespec_helpers import PreSpecModelHelpers
+from streaming_prespec_helpers import PreSpecModelHelpers, snapshot_stream_audio
 
 
 class OutputKind(Enum):
@@ -52,12 +53,13 @@ class Model(PreSpecModelHelpers):
         )
 
     def _pack_stream_request(self, *, full_audio_pcm_f32le,
-                             stable_prefix_token_ids, draft_token_ids,
+                             prefix_text, stable_prefix_token_ids, draft_token_ids,
                              model_context, sampling_params):
         # Test-only transport. These are NOT vLLM external-draft field names.
         return {
             "prompt": {"audio": full_audio_pcm_f32le,
-                       "prefix": stable_prefix_token_ids,
+                       "text": model_context["prompt_raw"] + prefix_text,
+                       "prefix_ids": stable_prefix_token_ids,
                        "context": model_context},
             "test_draft": draft_token_ids,
             "sampling_params": sampling_params,
@@ -71,8 +73,10 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
             full_audio_pcm_f32le=bytearray(b"\x01\x02\x03\x04" * 48000),
             current_audio_end_samples=48000, last_formal_audio_end_samples=32000,
             chunk_size_samples=32000, stable_prefix_token_ids=[10],
+            prefix_text="recognized ",
             rollback_draft_token_ids=[20, 21],
-            model_context={"language": "zh", "context": ["original"]},
+            model_context={"language": "zh", "context": ["original"],
+                           "prompt_raw": "<audio>"},
             sampling_params=SimpleNamespace(
                 max_tokens=128, min_tokens=4, n=1, best_of=None,
                 output_kind=OutputKind.DELTA),
@@ -100,7 +104,8 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
             call = engine.calls[0]
             self.assertEqual(len(call["prompt"]["audio"]), 48000 * 4)
             self.assertEqual(call["prompt"]["audio"][0], 1)
-            self.assertEqual(call["prompt"]["prefix"], [10])
+            self.assertEqual(call["prompt"]["text"], "<audio>recognized ")
+            self.assertEqual(call["prompt"]["prefix_ids"], [10])
             self.assertEqual(call["prompt"]["context"]["context"], ["original"])
             self.assertEqual(call["test_draft"], [20, 21])
             self.assertEqual(call["sampling_params"].max_tokens, 3)
@@ -131,6 +136,29 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(model.try_start_prespec(**inputs).reason, reason)
                 self.assertEqual(inputs["last_formal_audio_end_samples"], 32000)
         self.assertFalse(model.prespec_engine.calls)
+
+    async def test_snapshot_joins_consumed_chunks_and_pending_buffer(self):
+        committed = np.full(32000, 0.25, dtype=np.float32)
+        pending = np.full(16000, -0.5, dtype=np.float32)
+        audio, current_end, last_formal_end = snapshot_stream_audio(
+            committed, pending)
+        self.assertEqual((current_end, last_formal_end), (48000, 32000))
+        self.assertTrue(np.array_equal(np.frombuffer(audio, dtype="<f4")[:32000],
+                                       committed))
+        self.assertTrue(np.array_equal(np.frombuffer(audio, dtype="<f4")[32000:],
+                                       pending))
+        pending[0] = 1
+        self.assertEqual(np.frombuffer(audio, dtype="<f4")[32000], -0.5)
+
+    async def test_draft_length_reserves_at_least_one_continuation_token(self):
+        engine = FakeEngine()
+        model = Model(engine)
+        inputs = self.inputs()
+        inputs["rollback_draft_token_ids"] = [20, 21, 22]
+        self.assertTrue(model.try_start_prespec(**inputs).launched)
+        await engine.started.wait()
+        await model.prespec.close_session("ws-test")
+        self.assertEqual(engine.calls[0]["test_draft"], [20, 21])
 
     async def test_formal_submit_cancels_shadow_and_aborts_only_its_request(self):
         engine = FakeEngine("wait")

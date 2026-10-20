@@ -11,6 +11,7 @@ import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
+import numpy as np
 
 if __package__:
     from .streaming_prespec import LaunchDecision, ShadowRequest
@@ -21,8 +22,21 @@ else:
 @dataclass(frozen=True, kw_only=True)
 class ModelShadowRequest(ShadowRequest):
     # Private copies of small request settings, never the live ASR state/engine.
+    prefix_text: str
     model_context: dict[str, Any]
     sampling_params: Any
+
+
+def snapshot_stream_audio(audio_accum, buffer) -> tuple[bytes, int, int]:
+    """Snapshot all consumed full chunks plus the unconsumed audio tail.
+
+    Returns complete 16 kHz float32 LE PCM, its sample count, and the last
+    formal chunk cutoff. Both counts use segment-relative sample coordinates.
+    """
+    consumed = np.asarray(audio_accum, dtype=np.float32).reshape(-1)
+    pending = np.asarray(buffer, dtype=np.float32).reshape(-1)
+    complete = np.concatenate((consumed, pending)).astype("<f4", copy=False)
+    return complete.tobytes(), int(complete.size), int(consumed.size)
 
 
 class PreSpecModelHelpers:
@@ -36,7 +50,8 @@ class PreSpecModelHelpers:
     def try_start_prespec(
         self, *, ws_id, seg_id, prefix_version, full_audio_pcm_f32le,
         current_audio_end_samples, last_formal_audio_end_samples,
-        chunk_size_samples, stable_prefix_token_ids, rollback_draft_token_ids,
+        chunk_size_samples, prefix_text, stable_prefix_token_ids,
+        rollback_draft_token_ids,
         model_context, sampling_params, committed, audio_queue_empty,
         load=None, predicted_draft_ms=0.0,
     ):
@@ -56,12 +71,16 @@ class PreSpecModelHelpers:
             return LaunchDecision(False, "formal_chunk_due")
         if not rollback_draft_token_ids:
             return LaunchDecision(False, "no_rollback_draft")
+        if coordinator.policy.max_candidate_tokens < 2:
+            return LaunchDecision(False, "budget_too_small")
         # Take the time before copying so snapshot overhead consumes the budget.
         deadline_ns = coordinator.clock() + int(
             (chunk_size_samples - new_samples) / 16000 * 1e9)
         audio_bytes = bytes(full_audio_pcm_f32le)
         if not audio_bytes or len(audio_bytes) % 4:
             raise ValueError("audio must be complete mono float32 LE PCM")
+        if len(audio_bytes) // 4 != current_audio_end_samples:
+            raise ValueError("audio bytes and sample cutoff disagree")
         request = ModelShadowRequest(
             session_id=ws_id, audio_epoch=seg_id,
             base_prefix_version=prefix_version,
@@ -71,6 +90,7 @@ class PreSpecModelHelpers:
             stable_prefix_tokens=tuple(stable_prefix_token_ids),
             rollback_tokens=tuple(rollback_draft_token_ids),
             deadline_ns=deadline_ns,
+            prefix_text=prefix_text,
             model_context=deepcopy(model_context),
             sampling_params=deepcopy(sampling_params),
         )
@@ -87,8 +107,9 @@ class PreSpecModelHelpers:
         params.output_kind = type(params.output_kind).CUMULATIVE
         kwargs = self._pack_stream_request(
             full_audio_pcm_f32le=request.audio_pcm_f32le,
+            prefix_text=request.prefix_text,
             stable_prefix_token_ids=list(request.stable_prefix_tokens),
-            draft_token_ids=list(request.rollback_tokens[:budget]),
+            draft_token_ids=list(request.rollback_tokens[:budget - 1]),
             model_context=deepcopy(request.model_context),
             sampling_params=params,
         )
