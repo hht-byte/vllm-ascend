@@ -37,14 +37,19 @@ parser.add_argument(
 )
 ```
 
-在同一入口调用 `Qwen3ASRModelAsync.AsyncLLM(...)` 时，**保留全部原实参**并追加：
+你现在的调用是 `Qwen3ASRModelAsync.AsyncLLM(**base_config)`。保留 `base_config` 原内容，在同一调用上显式追加 parser 参数：
 
 ```python
-prespec_mode=args.prespec_mode,
-prespec_admission=args.prespec_admission,
+model = Qwen3ASRModelAsync.AsyncLLM(
+    **base_config,
+    prespec_mode=args.prespec_mode,
+    prespec_admission=args.prespec_admission,
+)
 ```
 
-在 `qwen3_asr_async.py` 的 `AsyncLLM()` 现有类方法签名末尾新增对应的两个可选形参；不能只在调用处传参，否则会得到 `unexpected keyword argument`：
+`base_config` 不能同时含有 `prespec_mode` 或 `prespec_admission`，否则 Python 会因重复关键字报错。若原调用的结果变量不是 `model`，保留原变量名。
+
+在 `qwen3_asr_async.py` 的 `AsyncLLM()` 现有类方法签名增加两个显式形参；若签名有 `**kwargs`，把它们放在 `**kwargs` **之前**。不能只在调用处传参，否则可能得到 `unexpected keyword argument`，或落入 `**kwargs` 后被错误转发给 vLLM engine：
 
 ```python
 prespec_mode: str = "off",

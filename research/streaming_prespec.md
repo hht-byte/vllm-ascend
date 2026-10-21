@@ -114,6 +114,8 @@ return model
 
 上面的 `enabled=False` 是完成适配前的静态安全起点。A/B/C 验证时，按 [验证手册第 1.1 节](streaming_prespec_validation.md) 从现有启动 parser 的 `--prespec-mode`、`--prespec-admission` 传到 `AsyncLLM()`，再调用本方法；不要同时保留这个写死的 `enabled=False` 调用，也不要把两个新参数直接传给 vLLM engine 构造函数。
 
+你当前的工厂调用是 `Qwen3ASRModelAsync.AsyncLLM(**base_config)`；验证手册给出的实际改法是在这一次调用中追加 `prespec_mode=args.prespec_mode`、`prespec_admission=args.prespec_admission`，并由 `AsyncLLM()` 的显式形参接收。`base_config` 保持原用途，不向 vLLM engine 透传这两个服务侧参数。
+
 #### 步骤 4：`websocket_router.py` 不修改
 
 明确到函数：
