@@ -18,13 +18,19 @@ A/B/C 保持同一服务代码、模型、图配置、回滚参数、chunk 长�
 
 ### 1.1 `qwen3_asr_async.py`：模型初始化时接入 probe 和三组开关
 
-先把现有 `enable_prespec()` 的参数和协调器构造改为可选模式；**其余初始化代码保持原样**：
+先在 910B 服务项目根目录核对当前实际签名：
+
+```bash
+rg -n -A 35 'def enable_prespec' qwen_asr/inference/qwen3_asr_async.py
+```
+
+这里的 `enable_prespec()` **不是上游已有 API**，而是 [主接入文档步骤 2](streaming_prespec.md) 要在 `Qwen3ASRModelAsync` 中新增的方法。该文档现在已把 `admission_mode` 和 `shadow_only` 加入签名并传给协调器；若你之前照旧版示例复制了函数，必须先同步更新签名与协调器构造，才可传下面两个实参。为记录 shadow 请求生命周期，再把其中的 `producer=self._run_prespec` 替换为 `producer=self._logged_prespec_producer`。完整的关键行是：
 
 ```python
 def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
                    candidate_tokens=8, on_probe=None,
                    admission_mode="force", shadow_only=True):
-    # ...保留当前 enabled/kmax/engine 校验和 midpoint_samples 计算...
+    # 保留主接入文档中已有的 enabled/kmax/engine 校验和 midpoint_samples 计算。
     self.prespec = PreSpecCoordinator(
         producer=self._logged_prespec_producer,
         policy=AdmissionPolicy(

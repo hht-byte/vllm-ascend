@@ -56,7 +56,8 @@ from qwen_asr.inference.streaming_prespec_helpers import (
 
 ```python
 def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
-                   candidate_tokens=8, on_probe=None):
+                   candidate_tokens=8, on_probe=None,
+                   admission_mode="force", shadow_only=True):
     # 仅在服务启动、连接尚未创建时调用一次。
     self.prespec = None
     if not enabled:
@@ -75,17 +76,17 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
     self.prespec = PreSpecCoordinator(
         producer=self._run_prespec,
         policy=AdmissionPolicy(
-            admission_mode="force",  # 仅用于第一轮受控 shadow 实验
+            admission_mode=admission_mode,
             midpoint_samples=midpoint_samples,
             max_candidate_tokens=min(candidate_tokens, kmax),
             max_active_shadows=1,
         ),
-        shadow_only=True,
+        shadow_only=shadow_only,
         on_probe=on_probe,
     )
 ```
 
-这个方法创建协调器并保存 engine 引用。`self._run_prespec` 已由 mixin 提供；第四节的 `_pack_stream_request` 接到已有实现前仍使用 `enabled=False`。`on_probe` 可传现有非阻塞日志回调；未传时不会自动输出 probe 日志。
+这个方法创建协调器并保存 engine 引用。`admission_mode="force"`、`shadow_only=True` 是初次受控实验的默认值；验证手册中的环境变量调用会显式覆盖它们。`self._run_prespec` 已由 mixin 提供；第四节的 `_pack_stream_request` 接到已有实现前仍使用 `enabled=False`。`on_probe` 可传现有非阻塞日志回调；未传时不会自动输出 probe 日志。
 
 #### 步骤 3：修改 `AsyncLLM()` 的返回位置
 
