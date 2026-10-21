@@ -313,6 +313,39 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(coordinator.finish_formal("ws-1", 1, (20, 21, 99)))
         await coordinator.close_session("ws-1")
 
+    async def test_chunk_without_target_tokens_discards_candidate_without_evaluation(self):
+        async def producer(request, budget):
+            return (20, 21)
+
+        coordinator = PreSpecCoordinator(producer, self.policy, clock=lambda: self.now,
+                                         shadow_only=False)
+        coordinator.maybe_start(self.request(), self.load(), 200)
+        await asyncio.sleep(0)
+        candidate = coordinator.begin_authoritative_chunk(
+            "ws-1", audio_epoch=1, prefix_version=2,
+            full_audio_end_samples=64_000)
+        self.assertIsNotNone(candidate)
+        self.assertIsNone(coordinator.end_authoritative_chunk("ws-1", audio_epoch=1))
+        self.assertNotIn(("ws-1", 1), coordinator._selected)
+        self.assertNotIn(("ws-1", 1), coordinator._selected_at_ns)
+        coordinator.begin_formal("ws-1", 1, 2, 64_000)
+        self.assertIsNone(coordinator.finish_formal("ws-1", 1))
+        await coordinator.close_session("ws-1")
+
+    async def test_formal_without_target_tokens_discards_candidate_without_evaluation(self):
+        async def producer(request, budget):
+            return (20, 21)
+
+        coordinator = PreSpecCoordinator(producer, self.policy, clock=lambda: self.now,
+                                         shadow_only=False)
+        coordinator.maybe_start(self.request(), self.load(), 200)
+        await asyncio.sleep(0)
+        self.assertIsNotNone(coordinator.begin_formal("ws-1", 1, 2, 64_000))
+        self.assertIsNone(coordinator.finish_formal("ws-1", 1))
+        self.assertNotIn(("ws-1", 1), coordinator._selected)
+        self.assertNotIn(("ws-1", 1), coordinator._selected_at_ns)
+        await coordinator.close_session("ws-1")
+
     async def test_probe_records_readiness_at_chunk_submit_without_waiting(self):
         probes = []
         async def producer(request, budget):

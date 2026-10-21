@@ -297,8 +297,7 @@ class PreSpecCoordinator:
                                 audio_epoch: int | None = None,
                                 target_continuation_tokens: Sequence[int] | None = None
                                 ) -> Evaluation | None:
-        if audio_epoch is not None and target_continuation_tokens is None:
-            raise ValueError("chunk evaluation needs target continuation tokens")
+        """End a chunk; omit target tokens to discard without quality scoring."""
         active = self._active_chunks.get(session_id, 0)
         if active <= 0:
             raise ValueError(f"no authoritative chunk in flight: {session_id}")
@@ -384,8 +383,9 @@ class PreSpecCoordinator:
                                       allow_candidate and not previous_active)
 
     def finish_formal(self, session_id: str, audio_epoch: int,
-                      target_continuation_tokens: Sequence[int]) -> Evaluation | None:
-        """Record shadow quality after the target has independently finished."""
+                      target_continuation_tokens: Sequence[int] | None = None
+                      ) -> Evaluation | None:
+        """End a formal boundary; optional tokens enable quality scoring."""
         key = (session_id, audio_epoch)
         if key not in self._begun:
             raise ValueError(f"formal boundary was not begun: {key}")
@@ -399,11 +399,14 @@ class PreSpecCoordinator:
         return self._evaluate(key, target_continuation_tokens)
 
     def _evaluate(self, key: tuple[str, int],
-                  target_continuation_tokens: Sequence[int]) -> Evaluation | None:
+                  target_continuation_tokens: Sequence[int] | None
+                  ) -> Evaluation | None:
         candidate = self._selected.pop(key, None)
         if candidate is None:
             return None
         ready_lead_ms = (self._selected_at_ns.pop(key) - candidate.ready_ns) / 1e6
+        if target_continuation_tokens is None:
+            return None
         accepted = 0
         for draft, actual in zip(candidate.token_ids, target_continuation_tokens):
             if draft != actual:

@@ -168,7 +168,7 @@ if decision is not None and decision.launched:
 
 `try_start_prespec_for_state()` 在未达中点、已 commit、音频队列非空或无合法回滚草稿时返回 `None`，因此这些路径**不会**出现 `PRESPEC_LAUNCH`。如果预期到达 3 秒却没有 launch，请在该包装函数这些 `return None` 前临时加一条 `DEBUG` 日志，包含 `ws_id/seg/chunk_id/len(state.buffer)/reason`；不要据“无 launch 日志”直接判断负载门控拒绝。`decision.reason` 只覆盖实际进入 `try_start_prespec()` 后的判断。
 
-### 1.4 `qwen3_asr_async.py`：记录正式边界和候选匹配
+### 1.4 `qwen3_asr_async.py`：关联正式请求与候选
 
 在 [第五节](streaming_prespec.md) 的 `begin_authoritative_chunk()` 前保存 `this_chunk_id = state.chunk_id`；在正式请求已构造好 `request_id`、紧邻现有 `engine.generate(...)` 前记录候选来源。下面的 `formal_request_id` 要换成正式请求当前使用的实际局部变量（如现有 `stream_...` ID），不能填 shadow 的 `prespec-...` ID：
 
@@ -181,21 +181,14 @@ logger.info(
 )
 ```
 
-在正式 `try` 前置 `formal_succeeded = False`，只在 L601–606 的正式 state 全部成功写回后置 `formal_succeeded = True`。在原 `finally` 中 `end_authoritative_chunk(...)` 返回后，只对**成功完成且取到原始 token IDs** 的正式请求记录匹配结果；异常或空 token 不计拒绝率：
+正式 chunk 的原 `finally` 只需与 `begin_authoritative_chunk()` 配对；不新增 `raw_target_tokens`，也不修改 `_yield_delta_text()`：
 
 ```python
-if formal_succeeded and evaluation is not None and raw_target_tokens:
-    logger.info(
-        "PRESPEC_EVAL ws_id=%s seg=%s chunk=%s "
-        "candidate_tokens=%s matched_prefix_tokens=%s ready_lead_ms=%.3f",
-        ws_id, seg_id, this_chunk_id,
-        len(evaluation.candidate_tokens),
-        evaluation.continuous_accepted_tokens,
-        evaluation.ready_lead_ms,
-    )
+if prespec is not None:
+    prespec.end_authoritative_chunk(ws_id, audio_epoch=seg_id)
 ```
 
-`PRESPEC_EVAL.matched_prefix_tokens` 是候选和正式输出的离线式连续前缀对照，**不是 vLLM verifier 实际接受数**。C 组还必须在引擎实际处理 `ascend_external_draft` 的验证结果处记录 `request_id`、提交的草稿长度、实际连续接受长度、首 token 是否拒绝、修正 token 数、目标模型前向步数。只在 proposer 的 `propose()` 打日志不足以证明草稿被验证；该函数只负责提出 token。先在服务/引擎仓库定位挂点：
+不传 `target_continuation_tokens` 表示**只清理候选，不计算匹配长度**，协调器返回 `None`；不能把此结果记为“接受 0 个 token”。C 组仍须在引擎实际处理 `ascend_external_draft` 的验证结果处记录 `request_id`、提交的草稿长度、实际连续接受长度、首 token 是否拒绝、修正 token 数、目标模型前向步数。只在 proposer 的 `propose()` 打日志不足以证明草稿被验证；该函数只负责提出 token。先在服务/引擎仓库定位挂点：
 
 ```bash
 rg -n 'ascend_external_draft|def propose\(|accepted.*token|rejected.*token' .
@@ -218,7 +211,7 @@ python -m py_compile qwen_asr/inference/streaming_prespec.py \
   qwen_asr/inference/streaming_prespec_helpers.py \
   qwen_asr/inference/qwen3_asr_async.py \
   qwen_asr/cli/realtime_connection.py
-rg -n 'PRESPEC_CONFIG|PRESPEC_LAUNCH|PRESPEC_REQUEST|PRESPEC_PROBE|PRESPEC_TARGET|PRESPEC_EVAL' \
+rg -n 'PRESPEC_CONFIG|PRESPEC_LAUNCH|PRESPEC_REQUEST|PRESPEC_PROBE|PRESPEC_TARGET' \
   qwen_asr/inference/qwen3_asr_async.py qwen_asr/cli/realtime_connection.py
 ```
 
@@ -236,7 +229,7 @@ rg -n 'PRESPEC_CONFIG|PRESPEC_LAUNCH|PRESPEC_REQUEST|PRESPEC_PROBE|PRESPEC_TARGE
 tail -F /path/to/server.log | rg --line-buffered 'PRESPEC_|inference submit|Commit received|Segment done'
 ```
 
-若服务由 systemd 管理，改用 `journalctl -u <实际服务单元名> -f -o cat` 作为管道左侧。预期按序看到 `PRESPEC_CONFIG`、中点 `PRESPEC_LAUNCH launched=True`、`PRESPEC_REQUEST submit/done`、正式 chunk 的 `PRESPEC_PROBE boundary=chunk status=ready_shadow_only` 和 `PRESPEC_EVAL`。`ready_lead_ms > 0` 表示候选早于正式 chunk 提交完成；若为 `pending`，候选被取消，不应等待它。随后分别重放提前 commit、≤0.4 秒短尾和断连，确认无遗留 `prespec-...` 请求、重复 begin 或未结束的 session。
+若服务由 systemd 管理，改用 `journalctl -u <实际服务单元名> -f -o cat` 作为管道左侧。预期按序看到 `PRESPEC_CONFIG`、中点 `PRESPEC_LAUNCH launched=True`、`PRESPEC_REQUEST submit/done` 和正式 chunk 的 `PRESPEC_PROBE boundary=chunk status=ready_shadow_only`。`ready_lead_ms > 0` 表示候选早于正式 chunk 提交完成；若为 `pending`，候选被取消，不应等待它。随后分别重放提前 commit、≤0.4 秒短尾和断连，确认无遗留 `prespec-...` 请求、重复 begin 或未结束的 session。
 
 如果链路没有 launch，打开 DEBUG 日志后先看 `return None` 的跳过原因和 `PRESPEC_LAUNCH reason`；`force` 仅绕过实时负载门控，不绕过中点、草稿、在途正式请求和容量检查。
 
@@ -265,7 +258,7 @@ rg -o 'PRESPEC_LAUNCH.*reason=[^ ]+' /path/to/run.log | sort | uniq -c
 # 同一回放清单
 ```
 
-这里的 `<现有服务启动命令>` 和 WebSocket 回放命令是环境专属的唯一占位符：本仓库没有 910B 服务启动脚本或你的 `test_v2.py` 参数表，不能编造 CLI。A/B 应逐 chunk 对比正式原始 token IDs、客户端 delta/done、最终文本与 commit 边界；C 还要确认候选实际写进正式 `ascend_external_draft` 并由引擎 verifier 验证。覆盖首 token 拒绝、部分接受、全拒绝、版本不匹配和候选超时。若原始 token 对齐基准不是同一个正式 prompt/前缀，`matched_prefix_tokens` 不可用于接受率计算。此步不通过就不要开始性能对比。
+这里的 `<现有服务启动命令>` 和 WebSocket 回放命令是环境专属的唯一占位符：本仓库没有 910B 服务启动脚本或你的 `test_v2.py` 参数表，不能编造 CLI。A/B 应逐 chunk 对比已有的客户端 delta/done、最终文本与 commit 边界；若引擎本来就记录正式原始 token IDs，可额外对比，但不为此改造流式输出函数。C 还要确认候选实际写进正式 `ascend_external_draft` 并由引擎 verifier 验证，覆盖首 token 拒绝、部分接受、全拒绝、版本不匹配和候选超时。此步不通过就不要开始性能对比。
 
 ## 4. 同负载性能对比：A→B、B→C、A→C
 

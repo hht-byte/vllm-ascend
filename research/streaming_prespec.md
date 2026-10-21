@@ -594,7 +594,6 @@ if prespec is not None:
         prefix_version=state.prespec_prefix_version,
         full_audio_end_samples=this_chunk_audio_end,
     )
-raw_target_tokens = ()
 try:
     draft_token_ids = (candidate.token_ids if candidate is not None
                        else rollback_draft_token_ids)
@@ -603,21 +602,17 @@ try:
     # ascend_external_draft；这一步通过 4.2 的 _pack_stream_request 复用。
     # L557：照常 yield ChunkInferenceEvent。
     # 正式请求仍保持 temperature=0、max_tokens=4096、DELTA。
-    # L583–596：继续 _yield_delta_text，照常 yield 客户端 delta；
-    #            从引擎原始输出累计 token IDs 到 raw_target_tokens。
+    # L583–596：继续 _yield_delta_text，照常 yield 客户端 delta。
     # L601–606：原样更新 _raw_decoded、解析输出和 chunk_id。
     state.prespec_prefix_version += 1  # 仅在正式状态成功写回后
 finally:
     if prespec is not None:
-        evaluation = prespec.end_authoritative_chunk(
-            ws_id, audio_epoch=seg_id,
-            target_continuation_tokens=raw_target_tokens,
-        )
+        prespec.end_authoritative_chunk(ws_id, audio_epoch=seg_id)
 ```
 
-上段是**插入位置示意**：注释所列的 L520–606 必须保留原函数实际代码，不能把注释当作代码替换。仅推理成功时将返回的 Evaluation 计入匹配率。因为正式请求使用 DELTA 输出，若 `_yield_delta_text()` 外层拿不到原始 token IDs，在它订阅引擎输出的位置增加可选回调，按输出片段累积 IDs；不要从 delta 文本重新 tokenize，也不能把它改成 await 函数。`try/finally` 覆盖 L557–606 以及真正的生成迭代；清理调用者时显式退出生成器，使 finally 执行。
+上段是**插入位置示意**：注释所列的 L520–606 必须保留原函数实际代码，不能把注释当作代码替换。最小版不采集正式请求的原始 token IDs，也不修改 `_yield_delta_text()`。`end_authoritative_chunk()` 不传 `target_continuation_tokens` 时只清理候选，返回 `None`；不得把缺失的对照数据记作“接受 0 个 token”。若以后另做离线候选质量评估，可显式传入与候选对齐的原始正式 token IDs。`try/finally` 覆盖 L557–606 以及真正的生成迭代；清理调用者时显式退出生成器，使 finally 执行。
 
-`shadow_only=True` 时 candidate 恒为 None，正式路径仍用原回滚草稿，但协调器会比较就绪预投机候选与正式原始输出。切换消费模式后，预投机候选仍经过现有 verifier 在完整正式音频上重新验证。推理失败/中断的空 token 只用于释放生命周期，不计为候选拒绝率。
+`shadow_only=True` 时 candidate 恒为 None，正式路径仍用原回滚草稿；协调器只记录候选是否赶上正式边界，不计算 token 匹配率。切换消费模式后，预投机候选仍经过现有 verifier 在完整正式音频上重新验证；实际接受数从引擎 verifier 日志获取。
 
 ### 六、commit 与清理：给出插入代码和字段初始化
 
@@ -666,7 +661,7 @@ try:
 finally:
     if self.prespec is not None and segment.prespec_formal_begun:
         try:
-            self.prespec.finish_formal(ws_id, seg_id, ())
+            self.prespec.finish_formal(ws_id, seg_id)
         finally:
             segment.prespec_formal_begun = False
 ```
@@ -683,7 +678,7 @@ if self.prespec is not None:
 #### 异常路径和配对规则
 
 - `handle_event()` 处理真实 commit 时，在注入 None 之前调用 `begin_formal(ws_id, seg_id, version, 0, allow_candidate=False)`，随后置 `segment.prespec_formal_begun=True`。这个 0 只是未消费候选时的占位参数，不与真正的段内音频截止比较。重复 commit 不能重复 begin；state 尚未初始化时版本参数可用段的初始值。
-- `_process_segment()` 最外层 finally 检查上述标志，调用 `finish_formal(ws_id, seg_id, ())` 并清标志。此处包住流式循环与 `_finish_segment()`，所以短尾跳过、正常完成和中途异常都会配对。
+- `_process_segment()` 最外层 finally 检查上述标志，调用 `finish_formal(ws_id, seg_id)` 并清标志。此处包住流式循环与 `_finish_segment()`，所以短尾跳过、正常完成和中途异常都会配对；不传 token IDs 表示只清理、不做候选质量评估。
 - 如果某段已 begin 但入队失败或被取消前根本未进入 `_process_segment()`，由对应异常处理或连接 cleanup 清理；不能期待一个从未进入的 finally 自动执行。
 - `cleanup()` 先取消并等待生成任务及其流式生成器退出，再 `await asr.prespec.close_session(ws_id)`，最后做原有队列/统计清理。不要先删协调器计数再让模型 finally 退出。
 
@@ -702,7 +697,7 @@ if self.prespec is not None:
 验收只保留直接相关的检查：
 
 1. 中点出现 `prespec-...` 请求；确认旧草稿有拒绝时，后续 decode 从 correction 状态继续。
-2. 正式 chunk submit 的 `ready_shadow_only/pending`、候选连续匹配长度与成本分开记录；shadow 不产生客户端事件、不改正式 state、不结束正式 session。
+2. 正式 chunk submit 的 `ready_shadow_only/pending`、引擎 verifier 的实际接受长度与成本分开记录；shadow 不产生客户端事件、不改正式 state、不结束正式 session。
 3. 提前 commit、短尾 skip、断连时，无泄漏请求和未配对计数；注意 Python 取消不等于 NPU kernel 已抢占。
 4. 同音频/同并发 baseline 与 probe 比较正式 P95/P99、队列等待及总计算成本；在离线回放验证经 verifier 消费后的 token/提交边界等价，再启用消费模式。
 
