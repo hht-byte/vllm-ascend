@@ -184,7 +184,7 @@ if self.prespec is not None and not segment.prespec_started:
         segment.prespec_started = True
 ```
 
-本次调用可能刚完成一个 2 s chunk，也可能仅向 `state.buffer` 追加了 80 ms 而没有进入 `while`。**后者正是检查 1 s 中点的机会。** 在生成器退出后，`state.audio_accum` 和 `state.buffer` 都已更新；`try_start_prespec()` 接收两者的完整快照、原回滚拆分及采样截止位置。具体实参见第四节 4.5。它仅在以下条件满足时调用现有 `maybe_start()`：
+本次调用可能刚完成一个 2 s chunk，也可能仅向 `state.buffer` 追加了 80 ms 而没有进入 `while`。**后者正是检查 1 s 中点的机会。** 在生成器退出后，`state.audio_accum` 和 `state.buffer` 都已更新；这里先调用 `try_start_prespec_for_state(state, ...)`，由它构造完整快照、回滚拆分和采样截止位置，再调用 `try_start_prespec(...)`。两层实参分别列在 4.5。它仅在以下条件满足时调用现有 `maybe_start()`：
 
 1. segment 未 commit、当前段音频队列无积压、上一轮正式推理已结束。commit 后合并剩余音频的路径不启动 shadow。
 2. 自上次正式请求的音频截止位置以来，新增音频量 `new_audio_samples` 位于 `[中点, chunk_size_samples)`；对 2 s chunk，就是 `[16000, 32000)`。这只是触发计数，传给引擎的音频仍是完整累计音频。
@@ -468,19 +468,32 @@ class PreSpecModelHelpers:
 
 例如 `state.audio_accum` 长 32000、`state.buffer` 长 16000，则新音频量为 16000，shadow 提交全部 48000 samples。到下个正式 chunk 切出后，`state.audio_accum` 长 64000，正式请求提交全部 64000。shadow 不更新这两个数组，缓存能复用多少由引擎决定。
 
-#### 4.5 第三节挂点具体传什么
+#### 4.5 第三节挂点与 helper 的两层实参
 
-在第三节的挂点，调用模型层的包装函数，由它读取这些现有状态并按 L486–518 的规则拆分。连接层只提供 `ws_id/seg_id`、commit 状态和队列是否为空；下面展示包装函数在模型类中的实际调用形态：
+第三节的挂点位于连接层 `_process_segment()` 的 `async for` 之后。这里调用的是模型层包装函数 `try_start_prespec_for_state()`，**只传以下五个实参**：
 
-| 实参来源 | 取值方式 |
+| `try_start_prespec_for_state` 形参 | 第三节传入的值 |
 |---|---|
-| `state.audio_accum / state.buffer` | 上次及更早正式 chunk 的完整音频 / 尚未凑满下个 chunk 的新增音频；`snapshot_stream_audio` 同时复制两者 |
-| `state._raw_decoded / state.chunk_id` | 用 L486–518 的只读拆分取得 `prefix_text`、前缀 IDs 和 `rollback_draft_token_ids`；固定阶段 `prefix_text=""`，动态阶段保留 `�` 修复循环 |
-| `state.prompt_raw` 及本段语言/context | 冻结到小字典 `model_context`，供 L520–554 的 processor/adapter 打包；不要把 state 传给后台 |
-| 本段采样参数 | 与 L559–568 正式路径一致的 `temperature=0,max_tokens=4096,output_kind=DELTA`；shadow 会复制并改输出模式/预算 |
-| `state.chunk_size_samples` | L474–606 的真实 chunk 大小，例如 2 s = 32000 |
+| `state` | 本段正在使用的 ASR streaming state |
+| `ws_id` | 当前 WebSocket 连接标识 |
+| `seg_id` | 当前段号 |
+| `committed` | `segment.committed` |
+| `audio_queue_empty` | `segment.audio_queue.empty()` |
 
-连接层的 `async for ...` 完成后可调用 `self.asr.try_start_prespec_for_state(state, ws_id=..., seg_id=..., committed=..., audio_queue_empty=...)`。`try_start_prespec_for_state` 是待加在模型类中的薄包装：它按上表取值，调用下面已有 helper。包装函数不得修改 `state.buffer`、`state.audio_accum`、`state._raw_decoded` 或 `state.chunk_id`。`state.prompt_raw` 的字段名由你提供；其他真实成员名仍要与源码核对。
+包装函数读取 `state`，再向已有的 `try_start_prespec()` helper 传以下参数。**下表不是连接层需要逐项传入的实参**：
+
+| `try_start_prespec` 形参 | 包装函数中的取值 |
+|---|---|
+| `ws_id`、`seg_id`、`committed`、`audio_queue_empty` | 原样转发连接层传入值 |
+| `prefix_version` | `state.prespec_prefix_version` |
+| `full_audio_pcm_f32le`、`current_audio_end_samples`、`last_formal_audio_end_samples` | `snapshot_stream_audio(state.audio_accum, state.buffer)` 的三个返回值；音频包含完整历史和当前 buffer |
+| `chunk_size_samples` | `state.chunk_size_samples` |
+| `prefix_text`、`stable_prefix_token_ids`、`rollback_draft_token_ids` | 用 `state._raw_decoded`、`state.chunk_id` 按 L486–518 的规则只读拆分；动态阶段保留 `�` 修复循环 |
+| `model_context` | 至少包含 `state.prompt_raw`，再加入原 processor 所需语言/context；不要把整个 state 交给后台 |
+| `sampling_params` | 为 shadow 准备的采样参数；以 L559–568 的正式参数为基准，helper 将其改为较小预算和 CUMULATIVE 输出 |
+| `load`、`predicted_draft_ms` | 初次 force 实验分别为 `None`、`0.0` |
+
+`try_start_prespec_for_state` 是待加在模型类中的薄包装；第三节已有连接层调用示例，下面只展示包装函数实现。它不得修改 `state.buffer`、`state.audio_accum`、`state._raw_decoded` 或 `state.chunk_id`。`state.prompt_raw` 的字段名由你提供；其他真实成员名仍要与源码核对。
 
 ```python
 def try_start_prespec_for_state(
