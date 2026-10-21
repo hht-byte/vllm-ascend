@@ -610,7 +610,7 @@ finally:
         prespec.end_authoritative_chunk(ws_id, audio_epoch=seg_id)
 ```
 
-上段是**插入位置示意**：注释所列的 L520–606 必须保留原函数实际代码，不能把注释当作代码替换。最小版不采集正式请求的原始 token IDs，也不修改 `_yield_delta_text()`。`end_authoritative_chunk()` 不传 `target_continuation_tokens` 时只清理候选，返回 `None`；不得把缺失的对照数据记作“接受 0 个 token”。若以后另做离线候选质量评估，可显式传入与候选对齐的原始正式 token IDs。`try/finally` 覆盖 L557–606 以及真正的生成迭代；清理调用者时显式退出生成器，使 finally 执行。
+上段是**插入位置示意**：注释所列的 L520–606 必须保留原函数实际代码，不能把注释当作代码替换。最小版不采集正式请求的原始 token IDs，也不修改 `_yield_delta_text()`。`end_authoritative_chunk()` 不传 `target_continuation_tokens` 时只清理候选，返回 `None`；不得把缺失的对照数据记作“接受 0 个 token”。若需要离线候选质量评估，按 [验证手册的可选采集挂点](streaming_prespec_validation.md) 从正式请求的 DELTA 输出流收集 token IDs；不能初始化 `raw_target_tokens = ()` 后不更新便传入。`try/finally` 覆盖 L557–606 以及真正的生成迭代；清理调用者时显式退出生成器，使 finally 执行。
 
 `shadow_only=True` 时 candidate 恒为 None，正式路径仍用原回滚草稿；协调器只记录候选是否赶上正式边界，不计算 token 匹配率。切换消费模式后，预投机候选仍经过现有 verifier 在完整正式音频上重新验证；实际接受数从引擎 verifier 日志获取。
 

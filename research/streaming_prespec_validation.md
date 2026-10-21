@@ -194,6 +194,59 @@ if prespec is not None:
 rg -n 'ascend_external_draft|def propose\(|accepted.*token|rejected.*token' .
 ```
 
+若需要**候选与正式输出的离线匹配统计**，不能把旧示例中的 `raw_target_tokens = ()` 原样传入：元组没有采集动作，会一直表示“已观测到空输出”，导致错误的 0 匹配。正式请求仍保持 `output_kind=DELTA`，在原 `_yield_delta_text()` 消费的**同一条正式 vLLM 输出流**上采集原始 token IDs。可给 `_yield_delta_text()` 增加一个可选的 `on_output` 回调，并在它原有的 `async for output in stream` 循环内、处理文本之前调用；不要另起一次 generate，也不要对输出文本重新 tokenize：
+
+```python
+# _yield_delta_text 的原有参数保持不变，仅追加 on_output=None。
+# 在原有 async for output in stream 循环内：
+if on_output is not None:
+    on_output(output)
+# 下方保留原有的文本增量、计时、缓存释放和 yield 逻辑。
+```
+
+正式 chunk 的调用点每轮新建一个收集器，并把回调传给**原有那次** `_yield_delta_text()` 调用（其他实参照旧保留）：
+
+```python
+raw_target_tokens = []
+formal_output_finished = False
+
+def capture_formal_output(output):
+    nonlocal formal_output_finished
+    # 正式采样只有一个 completion，DELTA 的 token_ids 是本次新增 token。
+    if output.outputs:
+        raw_target_tokens.extend(output.outputs[0].token_ids)
+    if output.finished:
+        formal_output_finished = True
+
+try:
+    # 原有 prompt、SamplingParams、engine.generate 与客户端 delta 流程。
+    async for delta in self._yield_delta_text(
+        stream,  # 其余原有位置/关键字参数保持不变
+        on_output=capture_formal_output,
+    ):
+        yield delta
+    # 原有 _raw_decoded / chunk_id 状态写回。
+finally:
+    if prespec is not None:
+        evaluation = prespec.end_authoritative_chunk(
+            ws_id,
+            audio_epoch=seg_id,
+            target_continuation_tokens=(
+                tuple(raw_target_tokens) if formal_output_finished else None
+            ),
+        )
+        if evaluation is not None:
+            logger.info(
+                "PRESPEC_MATCH ws_id=%s seg=%s chunk=%s candidate_len=%s "
+                "matched_prefix_tokens=%s",
+                ws_id, seg_id, this_chunk_id,
+                len(evaluation.candidate_tokens),
+                evaluation.continuous_accepted_tokens,
+            )
+```
+
+这段仅展示采集与统计挂点，不能替换原函数的其他实参或原有状态写回。只有观察到 `output.finished` 才传入 token 列表；中断/取消时传 `None`，避免把部分输出或尚未采集的 `()` 算作 0 匹配。完成且确实生成 0 个 token 时，空元组才是有效观测。`PRESPEC_MATCH` 是候选与正式**最终输出**的最长公共前缀长度，不是引擎 verifier 的实际草稿接受数；后者仍从 verifier 打点取得。候选和正式请求必须使用相同的输出 token 对齐起点（prompt 之后），且这里假设正式请求只有一个 completion。
+
 日志关联以 `ws_id + seg + chunk` 为正式键，以 `prespec-...` 为 shadow 引擎请求键；不要把不同 request 的 prefill/decode 打点混在一起。`PRESPEC_PROBE status=ready_consumed` 发生在正式验证**之前**，不能代替 verifier 日志。
 
 先把本仓库的两个模块复制到服务的 `qwen_asr/inference/`，监测脚本复制到测试工作目录；若两仓库在同一主机上，在服务项目根目录执行（替换检出路径）：
