@@ -686,6 +686,8 @@ if self.prespec is not None:
 
 ### 七、最小版范围与验证
 
+910B 上按“回滚投机 baseline → shadow → 消费候选”逐步验证的可执行命令、最小日志接线和判定表见 [streaming_prespec_validation.md](streaming_prespec_validation.md)。协调器本身不自动打印 launch、probe 或 evaluation；只看原有服务日志无法判断预投机是否运行。
+
 当前协调器按 `(session_id, audio_epoch)` 去重，最小版继续 `audio_epoch=seg_id`，**每段最多成功启动一次**。选择段内第一个已有合法回滚草稿的中点，例如 2 s 正式结果之后，累计到 3 s 时为 4 s chunk 起草。没有合法回滚草稿的首个窗口跳过；不能跨 VAD 段借用旧 token。`seg-24/chunk-0` 若是新段首次推理，本版不能据其等待日志声称可获得预投机收益。
 
 要覆盖每个 2 s 窗口，下一步需把 `(ws, seg, chunk/window)` 候选 epoch 与段级 commit 生命周期拆开，并在每次 chunk 结束回收对应 epoch。**仅把 `audio_epoch=seg` 改成 `chunk_id` 不够**：chunk 可能跨段重号，且现有 finish_formal 不会回收所有窗口。此改动不属于本次文档适配，当前代码仍是每段一次接口。
