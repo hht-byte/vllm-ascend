@@ -155,7 +155,7 @@ AsyncLLM() 构造 model，并设置 model.prespec
 |---|---|
 | `websocket_router.py`：三个函数 | **不改代码**；具体见步骤 4 |
 | `qwen3_asr_async.py`：`AsyncLLM()` | **插入一处调用**：在返回实例前调用新增 `enable_prespec()`，具体见步骤 2–3 |
-| 同文件 `init_streaming_state()` | 初始化 `state.prespec_prefix_version=0`；`ws_id/seg_id` 通过新增可选参数传入流式函数，具体见第五、六节；`audio_accum` 和 `buffer` 沿用原有字段 |
+| 同文件 `init_streaming_state()` | 初始化 `state.prespec_prefix_version=0`；流式函数已有第三个参数 `connection_id` 可作 `ws_id`，只需另传当前 `seg_id`，具体见第五、六节；`audio_accum` 和 `buffer` 沿用原有字段 |
 | 同文件 `async_streaming_transcribe()` | **每个正式 chunk 内部**，在准备好正式音频/保留前缀、尚未把 external draft 写进请求时领取候选；实际 engine 输出迭代结束后配对退出 |
 | 同文件 `_yield_delta_text()` | 正式输出流程保留；若外层拿不到原始 token IDs，增加一个可选的“最终 token 回调”，用于评估；shadow 不调用此函数 |
 | 同文件 `async_finish_streaming_transcribe()` | 第一版保留原 finish 路径；commit 到达已取消 shadow 并标记正式任务，finish 不重复领取候选 |
@@ -167,16 +167,22 @@ AsyncLLM() 构造 model，并设置 model.prespec
 
 ### 三、中点触发：在本次 `async_streaming_transcribe()` 生成器退出后
 
-之前示例中的 `await existing_stream_chunk_inference(...)` 不能直接对应你的流式 API：`async_streaming_transcribe()` 是异步生成器，一次调用可能执行多个 chunk。连接层应这样挂中点检查（参数名仅示意）：
+之前示例中的 `await existing_stream_chunk_inference(...)` 不能直接对应你的流式 API：`async_streaming_transcribe()` 是异步生成器，一次调用可能执行多个 chunk。保留原有第三个位置参数 `self.connection_id`；它就是 `ws_id`。连接层在这次调用结束后挂中点检查（`seg_id` 表示当前段号，须对应现有 `seg-N` 字段）：
 
 ```python
 # _process_segment() 原有“未提交、逐块处理”路径
-async for item in self.asr.async_streaming_transcribe(audio, state):
-    await self._send_stream_item(item)
+item = await segment.audio_queue.get()
+if item is None:
+    continue
+async for stream_item in self.asr.async_streaming_transcribe(
+    item, segment.asr_state, self.connection_id,
+    prespec_seg_id=seg_id,  # 唯一新增的流式函数实参
+):
+    await self._send_stream_item(stream_item)
 
 if self.prespec is not None and not segment.prespec_started:
     decision = self.asr.try_start_prespec_for_state(
-        state, ws_id=ws_id, seg_id=seg_id,
+        segment.asr_state, ws_id=self.connection_id, seg_id=seg_id,
         committed=segment.committed,
         audio_queue_empty=segment.audio_queue.empty(),
     )
@@ -474,9 +480,9 @@ class PreSpecModelHelpers:
 
 | `try_start_prespec_for_state` 形参 | 第三节传入的值 |
 |---|---|
-| `state` | 本段正在使用的 ASR streaming state |
-| `ws_id` | 当前 WebSocket 连接标识 |
-| `seg_id` | 当前段号 |
+| `state` | `segment.asr_state` |
+| `ws_id` | `self.connection_id`，与原流式函数第三个位置参数相同 |
+| `seg_id` | 当前段号，对应现有 `seg-N` 字段 |
 | `committed` | `segment.committed` |
 | `audio_queue_empty` | `segment.audio_queue.empty()` |
 
@@ -555,16 +561,17 @@ shadow 不调用正式转写/finish/`_yield_delta_text`，不发送客户端事�
 
 挂点在 `async_streaming_transcribe()` 的**每次切 chunk 推理循环内部**：正式音频和保留前缀已确定，external draft 尚未打包。只在外面包一次函数调用会漏掉同次调用的后续 chunk。
 
-**先把连接/段标识传到这个函数，不能假设局部变量已经存在。** 在原 `async_streaming_transcribe()` 参数列表末尾新增可选参数 `prespec_ws_id=None, prespec_seg_id=None`（保留原有参数）；把 `_process_segment()` 中对它的调用改为：
+`_process_segment()` 原本调用 `async_streaming_transcribe(item, segment.asr_state, self.connection_id)`；第三个位置参数 `connection_id` 已经是 `ws_id`，不新增 `prespec_ws_id`。只在模型函数参数列表末尾增加 `prespec_seg_id=None`，把当前段号传入：
 
 ```python
-async for item in self.asr.async_streaming_transcribe(
-    audio, state, prespec_ws_id=ws_id, prespec_seg_id=seg_id,
+async for stream_item in self.asr.async_streaming_transcribe(
+    item, segment.asr_state, self.connection_id,
+    prespec_seg_id=seg_id,
 ):
-    await self._send_stream_item(item)
+    await self._send_stream_item(stream_item)
 ```
 
-这是替换第三节中的原有调用，不是再调用一次转写。如果原调用还有其他参数，全部保留，仅增加上述两个关键字参数；未提交和 commit 后消费完整 chunk 的调用点都要传。模型函数中令 `ws_id = prespec_ws_id`、`seg_id = prespec_seg_id`。下面的 `prefix_version` 明确取 `state.prespec_prefix_version`，初始化和更新见第六节。
+这是第三节同一个调用，不是再调用一次转写。若原调用还有其他参数，全部保留；未提交和 commit 后消费完整 chunk 的调用点都保留原第三参数，并传 `prespec_seg_id`。模型函数内部可令 `ws_id = connection_id`、`seg_id = prespec_seg_id`；`seg_id` 必须取当前段在日志 `seg-N` 中使用的段号，不能从连接 ID 推断。下面的 `prefix_version` 明确取 `state.prespec_prefix_version`，初始化和更新见第六节。
 
 准确的改动位置在每轮 `while len(state.buffer) >= state.chunk_size_samples` **内部**：L475–481 已切块并更新 `state.audio_accum`；L486–518 已算好原 `prefix` 与草稿；在 L520 的 prompt 构造前领取候选。使用 `len(state.audio_accum)` 作为本轮正式完整音频截止。完成 L583–596 的 DELTA 输出迭代和 L601–606 的 `_raw_decoded = prefix + accumulated_delta`、解析及 `chunk_id += 1` 后配对退出。这些现有状态更新仍只在正式路径发生。
 
