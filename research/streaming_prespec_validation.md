@@ -4,7 +4,7 @@
 
 ## 0. 三组配置与共同前提
 
-| 组 | `ASR_PRESPEC_MODE` | 回滚投机 | 含义 |
+| 组 | `--prespec-mode` | 回滚投机 | 含义 |
 |---|---|---|---|
 | A | `off` | 开 | rollback baseline |
 | B | `shadow` | 开 | 后台生成候选，正式请求仍用原回滚草稿 |
@@ -16,7 +16,42 @@ A/B/C 保持同一服务代码、模型、图配置、回滚参数、chunk 长�
 
 以下代码使用 `logger = logging.getLogger(__name__)`；若文件已有 logger，沿用原对象。服务日志格式需带毫秒时间和时区；三个日志来源的主机时钟应同步。日志不记录音频、文本和完整 token 序列，只记录关联键、长度、状态和耗时。
 
-### 1.1 `qwen3_asr_async.py`：模型初始化时接入 probe 和三组开关
+### 1.1 启动 parser → `AsyncLLM()` → `enable_prespec()`
+
+先在服务项目根目录定位已有的 argparse 入口和模型工厂调用，沿用原 parser 与原启动命令：
+
+```bash
+rg -n 'ArgumentParser|parse_args|AsyncLLM\(' qwen_asr
+```
+
+在现有 `parser.parse_args()` **之前**增加两个参数；保留其余已有参数：
+
+```python
+parser.add_argument(
+    "--prespec-mode", choices=("off", "shadow", "consume"), default="off",
+    help="off=rollback baseline; shadow=observe; consume=verify candidate",
+)
+parser.add_argument(
+    "--prespec-admission", choices=("force", "gated"), default="force",
+    help="force for chain checks; gated requires fresh LoadSnapshot",
+)
+```
+
+在同一入口调用 `Qwen3ASRModelAsync.AsyncLLM(...)` 时，**保留全部原实参**并追加：
+
+```python
+prespec_mode=args.prespec_mode,
+prespec_admission=args.prespec_admission,
+```
+
+在 `qwen3_asr_async.py` 的 `AsyncLLM()` 现有类方法签名末尾新增对应的两个可选形参；不能只在调用处传参，否则会得到 `unexpected keyword argument`：
+
+```python
+prespec_mode: str = "off",
+prespec_admission: str = "force",
+```
+
+这里假定现有入口用 `argparse` 且解析结果名为 `args`；若名字不同，只替换该局部变量名。服务启动脚本不在本仓库，无法填写其余既有 CLI 选项。
 
 先在 910B 服务项目根目录核对当前实际签名：
 
@@ -44,7 +79,7 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
     )
 ```
 
-先在 `qwen3_asr_async.py` 顶部加入 `import asyncio`、`import logging`、`import os`、`import time` 和模块级 `logger = logging.getLogger(__name__)`（已有同名导入或 logger 时不要重复）。然后在 `AsyncLLM()` 创建 `model` 后、返回它之前，替换原来的 `model.enable_prespec(...)` 调用。`kmax`、`engine` 和 `chunk_size_sec` 继续使用本函数现有的实际变量；下面代码中的这三个名字要按你的函数局部变量映射：
+先在 `qwen3_asr_async.py` 顶部加入 `import asyncio`、`import logging`、`import time` 和模块级 `logger = logging.getLogger(__name__)`（已有同名导入或 logger 时不要重复）。然后在 `AsyncLLM()` 创建 `model` 后、返回它之前，替换原来的 `model.enable_prespec(...)` 调用。`kmax`、`engine` 和 `chunk_size_sec` 继续使用本函数现有的实际变量；下面代码中的这三个名字要按你的函数局部变量映射：
 
 ```python
 def log_prespec_probe(p):
@@ -55,19 +90,18 @@ def log_prespec_probe(p):
         p.request_id, p.ready_lead_ms,
     )
 
-mode = os.environ.get("ASR_PRESPEC_MODE", "off")
-admission = os.environ.get("ASR_PRESPEC_ADMISSION", "gated")
-if mode not in {"off", "shadow", "consume"}:
-    raise ValueError(f"invalid ASR_PRESPEC_MODE: {mode}")
-if admission not in {"force", "gated"}:
-    raise ValueError(f"invalid ASR_PRESPEC_ADMISSION: {admission}")
+if prespec_mode not in {"off", "shadow", "consume"}:
+    raise ValueError(f"invalid prespec_mode: {prespec_mode}")
+if prespec_admission not in {"force", "gated"}:
+    raise ValueError(f"invalid prespec_admission: {prespec_admission}")
 model.enable_prespec(
-    enabled=(mode != "off"), kmax=kmax, engine=engine,
+    enabled=(prespec_mode != "off"), kmax=kmax, engine=engine,
     chunk_size_sec=chunk_size_sec,
-    admission_mode=admission, shadow_only=(mode != "consume"),
-    on_probe=log_prespec_probe if mode != "off" else None,
+    admission_mode=prespec_admission,
+    shadow_only=(prespec_mode != "consume"),
+    on_probe=log_prespec_probe if prespec_mode != "off" else None,
 )
-logger.info("PRESPEC_CONFIG mode=%s admission=%s", mode, admission)
+logger.info("PRESPEC_CONFIG mode=%s admission=%s", prespec_mode, prespec_admission)
 ```
 
 `on_probe` 是同步回调；这里只做一条格式化日志，不做阻塞采样或文件读写。回调异常被协调器吞掉并计入 `probe_error_count`，因此每轮结束要检查该计数是否为 0。
@@ -188,9 +222,7 @@ rg -n 'PRESPEC_CONFIG|PRESPEC_LAUNCH|PRESPEC_REQUEST|PRESPEC_PROBE|PRESPEC_TARGE
 在 910B 服务项目完成第 1 节的代码接线、复制与语法检查后，按 [主接入说明](streaming_prespec.md) 导入。以服务现有启动命令启动一份 B 组实例：
 
 ```bash
-export ASR_PRESPEC_MODE=shadow
-export ASR_PRESPEC_ADMISSION=force
-<现有服务启动命令>
+<现有服务启动命令> --prespec-mode shadow --prespec-admission force
 ```
 
 使用现有 WebSocket 测试脚本发送**同一段超过 4 秒、在 2 秒正式 chunk 后仍有合法回滚草稿**的音频；这一步并发为 1，不开启自动补位。服务若写日志文件：
@@ -215,18 +247,16 @@ rg -o 'PRESPEC_LAUNCH.*reason=[^ ]+' /path/to/run.log | sort | uniq -c
 对同一批音频保存**每条连接的音频文件、切片顺序、发送时刻和 commit 时刻**。三组分别重启服务并使用同一回放清单：
 
 ```bash
-export ASR_PRESPEC_MODE=off      # A；保持现有回滚投机配置不变
-<现有服务启动命令>
+# A：保持现有回滚投机配置不变
+<现有服务启动命令> --prespec-mode off
 # 使用现有 WebSocket 回放命令，保存客户端事件和服务日志
 
-export ASR_PRESPEC_MODE=shadow   # B；仍用原回滚草稿正式推理
-export ASR_PRESPEC_ADMISSION=force
-<现有服务启动命令>
+# B：正式请求仍用原回滚草稿
+<现有服务启动命令> --prespec-mode shadow --prespec-admission force
 # 同一回放清单
 
-export ASR_PRESPEC_MODE=consume  # C；先仅在固定输入回放中启用消费
-export ASR_PRESPEC_ADMISSION=force
-<现有服务启动命令>
+# C：先仅在固定输入回放中启用消费
+<现有服务启动命令> --prespec-mode consume --prespec-admission force
 # 同一回放清单
 ```
 
@@ -234,7 +264,7 @@ export ASR_PRESPEC_ADMISSION=force
 
 ## 4. 同负载性能对比：A→B、B→C、A→C
 
-先在 B/C 中设置 `export ASR_PRESPEC_ADMISSION=force`，完成初次同负载对比；这一步只能衡量后台请求的收益与干扰，**不能证明低利用率准入策略有效**。分别跑现有 `sustained_test` 的并发档位 `1、5、20`，再扩到拐点附近；每组保持相同音频清单、到达时序、自动补位规则、持续时间和预热。A/B/C 交错排序，至少重复 3 轮，记录实际测试起止 UTC。每轮单独设置 `run_id`、切片服务日志、导出该轮 `commits.jsonl`。导出行须含 `ws_id, seg, received_at, done_at, commit_latency_ms, queue_wait_ms, queue_size, is_empty_commit`；空 commit 不算正式时延。客户端执行命令仍用你现有 `test_v2.py` 的真实 CLI。
+先用 B/C 的 `--prespec-admission force` 完成初次同负载对比；这一步只能衡量后台请求的收益与干扰，**不能证明低利用率准入策略有效**。分别跑现有 `sustained_test` 的并发档位 `1、5、20`，再扩到拐点附近；每组保持相同音频清单、到达时序、自动补位规则、持续时间和预热。A/B/C 交错排序，至少重复 3 轮，记录实际测试起止 UTC。每轮单独设置 `run_id`、切片服务日志、导出该轮 `commits.jsonl`。导出行须含 `ws_id, seg, received_at, done_at, commit_latency_ms, queue_wait_ms, queue_size, is_empty_commit`；空 commit 不算正式时延。客户端执行命令仍用你现有 `test_v2.py` 的真实 CLI。
 
 与负载同时启动旁路采样；下面以 A、并发 20、第一轮为例，`--duration` 应覆盖测试加启停等待：
 
@@ -302,8 +332,8 @@ python streaming_prespec_monitor.py compare \
 接线后重启 B/C 并执行第 4 节**相同命令和负载**，唯一变化是：
 
 ```bash
-export ASR_PRESPEC_ADMISSION=gated
-<现有服务启动命令>
+<现有服务启动命令> --prespec-mode shadow --prespec-admission gated
+# C 组重启时将 shadow 换成 consume，其余服务参数相同。
 ```
 
 从 DEBUG `PRESPEC_LAUNCH reason` 汇总 `missing_load/stale_load/formal_queue_nonempty/utilization_high/insufficient_slack/launched` 的次数，并在正式日志中检查每次 launch 前后及下一个请求的队列等待。若几乎不 launch，结论是“当前门控策略覆盖不足”，不能据此称候选无效；若 launch 后正式 P95/P99 或后续请求排队恶化，收紧门控或停用，不以 NPU 利用率上升替代时延证据。

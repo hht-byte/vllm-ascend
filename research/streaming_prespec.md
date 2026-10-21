@@ -112,6 +112,8 @@ return model
 
 若原代码已是 `model = ...; return model`，只在 `return model` 前插入 `model.enable_prespec(...)`。`AsyncLLM()` 是类方法，不能在这里写 `self.prespec = ...`。这里的 `kmax` 是待映射到现有局部变量的名称，不是要求再读一次配置。初始化必须在 `set_asr(model)` 之前完成；不要运行中再次调用此方法，否则连接持有的旧协调器引用不会自动更新。
 
+上面的 `enabled=False` 是完成适配前的静态安全起点。A/B/C 验证时，按 [验证手册第 1.1 节](streaming_prespec_validation.md) 从现有启动 parser 的 `--prespec-mode`、`--prespec-admission` 传到 `AsyncLLM()`，再调用本方法；不要同时保留这个写死的 `enabled=False` 调用，也不要把两个新参数直接传给 vLLM engine 构造函数。
+
 #### 步骤 4：`websocket_router.py` 不修改
 
 明确到函数：
