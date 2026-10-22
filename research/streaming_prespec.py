@@ -10,10 +10,14 @@ module never modifies authoritative state or chooses cached audio/KV ranges.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Literal, Protocol, Sequence
 from uuid import uuid4
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -513,6 +517,16 @@ class PreSpecCoordinator:
                                        target_continuation_tokens)
         draft_match = matched_prefix_len(candidate.formal_draft_token_ids,
                                          target_continuation_tokens[1:])
+        logger.info(
+            "PRESPEC_MATCH_TOKENS ws_id=%s seg=%s window=%s mode=%s "
+            "candidate_token_ids=%s target_token_ids=%s target_len=%s "
+            "raw_matched_prefix_tokens=%s",
+            key[0], key[1], key[2],
+            "shadow" if self.shadow_only else "consume",
+            candidate.token_ids,
+            tuple(target_continuation_tokens[:len(candidate.token_ids)]),
+            len(target_continuation_tokens), raw_match,
+        )
         return Evaluation(
             key[0], key[1], key[2], candidate.token_ids,
             raw_matched_prefix_tokens=raw_match,

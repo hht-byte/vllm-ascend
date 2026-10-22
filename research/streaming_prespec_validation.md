@@ -280,6 +280,8 @@ finally:
 
 这段仅展示采集与统计挂点，不能替换原函数的其他实参或原有状态写回。只有观察到 `output.finished` 才传入 token 列表；中断/取消时传 `None`，避免把部分输出或尚未采集的 `()` 算作 0 匹配。完成且确实生成 0 个 token 时，空元组才是有效观测；此时 `target_len=0`，不能解释为候选首 token 不匹配。`raw_matched_prefix_tokens` 比较候选完整原始输出与正式完整原始输出。`draft_matched_prefix_tokens` 比较实际拟提交的候选 `token_ids[1:]` 与正式输出的 `token_ids[1:]`，跳过两个请求各自采样的首 token；例如候选 `(19, 20, 21)`、正式 `(99, 20, 22)` 时，两个值分别是 0 和 1。两者都是 shadow 离线匹配指标，**都不是引擎 verifier 的实际草稿接受数**；后者仍从 verifier 打点取得。候选和正式请求必须使用相同的输出 token 对齐起点（prompt 之后），且这里假设正式请求只有一个 completion。
 
+协调器收到完整的 `target_continuation_tokens` 且已选中候选时，会另外打印 `PRESPEC_MATCH_TOKENS`。`candidate_token_ids` 是候选完整原始输出；`target_token_ids` 是从正式原始输出开头截取的**相同长度**序列，`target_len` 是正式输出的实际总长度。按位置对照两列即可看到 `raw_matched_prefix_tokens` 个相同 token 后的首个差异。例如 `candidate_token_ids=(19, 20, 21, 22)`、`target_token_ids=(19, 20, 99, 77)`、`target_len=5`、`raw_matched_prefix_tokens=2`，表示前两项相同，第三项 `21` 与 `99` 不同，正式输出还有一个未显示的 token。日志的 `mode=shadow/consume` 标明正式请求是否使用候选；consume 模式下两组序列的匹配不代表无候选的 baseline 结果。若未采集正式 token、正式生成中断，或没有就绪候选，就不会出现该日志。它同样不是 verifier 接受数。
+
 日志关联以 `ws_id + seg + chunk` 为正式键，以 `prespec-...` 为 shadow 引擎请求键；不要把不同 request 的 prefill/decode 打点混在一起。`PRESPEC_PROBE status=ready_consumed` 发生在正式验证**之前**，不能代替 verifier 日志。
 
 先把本仓库的两个模块复制到服务的 `qwen_asr/inference/`，并**在同一次部署中**按主接入文档更新连接层、模型包装函数和正式 chunk 的 `window_id` 实参。新协调器要求 `begin_authoritative_chunk`、`end_authoritative_chunk`、`begin_formal`、`finish_formal` 携带窗口 ID；只替换模块而保留旧调用会报错。监测脚本复制到测试工作目录；若两仓库在同一主机上，在服务项目根目录执行（替换检出路径）：

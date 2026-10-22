@@ -241,6 +241,30 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evaluation.draft_matched_prefix_tokens, 2)
         await coordinator.close_session("ws-1")
 
+    async def test_match_log_shows_both_token_sequences_through_first_difference(self):
+        async def producer(request, budget):
+            return (19, 20, 21, 22)
+
+        coordinator = PreSpecCoordinator(
+            producer, replace(self.policy, max_candidate_tokens=4),
+            clock=lambda: self.now)
+        self.assertTrue(coordinator.maybe_start(
+            self.request(), self.load(), predicted_draft_ms=200).launched)
+        await asyncio.sleep(0)
+        coordinator.begin_authoritative_chunk(
+            "ws-1", audio_epoch=1, window_id=0, prefix_version=2,
+            full_audio_end_samples=64_000)
+        with self.assertLogs("streaming_prespec", level="INFO") as captured:
+            coordinator.end_authoritative_chunk(
+                "ws-1", audio_epoch=1, window_id=0,
+                target_continuation_tokens=(19, 20, 99, 77, 55))
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("candidate_token_ids=(19, 20, 21, 22)", captured.output[0])
+        self.assertIn("target_token_ids=(19, 20, 99, 77)", captured.output[0])
+        self.assertIn("target_len=5", captured.output[0])
+        self.assertIn("raw_matched_prefix_tokens=2", captured.output[0])
+        await coordinator.close_session("ws-1")
+
     async def test_same_segment_starts_a_new_candidate_for_each_chunk_window(self):
         launched_windows = []
         probes = []
