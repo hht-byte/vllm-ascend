@@ -8,10 +8,13 @@ See streaming_prespec.md section 4 for the one service-specific extraction.
 from __future__ import annotations
 
 import asyncio
+import logging
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 if __package__:
     from .streaming_prespec import LaunchDecision, ShadowRequest
@@ -71,8 +74,27 @@ class PreSpecModelHelpers:
             return LaunchDecision(False, "formal_chunk_due")
         if not rollback_draft_token_ids:
             return LaunchDecision(False, "no_rollback_draft")
-        if coordinator.policy.max_candidate_tokens < 2:
-            return LaunchDecision(False, "budget_too_small")
+        draft_len = len(rollback_draft_token_ids)
+        if draft_len > coordinator.policy.max_rollback_draft_tokens:
+            if coordinator.should_log_budget_skip(
+                    ws_id, seg_id, "rollback_draft_exceeds_kmax"):
+                logger.info(
+                    "PRESPEC_SKIP ws_id=%s seg=%s reason=rollback_draft_exceeds_kmax "
+                    "draft_tokens=%s kmax=%s",
+                    ws_id, seg_id, draft_len,
+                    coordinator.policy.max_rollback_draft_tokens,
+                )
+            return LaunchDecision(False, "rollback_draft_exceeds_kmax")
+        if draft_len + 2 > coordinator.policy.max_candidate_tokens:
+            if coordinator.should_log_budget_skip(
+                    ws_id, seg_id, "candidate_budget_insufficient"):
+                logger.info(
+                    "PRESPEC_SKIP ws_id=%s seg=%s reason=candidate_budget_insufficient "
+                    "draft_tokens=%s candidate_budget=%s required=%s",
+                    ws_id, seg_id, draft_len,
+                    coordinator.policy.max_candidate_tokens, draft_len + 2,
+                )
+            return LaunchDecision(False, "candidate_budget_insufficient")
         # Take the time before copying so snapshot overhead consumes the budget.
         deadline_ns = coordinator.clock() + int(
             (chunk_size_samples - new_samples) / 16000 * 1e9)
@@ -97,6 +119,10 @@ class PreSpecModelHelpers:
         return coordinator.maybe_start(request, load, predicted_draft_ms)
 
     def _build_stream_request(self, request, budget):
+        if len(request.rollback_tokens) > self.prespec.policy.max_rollback_draft_tokens:
+            raise ValueError("rollback draft exceeds engine kmax")
+        if len(request.rollback_tokens) + 2 > budget:
+            raise ValueError("candidate budget cannot cover first token, old draft and extension")
         params = deepcopy(request.sampling_params)
         params.max_tokens = budget
         params.min_tokens = 0
@@ -109,7 +135,7 @@ class PreSpecModelHelpers:
             full_audio_pcm_f32le=request.audio_pcm_f32le,
             prefix_text=request.prefix_text,
             stable_prefix_token_ids=list(request.stable_prefix_tokens),
-            draft_token_ids=list(request.rollback_tokens[:budget - 1]),
+            draft_token_ids=list(request.rollback_tokens),
             model_context=deepcopy(request.model_context),
             sampling_params=params,
         )

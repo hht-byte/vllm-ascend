@@ -55,7 +55,8 @@ class AdmissionPolicy:
     cancel_margin_ms: float = 100.0
     safety_guard_ms: float = 100.0
     max_active_shadows: int = 1
-    max_candidate_tokens: int = 8
+    max_rollback_draft_tokens: int = 8
+    max_candidate_tokens: int = 9
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,11 @@ class Candidate:
     visible_audio_end_samples: int
     token_ids: tuple[int, ...]
     ready_ns: int
+
+    @property
+    def formal_draft_token_ids(self) -> tuple[int, ...]:
+        """The pasted proposer consumes drafts after target's first sampled token."""
+        return self.token_ids[1:]
 
 
 @dataclass(frozen=True)
@@ -104,8 +110,9 @@ ProbeSink = Callable[[CandidateProbe], None]
 
 @dataclass(frozen=True)
 class VerifiedRollback:
-    """Corrected rollback suffix plus adapter-owned shadow continuation state."""
+    """First sampled token, corrected old suffix, and shadow continuation state."""
 
+    first_sampled_token: int
     token_ids: tuple[int, ...]
     continuation_state: object
 
@@ -140,27 +147,32 @@ class RepairExtendProducer:
 
     async def __call__(self, request: ShadowRequest,
                        max_candidate_tokens: int) -> tuple[int, ...]:
+        if len(request.rollback_tokens) + 2 > max_candidate_tokens:
+            raise ValueError("candidate budget cannot cover first token, old draft and extension")
         branch = await self.backend.open_shadow(request)
         try:
             verified = await branch.verify_and_repair_old(
-                request.rollback_tokens[:max_candidate_tokens],
+                request.rollback_tokens,
                 max_candidate_tokens)
             if not isinstance(verified, VerifiedRollback):
                 raise TypeError("rollback verifier must return VerifiedRollback")
+            if (not isinstance(verified.first_sampled_token, int)
+                    or verified.first_sampled_token < 0):
+                raise ValueError("rollback verifier returned invalid first token")
             if verified.continuation_state is None:
                 raise ValueError("rollback verifier returned no continuation state")
             old = verified.token_ids
             if not isinstance(old, tuple) or not all(
                     isinstance(token, int) and token >= 0 for token in old):
                 raise ValueError("rollback verifier returned invalid token IDs")
-            if len(old) > max_candidate_tokens:
-                raise ValueError("repaired old suffix exceeds candidate budget")
-            remaining = max_candidate_tokens - len(old)
+            if len(old) + 1 >= max_candidate_tokens:
+                raise ValueError("repaired old suffix leaves no continuation budget")
+            remaining = max_candidate_tokens - 1 - len(old)
             extension = (tuple(await branch.extend_from_verified(verified, remaining))
                          if remaining else ())
             if len(extension) > remaining:
                 raise ValueError("new continuation exceeds candidate budget")
-            return old + extension
+            return (verified.first_sampled_token,) + old + extension
         finally:
             await branch.close()
 
@@ -182,6 +194,8 @@ class PreSpecCoordinator:
         self.policy = policy
         if policy.admission_mode not in ("gated", "force"):
             raise ValueError("admission_mode must be gated or force")
+        if policy.max_rollback_draft_tokens <= 0 or policy.max_candidate_tokens <= 0:
+            raise ValueError("draft and candidate budgets must be positive")
         self.clock = clock
         self.shadow_only = shadow_only
         self.on_probe = on_probe
@@ -195,6 +209,15 @@ class PreSpecCoordinator:
         self._selected_at_ns: dict[tuple[str, int], int] = {}
         self._active_formals: dict[str, int] = {}
         self._active_chunks: dict[str, int] = {}
+        self._logged_budget_skips: set[tuple[str, int, str]] = set()
+
+    def should_log_budget_skip(self, session_id: str, audio_epoch: int,
+                               reason: str) -> bool:
+        key = (session_id, audio_epoch, reason)
+        if key in self._logged_budget_skips:
+            return False
+        self._logged_budget_skips.add(key)
+        return True
 
     def maybe_start(self, request: ShadowRequest, load: LoadSnapshot | None,
                     predicted_draft_ms: float) -> LaunchDecision:
@@ -203,6 +226,10 @@ class PreSpecCoordinator:
         now = self.clock()
         if request.window_audio_samples < self.policy.midpoint_samples:
             return LaunchDecision(False, "before_midpoint")
+        if len(request.rollback_tokens) > self.policy.max_rollback_draft_tokens:
+            return LaunchDecision(False, "rollback_draft_exceeds_kmax")
+        if len(request.rollback_tokens) + 2 > self.policy.max_candidate_tokens:
+            return LaunchDecision(False, "candidate_budget_insufficient")
         if key in self._launched or key in self._begun:
             return LaunchDecision(False, "epoch_already_used")
         if self._active_formals.get(request.session_id, 0):
@@ -354,6 +381,13 @@ class PreSpecCoordinator:
                 or candidate.visible_audio_end_samples > full_audio_end_samples):
             self._emit_probe(key, boundary, started_ns, "audio_mismatch", candidate)
             return None
+        if not candidate.formal_draft_token_ids:
+            self._emit_probe(key, boundary, started_ns, "candidate_no_draft", candidate)
+            return None
+        if len(candidate.formal_draft_token_ids) > self.policy.max_rollback_draft_tokens:
+            self._emit_probe(key, boundary, started_ns,
+                             "candidate_exceeds_kmax", candidate)
+            return None
         self._selected[key] = candidate
         self._selected_at_ns[key] = started_ns
         self._emit_probe(key, boundary, started_ns,
@@ -435,3 +469,6 @@ class PreSpecCoordinator:
                                 if key[0] != session_id}
         self._active_formals.pop(session_id, None)
         self._active_chunks.pop(session_id, None)
+        self._logged_budget_skips = {
+            key for key in self._logged_budget_skips if key[0] != session_id
+        }

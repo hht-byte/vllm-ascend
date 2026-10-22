@@ -56,16 +56,18 @@ from qwen_asr.inference.streaming_prespec_helpers import (
 
 ```python
 def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
-                   candidate_tokens=8, on_probe=None,
+                   candidate_tokens=None, on_probe=None,
                    admission_mode="force", shadow_only=True):
     # 仅在服务启动、连接尚未创建时调用一次。
     self.prespec = None
     if not enabled:
         return
-    if kmax <= 0 or candidate_tokens <= 0 or chunk_size_sec <= 0:
+    if kmax <= 0 or chunk_size_sec <= 0:
         raise ValueError("prespec requires positive kmax, budget and chunk size")
-    if min(kmax, candidate_tokens) < 2:
-        raise ValueError("prespec needs one draft and one continuation token")
+    if candidate_tokens is None:
+        candidate_tokens = kmax + 1
+    if candidate_tokens < 3:
+        raise ValueError("candidate budget needs first token, draft and continuation")
     midpoint_samples = int(chunk_size_sec * 16000 / 2)
     if midpoint_samples <= 0:
         raise ValueError("prespec midpoint must contain at least one sample")
@@ -78,7 +80,8 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
         policy=AdmissionPolicy(
             admission_mode=admission_mode,
             midpoint_samples=midpoint_samples,
-            max_candidate_tokens=min(candidate_tokens, kmax),
+            max_rollback_draft_tokens=kmax,
+            max_candidate_tokens=candidate_tokens,
             max_active_shadows=1,
         ),
         shadow_only=shadow_only,
@@ -86,7 +89,9 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
     )
 ```
 
-这个方法创建协调器并保存 engine 引用。`admission_mode="force"`、`shadow_only=True` 是初次受控实验的默认值；验证手册中的环境变量调用会显式覆盖它们。`self._run_prespec` 已由 mixin 提供；第四节的 `_pack_stream_request` 接到已有实现前仍使用 `enabled=False`。`on_probe` 可传现有非阻塞日志回调；未传时不会自动输出 probe 日志。
+这个方法创建协调器并保存 engine 引用。`admission_mode="force"`、`shadow_only=True` 是初次受控实验的默认值；验证手册使用启动 parser 参数显式覆盖。`kmax` 是引擎 proposer 能接收的 external draft 上限，`candidate_tokens` 是 shadow 请求的 `max_tokens`，不再用 `min(candidate_tokens, kmax)` 混成一个预算。默认候选预算为 `kmax+1`：第一个位置由 target 采样，后面最多 `kmax` 个候选 token 可供正式请求提交。旧草稿加首 token、至少一个续写 token 放不下时会跳过。显式设置更大的候选预算时，若最终可提交的候选后缀超过 `kmax`，正式边界会返回 `candidate_exceeds_kmax`，避免 proposer 再次静默截断。`self._run_prespec` 已由 mixin 提供；第四节的 `_pack_stream_request` 接到已有实现前仍使用 `enabled=False`。`on_probe` 可传现有非阻塞日志回调；未传时不会自动输出 probe 日志。
+
+例如引擎 `kmax=8`、默认候选预算 9 时，旧回滚草稿最多 7 个 token 才能同时给首 token 和至少一个新续写留位置；长度恰为 8 时返回 `candidate_budget_insufficient`。把预算改为 10 虽可启动这条 shadow，但若它真输出 10 个 token，正式可提交后缀长 9，仍会以 `candidate_exceeds_kmax` 跳过。要让完整旧草稿和新续写都可提交，必须增大引擎的 `kmax` 或缩短原回滚草稿；不能在服务端静默截断旧草稿。
 
 #### 步骤 3：修改 `AsyncLLM()` 的返回位置
 
@@ -114,7 +119,7 @@ return model
 
 上面的 `enabled=False` 是完成适配前的静态安全起点。A/B/C 验证时，按 [验证手册第 1.1 节](streaming_prespec_validation.md) 从现有启动 parser 的 `--prespec-mode`、`--prespec-admission` 传到 `AsyncLLM()`，再调用本方法；不要同时保留这个写死的 `enabled=False` 调用，也不要把两个新参数直接传给 vLLM engine 构造函数。
 
-你当前的工厂调用是 `Qwen3ASRModelAsync.AsyncLLM(**base_config)`；验证手册给出的实际改法是在这一次调用中追加 `prespec_mode=args.prespec_mode`、`prespec_admission=args.prespec_admission`，并由 `AsyncLLM()` 的显式形参接收。`base_config` 保持原用途，不向 vLLM engine 透传这两个服务侧参数。
+你当前的工厂调用是 `Qwen3ASRModelAsync.AsyncLLM(**base_config)`；验证手册给出的实际改法是在这一次调用中追加 `prespec_mode=args.prespec_mode`、`prespec_admission=args.prespec_admission`、`prespec_candidate_tokens=args.prespec_candidate_tokens`，并由 `AsyncLLM()` 的显式形参接收。`base_config` 保持原用途，不向 vLLM engine 透传这些服务侧参数。
 
 #### 步骤 4：`websocket_router.py` 不修改
 
@@ -227,21 +232,22 @@ new_audio_samples = current_audio_end_samples - last_formal_audio_end_samples
 |---|---|---|
 | `prefix_text` / `stable_prefix_token_ids` | L486–518 从 `state._raw_decoded` 得到的前缀文本及对应 token IDs；固定前缀阶段 `prefix_text=""` | 实际 prompt 文本仍按 `state.prompt_raw + prefix_text` 构造；token IDs 用于快照记录，不自行拼到多模态 prompt |
 | `rollback_draft_token_ids` | 上一轮输出中，本次需要重新验证的回滚后缀 | 已实现的 external draft 字段 |
-| `candidate_token_ids` | 用当前完整音频验证、修正旧草稿后，继续生成得到的后缀 | 仅暂存；下一正式请求可把它作为 external draft 再验证 |
+| `candidate_token_ids` | shadow 请求的完整原始输出，含其首个 sampled token | 仅暂存；下一正式请求只把 `candidate_token_ids[1:]` 作为 external draft |
 
 “保留前缀”只描述当前回滚算法的拆分，不额外声称这些文本永远不会变化。协调器原有字段 `stable_prefix_tokens`、`rollback_tokens`、`Candidate.token_ids` 分别记录前缀 IDs、回滚草稿和候选。`prefix_text` 在模型扩展快照中单独保存：正式请求原本拼的是文本，不能由 token IDs 猜测或重新解码来代替。
 
-例如，保留前缀为 `[10, 11]`，旧草稿为 `[20, 21]`。当前音频下引擎接受 `20`、把 `21` 修正为 `99`，然后生成 `30`：
+例如，保留前缀为 `[10, 11]`，旧草稿为 `[21, 22]`。当前音频下 shadow target 先采样 `20`，随后验证 `21`、把 `22` 修正为 `99`，然后生成 `30`：
 
 ```text
 输入：完整累计音频 [0, 3s]
       prompt 中的保留前缀 [10, 11]
-      external draft    [20, 21]
-引擎：验证 20 → 修正 21 为 99 → 在 [10, 11, 20, 99] 上继续生成 30
-返回：candidate_token_ids = (20, 99, 30)
+      external draft    [21, 22]
+引擎：先采样 20 → 验证 21 → 修正 22 为 99 → 继续生成 30
+返回：candidate_token_ids = (20, 21, 99, 30)
+正式请求提交的 external draft = (21, 99, 30)
 ```
 
-候选既不包含 `[10, 11]`，也不保留被拒绝的 `21`。**验证与续写在同一次 engine 请求中完成**；服务不拆成两次请求，不自行重建验证后的 KV。总预算包括“接受/修正旧草稿的 token + 新续写 token”；`_build_stream_request` 把草稿最多截到 `budget-1`，至少留一个输出 token 的空间。EOS 或提前取消仍可能没有续写。
+候选既不包含 `[10, 11]`，也不保留被拒绝的 `22`。**验证与续写在同一次 engine 请求中完成**；服务不拆成两次请求，不自行重建验证后的 KV。对用户给出的 proposer，target 先采样首 token，再提出 external draft；因此启动前要求 `candidate_tokens >= 1 + len(rollback_draft_token_ids) + 1`，分别为首 token、完整旧草稿和至少一个新续写位置。旧草稿超过 `kmax` 返回 `rollback_draft_exceeds_kmax`，预算不足返回 `candidate_budget_insufficient`；不再截掉草稿尾部。shadow 原始输出的首 token **只在正式提交时去掉一次**，旧回滚草稿已经按原规则去首，不能再去。这个检查是**静态上限**，EOS、修正或提前取消仍可能没有续写，实际 proposer 还可能因模型上下文不足缩短草稿，需要在 910B 核实有效长度和首 token 对齐。
 
 #### 4.2 哪些已提供，哪些必须从你的函数搬出
 
@@ -250,7 +256,7 @@ new_audio_samples = current_audio_end_samples - last_formal_audio_end_samples
 | 方法 | 已实现的代码 | 你需要修改的部分 |
 |---|---|---|
 | `try_start_prespec(...)` | 中点/队列检查、独立输入快照、截止时间、`maybe_start` | 调用处用 `audio_accum + buffer` 形成快照，按 L486–518 取得下次前缀和草稿，见 4.5 |
-| `_build_stream_request(request, budget)` | 请求级采样参数副本、预算、调用原有打包逻辑、独立 request ID；为续写预留至少一个输出 token | 提供下面的 `_pack_stream_request` |
+| `_build_stream_request(request, budget)` | 请求级采样参数副本、完整旧草稿、独立 request ID；提交前再次检查预算 | 提供下面的 `_pack_stream_request` |
 | `_run_prespec(request, budget)` | `generate`、累计输出收集、截止时间、异常/取消时 abort 与关闭迭代器 | 初始化时传入已有 engine；若本地 fork 改了输出接口，按 4.6 核对 |
 
 **从 `async_streaming_transcribe()` 提取两段只读逻辑。** 草稿拆分一段单独复用，请求打包一段放进 `_pack_stream_request`：
@@ -317,10 +323,13 @@ stream = engine.generate(**request_kwargs, request_id=formal_request_id)
 
 ```python
 import asyncio
+import logging
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 if __package__:
     from .streaming_prespec import LaunchDecision, ShadowRequest
@@ -380,8 +389,27 @@ class PreSpecModelHelpers:
             return LaunchDecision(False, "formal_chunk_due")
         if not rollback_draft_token_ids:
             return LaunchDecision(False, "no_rollback_draft")
-        if coordinator.policy.max_candidate_tokens < 2:
-            return LaunchDecision(False, "budget_too_small")
+        draft_len = len(rollback_draft_token_ids)
+        if draft_len > coordinator.policy.max_rollback_draft_tokens:
+            if coordinator.should_log_budget_skip(
+                    ws_id, seg_id, "rollback_draft_exceeds_kmax"):
+                logger.info(
+                    "PRESPEC_SKIP ws_id=%s seg=%s reason=rollback_draft_exceeds_kmax "
+                    "draft_tokens=%s kmax=%s",
+                    ws_id, seg_id, draft_len,
+                    coordinator.policy.max_rollback_draft_tokens,
+                )
+            return LaunchDecision(False, "rollback_draft_exceeds_kmax")
+        if draft_len + 2 > coordinator.policy.max_candidate_tokens:
+            if coordinator.should_log_budget_skip(
+                    ws_id, seg_id, "candidate_budget_insufficient"):
+                logger.info(
+                    "PRESPEC_SKIP ws_id=%s seg=%s reason=candidate_budget_insufficient "
+                    "draft_tokens=%s candidate_budget=%s required=%s",
+                    ws_id, seg_id, draft_len,
+                    coordinator.policy.max_candidate_tokens, draft_len + 2,
+                )
+            return LaunchDecision(False, "candidate_budget_insufficient")
         # Take the time before copying so snapshot overhead consumes the budget.
         deadline_ns = coordinator.clock() + int(
             (chunk_size_samples - new_samples) / 16000 * 1e9)
@@ -406,6 +434,10 @@ class PreSpecModelHelpers:
         return coordinator.maybe_start(request, load, predicted_draft_ms)
 
     def _build_stream_request(self, request, budget):
+        if len(request.rollback_tokens) > self.prespec.policy.max_rollback_draft_tokens:
+            raise ValueError("rollback draft exceeds engine kmax")
+        if len(request.rollback_tokens) + 2 > budget:
+            raise ValueError("candidate budget cannot cover first token, old draft and extension")
         params = deepcopy(request.sampling_params)
         params.max_tokens = budget
         params.min_tokens = 0
@@ -418,7 +450,7 @@ class PreSpecModelHelpers:
             full_audio_pcm_f32le=request.audio_pcm_f32le,
             prefix_text=request.prefix_text,
             stable_prefix_token_ids=list(request.stable_prefix_tokens),
-            draft_token_ids=list(request.rollback_tokens[:budget - 1]),
+            draft_token_ids=list(request.rollback_tokens),
             model_context=deepcopy(request.model_context),
             sampling_params=params,
         )
@@ -467,7 +499,7 @@ class PreSpecModelHelpers:
 
 - `try_start_prespec` 是同步函数，只调用 `maybe_start` 创建后台 task；它不会等待生成，也不会推进上次正式音频截止位置。
 - `ModelShadowRequest` 在通用 `ShadowRequest` 上补了 `model_context/sampling_params`。创建时深拷贝小配置、音频转 bytes、token 转 tuple；它不持有真实 state。
-- `_build_stream_request` 给每次 shadow 建立参数副本，设置累计输出、单序列及总 token 上限；已有回滚草稿最多传入该上限。
+- `_build_stream_request` 给每次 shadow 建立参数副本，设置累计输出、单序列及总 token 上限；已有回滚草稿完整传入，预算不足时跳过。
 - `_run_prespec` 只取引擎给出的**已验证输出**，累计输出用覆盖赋值，不重复拼接；流异常结束时不发布半截候选。
 - 提前 commit/正式 chunk 导致取消时，只 abort 自己的 `prespec-...` 请求。到预估下一正式提交时间仍未结束也会取消；正式路径没有 await shadow 的操作。
 
@@ -558,6 +590,8 @@ helper 使用 `engine.generate(**kwargs)` 返回异步生成器、`await engine.
 
 普通 vLLM 输出不包含 prompt token，因此代码没有再切掉 `len(stable_prefix_token_ids)`；否则会丢失候选开头。引擎完成标记之后才发布候选。若你修改过输出为“整个序列”或只报告增量，先还原此合同。
 
+按你提供的 external proposer，`propose(sampled_token_ids, ...)` 在 target 已经采样首 token 后运行，返回的 draft 被接在这些 `sampled_ids` 后面。故旧回滚草稿沿用 `_split_stream_rollback()` 已去首的结果；shadow `RequestOutput.token_ids` 是原始生成序列，正式请求使用 `Candidate.formal_draft_token_ids`（即 raw `[1:]`）。这一步是根据所给 proposer 代码作出的对齐推断：在 910B 用首 token ID、原始候选长度、提交草稿长度与 verifier 有效草稿长度核对；`max_model_len` 不足时 proposer 仍可能截短草稿。
+
 shadow 不调用正式转写/finish/`_yield_delta_text`，不发送客户端事件、不修改正式 state；引擎全局统计仍可能包含 shadow，需按 request ID 单独分析。
 
 本地 mock 用例覆盖完整音频、输入隔离、旧草稿传递、纠正后输出的收集、累计输出去重、跳过条件、取消及异常清理。**它验证适配逻辑，不证明真实 verifier 已正确执行，也不证明 910B 上的时延收益。** 实际服务接通后还需看一次旧草稿被拒绝后继续 decode 的日志，并比较 baseline/probe 正式 P95/P99。
@@ -595,7 +629,7 @@ if prespec is not None:
         full_audio_end_samples=this_chunk_audio_end,
     )
 try:
-    draft_token_ids = (candidate.token_ids if candidate is not None
+    draft_token_ids = (candidate.formal_draft_token_ids if candidate is not None
                        else rollback_draft_token_ids)
     # L520–554：原 prompt_raw + prefix 和 adapter/TokensPrompt 分支。
     # 提前构造 L559–568 的正式 SamplingParams，用 draft_token_ids 写入
@@ -612,7 +646,7 @@ finally:
 
 上段是**插入位置示意**：注释所列的 L520–606 必须保留原函数实际代码，不能把注释当作代码替换。最小版不采集正式请求的原始 token IDs，也不修改 `_yield_delta_text()`。`end_authoritative_chunk()` 不传 `target_continuation_tokens` 时只清理候选，返回 `None`；不得把缺失的对照数据记作“接受 0 个 token”。若需要离线候选质量评估，按 [验证手册的可选采集挂点](streaming_prespec_validation.md) 从正式请求的 DELTA 输出流收集 token IDs；不能初始化 `raw_target_tokens = ()` 后不更新便传入。`try/finally` 覆盖 L557–606 以及真正的生成迭代；清理调用者时显式退出生成器，使 finally 执行。
 
-`shadow_only=True` 时 candidate 恒为 None，正式路径仍用原回滚草稿；协调器只记录候选是否赶上正式边界，不计算 token 匹配率。切换消费模式后，预投机候选仍经过现有 verifier 在完整正式音频上重新验证；实际接受数从引擎 verifier 日志获取。
+`shadow_only=True` 时 candidate 恒为 None，正式路径仍用原回滚草稿；协调器只记录候选是否赶上正式边界，不计算 token 匹配率。若候选只有首 token、无可提交后续 token，probe 为 `candidate_no_draft`；若后续 token 长度超过 `kmax`，probe 为 `candidate_exceeds_kmax`，两者都不进入正式请求。切换消费模式后，预投机候选仍经过现有 verifier 在完整正式音频上重新验证；实际接受数从引擎 verifier 日志获取。
 
 ### 六、commit 与清理：给出插入代码和字段初始化
 
@@ -692,7 +726,7 @@ if self.prespec is not None:
 
 要覆盖每个 2 s 窗口，下一步需把 `(ws, seg, chunk/window)` 候选 epoch 与段级 commit 生命周期拆开，并在每次 chunk 结束回收对应 epoch。**仅把 `audio_epoch=seg` 改成 `chunk_id` 不够**：chunk 可能跨段重号，且现有 finish_formal 不会回收所有窗口。此改动不属于本次文档适配，当前代码仍是每段一次接口。
 
-首次用共享的单个协调器、一个 active shadow、`shadow_only=True`、预算不超过 kmax。受控低并发实验可用 `admission_mode="force"` 和现有旁路监测，先打通链路；它不保证不干扰正式时延。在线 `gated` 模式仍需新鲜队列/利用率和实测耗时预算，约 2 s 的 `npu-smi` 读数不能冒充默认 200 ms 的 admission 读数。
+首次用共享的单个协调器、一个 active shadow、`shadow_only=True`、默认候选预算为 `kmax+1`。受控低并发实验可用 `admission_mode="force"` 和现有旁路监测，先打通链路；它不保证不干扰正式时延。在线 `gated` 模式仍需新鲜队列/利用率和实测耗时预算，约 2 s 的 `npu-smi` 读数不能冒充默认 200 ms 的 admission 读数。
 
 验收只保留直接相关的检查：
 

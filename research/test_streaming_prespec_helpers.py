@@ -34,8 +34,10 @@ class FakeEngine:
                 raise RuntimeError("engine failure")
             if self.mode == "truncated":
                 return
+            final_ids = ([19, 20, 21, 22, 30] if self.mode == "full_budget"
+                         else [20, 99, 30])
             yield SimpleNamespace(finished=True, outputs=[
-                SimpleNamespace(token_ids=[20, 99, 30], finish_reason="length")])
+                SimpleNamespace(token_ids=final_ids, finish_reason="length")])
         finally:
             self.closed.append(kwargs["request_id"])
 
@@ -44,11 +46,13 @@ class FakeEngine:
 
 
 class Model(PreSpecModelHelpers):
-    def __init__(self, engine):
+    def __init__(self, engine, *, kmax=3, candidate_budget=5):
         self.prespec_engine = engine
         self.prespec = PreSpecCoordinator(
             self._run_prespec,
-            AdmissionPolicy(admission_mode="force", max_candidate_tokens=3),
+            AdmissionPolicy(admission_mode="force",
+                            max_rollback_draft_tokens=kmax,
+                            max_candidate_tokens=candidate_budget),
             shadow_only=False,
         )
 
@@ -101,6 +105,7 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
                 "ws-test", audio_epoch=1, prefix_version=2,
                 full_audio_end_samples=64000)
             self.assertEqual(candidate.token_ids, (20, 99, 30))
+            self.assertEqual(candidate.formal_draft_token_ids, (99, 30))
             call = engine.calls[0]
             self.assertEqual(len(call["prompt"]["audio"]), 48000 * 4)
             self.assertEqual(call["prompt"]["audio"][0], 1)
@@ -108,7 +113,7 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(call["prompt"]["prefix_ids"], [10])
             self.assertEqual(call["prompt"]["context"]["context"], ["original"])
             self.assertEqual(call["test_draft"], [20, 21])
-            self.assertEqual(call["sampling_params"].max_tokens, 3)
+            self.assertEqual(call["sampling_params"].max_tokens, 5)
             self.assertEqual(call["sampling_params"].min_tokens, 0)
             self.assertEqual(call["sampling_params"].output_kind,
                              OutputKind.CUMULATIVE)
@@ -150,7 +155,7 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
         pending[0] = 1
         self.assertEqual(np.frombuffer(audio, dtype="<f4")[32000], -0.5)
 
-    async def test_draft_length_reserves_at_least_one_continuation_token(self):
+    async def test_old_draft_is_sent_whole_with_separate_output_budget(self):
         engine = FakeEngine()
         model = Model(engine)
         inputs = self.inputs()
@@ -158,7 +163,55 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(model.try_start_prespec(**inputs).launched)
         await engine.started.wait()
         await model.prespec.close_session("ws-test")
-        self.assertEqual(engine.calls[0]["test_draft"], [20, 21])
+        self.assertEqual(engine.calls[0]["test_draft"], [20, 21, 22])
+        self.assertEqual(engine.calls[0]["sampling_params"].max_tokens, 5)
+
+    async def test_oversized_old_draft_is_skipped_before_engine_submission(self):
+        engine = FakeEngine()
+        model = Model(engine)
+        inputs = self.inputs()
+        inputs["rollback_draft_token_ids"] = [20, 21, 22, 23]
+        with self.assertLogs("streaming_prespec_helpers", level="INFO") as logs:
+            decision = model.try_start_prespec(**inputs)
+            again = model.try_start_prespec(**inputs)
+        self.assertFalse(decision.launched)
+        self.assertEqual(decision.reason, "rollback_draft_exceeds_kmax")
+        self.assertEqual(again.reason, decision.reason)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("draft_tokens=4 kmax=3", logs.output[0])
+        self.assertFalse(engine.calls)
+
+    async def test_output_budget_covers_first_token_old_draft_and_extension(self):
+        engine = FakeEngine()
+        model = Model(engine, kmax=3, candidate_budget=4)
+        inputs = self.inputs()
+        inputs["rollback_draft_token_ids"] = [20, 21, 22]
+        with self.assertLogs("streaming_prespec_helpers", level="INFO") as logs:
+            decision = model.try_start_prespec(**inputs)
+        self.assertFalse(decision.launched)
+        self.assertEqual(decision.reason, "candidate_budget_insufficient")
+        self.assertIn("candidate_budget=4 required=5", logs.output[0])
+        self.assertFalse(engine.calls)
+
+    async def test_full_kmax_old_draft_is_verified_but_oversized_result_not_consumed(self):
+        engine = FakeEngine("full_budget")
+        model = Model(engine, kmax=3, candidate_budget=5)
+        probes = []
+        model.prespec.on_probe = probes.append
+        inputs = self.inputs()
+        inputs["rollback_draft_token_ids"] = [20, 21, 22]
+        try:
+            self.assertTrue(model.try_start_prespec(**inputs).launched)
+            await engine.started.wait()
+            await asyncio.sleep(0)
+            self.assertEqual(engine.calls[0]["test_draft"], [20, 21, 22])
+            self.assertIsNone(model.prespec.begin_authoritative_chunk(
+                "ws-test", audio_epoch=1, prefix_version=2,
+                full_audio_end_samples=64000))
+            self.assertEqual(probes[-1].status, "candidate_exceeds_kmax")
+            model.prespec.end_authoritative_chunk("ws-test", audio_epoch=1)
+        finally:
+            await model.prespec.close_session("ws-test")
 
     async def test_formal_submit_cancels_shadow_and_aborts_only_its_request(self):
         engine = FakeEngine("wait")

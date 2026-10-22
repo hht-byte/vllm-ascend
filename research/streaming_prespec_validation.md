@@ -24,7 +24,7 @@ A/B/C 保持同一服务代码、模型、图配置、回滚参数、chunk 长�
 rg -n 'ArgumentParser|parse_args|AsyncLLM\(' qwen_asr
 ```
 
-在现有 `parser.parse_args()` **之前**增加两个参数；保留其余已有参数：
+在现有 `parser.parse_args()` **之前**增加三个参数；保留其余已有参数：
 
 ```python
 parser.add_argument(
@@ -35,6 +35,10 @@ parser.add_argument(
     "--prespec-admission", choices=("force", "gated"), default="force",
     help="force for chain checks; gated requires fresh LoadSnapshot",
 )
+parser.add_argument(
+    "--prespec-candidate-tokens", type=int, default=None,
+    help="shadow output max_tokens; default uses engine kmax + 1",
+)
 ```
 
 你现在的调用是 `Qwen3ASRModelAsync.AsyncLLM(**base_config)`。保留 `base_config` 原内容，在同一调用上显式追加 parser 参数：
@@ -44,16 +48,18 @@ model = Qwen3ASRModelAsync.AsyncLLM(
     **base_config,
     prespec_mode=args.prespec_mode,
     prespec_admission=args.prespec_admission,
+    prespec_candidate_tokens=args.prespec_candidate_tokens,
 )
 ```
 
-`base_config` 不能同时含有 `prespec_mode` 或 `prespec_admission`，否则 Python 会因重复关键字报错。若原调用的结果变量不是 `model`，保留原变量名。
+`base_config` 不能同时含有这三个 `prespec_...` 名字，否则 Python 会因重复关键字报错。若原调用的结果变量不是 `model`，保留原变量名。
 
-在 `qwen3_asr_async.py` 的 `AsyncLLM()` 现有类方法签名增加两个显式形参；若签名有 `**kwargs`，把它们放在 `**kwargs` **之前**。不能只在调用处传参，否则可能得到 `unexpected keyword argument`，或落入 `**kwargs` 后被错误转发给 vLLM engine：
+在 `qwen3_asr_async.py` 的 `AsyncLLM()` 现有类方法签名增加三个显式形参；若签名有 `**kwargs`，把它们放在 `**kwargs` **之前**。不能只在调用处传参，否则可能得到 `unexpected keyword argument`，或落入 `**kwargs` 后被错误转发给 vLLM engine：
 
 ```python
 prespec_mode: str = "off",
 prespec_admission: str = "force",
+prespec_candidate_tokens: int | None = None,
 ```
 
 这里假定现有入口用 `argparse` 且解析结果名为 `args`；若名字不同，只替换该局部变量名。服务启动脚本不在本仓库，无法填写其余既有 CLI 选项。
@@ -68,15 +74,21 @@ rg -n -A 35 'def enable_prespec' qwen_asr/inference/qwen3_asr_async.py
 
 ```python
 def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
-                   candidate_tokens=8, on_probe=None,
+                   candidate_tokens=None, on_probe=None,
                    admission_mode="force", shadow_only=True):
-    # 保留主接入文档中已有的 enabled/kmax/engine 校验和 midpoint_samples 计算。
+    # 保留主接入文档中已有的 enabled/kmax/engine 校验。
+    if candidate_tokens is None:
+        candidate_tokens = kmax + 1
+    if candidate_tokens < 3:
+        raise ValueError("candidate budget needs first token, draft and continuation")
+    # midpoint_samples 沿用主接入文档中的计算。
     self.prespec = PreSpecCoordinator(
         producer=self._logged_prespec_producer,
         policy=AdmissionPolicy(
             admission_mode=admission_mode,
             midpoint_samples=midpoint_samples,
-            max_candidate_tokens=min(candidate_tokens, kmax),
+            max_rollback_draft_tokens=kmax,
+            max_candidate_tokens=candidate_tokens,
             max_active_shadows=1,
         ),
         shadow_only=shadow_only,
@@ -102,11 +114,16 @@ if prespec_admission not in {"force", "gated"}:
 model.enable_prespec(
     enabled=(prespec_mode != "off"), kmax=kmax, engine=engine,
     chunk_size_sec=chunk_size_sec,
+    candidate_tokens=prespec_candidate_tokens,
     admission_mode=prespec_admission,
     shadow_only=(prespec_mode != "consume"),
     on_probe=log_prespec_probe if prespec_mode != "off" else None,
 )
-logger.info("PRESPEC_CONFIG mode=%s admission=%s", prespec_mode, prespec_admission)
+logger.info(
+    "PRESPEC_CONFIG mode=%s admission=%s kmax=%s candidate_budget=%s",
+    prespec_mode, prespec_admission, kmax,
+    model.prespec.policy.max_candidate_tokens if model.prespec is not None else None,
+)
 ```
 
 `on_probe` 是同步回调；这里只做一条格式化日志，不做阻塞采样或文件读写。回调异常被协调器吞掉并计入 `probe_error_count`，因此每轮结束要检查该计数是否为 0。
@@ -166,7 +183,7 @@ if decision is not None and decision.launched:
     segment.prespec_started = True
 ```
 
-`try_start_prespec_for_state()` 在未达中点、已 commit、音频队列非空或无合法回滚草稿时返回 `None`，因此这些路径**不会**出现 `PRESPEC_LAUNCH`。如果预期到达 3 秒却没有 launch，请在该包装函数这些 `return None` 前临时加一条 `DEBUG` 日志，包含 `ws_id/seg/chunk_id/len(state.buffer)/reason`；不要据“无 launch 日志”直接判断负载门控拒绝。`decision.reason` 只覆盖实际进入 `try_start_prespec()` 后的判断。
+`try_start_prespec_for_state()` 在未达中点、已 commit、音频队列非空或无合法回滚草稿时返回 `None`，因此这些路径**不会**出现 `PRESPEC_LAUNCH`。真正进入 `try_start_prespec()` 后，旧草稿超出引擎 `kmax` 或输出预算放不下 `1 + 旧草稿长度 + 1` 时，分别返回 `rollback_draft_exceeds_kmax` / `candidate_budget_insufficient`，不会给引擎发缩短后的草稿；helper 对每个 `(ws_id, seg_id, reason)` 只输出一次 `PRESPEC_SKIP` INFO，避免后续 80 ms chunk 重复刷屏。若预期到达 3 秒却没有 launch，请在包装函数这些 `return None` 前临时加一条 `DEBUG` 日志，包含 `ws_id/seg/chunk_id/len(state.buffer)/reason`；不要据“无 launch 日志”直接判断负载门控拒绝。
 
 ### 1.4 `qwen3_asr_async.py`：关联正式请求与候选
 
@@ -175,9 +192,12 @@ if decision is not None and decision.launched:
 ```python
 logger.info(
     "PRESPEC_TARGET ws_id=%s seg=%s chunk=%s event=submit "
-    "formal_request_id=%s candidate_request_id=%s",
+    "formal_request_id=%s candidate_request_id=%s "
+    "candidate_raw_tokens=%s submitted_draft_tokens=%s",
     ws_id, seg_id, this_chunk_id, formal_request_id,
     candidate.request_id if candidate is not None else None,
+    len(candidate.token_ids) if candidate is not None else None,
+    len(draft_token_ids),
 )
 ```
 
@@ -188,11 +208,13 @@ if prespec is not None:
     prespec.end_authoritative_chunk(ws_id, audio_epoch=seg_id)
 ```
 
-不传 `target_continuation_tokens` 表示**只清理候选，不计算匹配长度**，协调器返回 `None`；不能把此结果记为“接受 0 个 token”。C 组仍须在引擎实际处理 `ascend_external_draft` 的验证结果处记录 `request_id`、提交的草稿长度、实际连续接受长度、首 token 是否拒绝、修正 token 数、目标模型前向步数。只在 proposer 的 `propose()` 打日志不足以证明草稿被验证；该函数只负责提出 token。先在服务/引擎仓库定位挂点：
+不传 `target_continuation_tokens` 表示**只清理候选，不计算匹配长度**，协调器返回 `None`；不能把此结果记为“接受 0 个 token”。C 组仍须在引擎实际处理 `ascend_external_draft` 的验证结果处记录 `request_id`、提交的草稿长度、实际连续接受长度、**首个草稿 token** 是否拒绝、修正 token 数、目标模型前向步数。首个 target token 已在 proposer 之前采样，不属于 external draft。只在 proposer 的 `propose()` 打日志不足以证明草稿被验证；该函数只负责提出 token。先在服务/引擎仓库定位挂点：
 
 ```bash
 rg -n 'ascend_external_draft|def propose\(|accepted.*token|rejected.*token' .
 ```
+
+还要在 910B 的 proposer 处核对 `sampled_ids` 后接入草稿的真实顺序，确认 `requested_draft_len`、`effective_draft_len`、`num_tokens_no_spec`、`max_model_len`；静态 `kmax` 检查不能发现上下文空间不足造成的运行时缩短。正式日志应满足 `candidate_raw_tokens = submitted_draft_tokens + 1`，且 `effective_draft_len = submitted_draft_tokens` 才能把该轮记为“完整提交候选草稿”。
 
 若需要**候选与正式输出的离线匹配统计**，不能把旧示例中的 `raw_target_tokens = ()` 原样传入：元组没有采集动作，会一直表示“已观测到空输出”，导致错误的 0 匹配。正式请求仍保持 `output_kind=DELTA`，在原 `_yield_delta_text()` 消费的**同一条正式 vLLM 输出流**上采集原始 token IDs。可给 `_yield_delta_text()` 增加一个可选的 `on_output` 回调，并在它原有的 `async for output in stream` 循环内、处理文本之前调用；不要另起一次 generate，也不要对输出文本重新 tokenize：
 
@@ -264,8 +286,9 @@ python -m py_compile qwen_asr/inference/streaming_prespec.py \
   qwen_asr/inference/streaming_prespec_helpers.py \
   qwen_asr/inference/qwen3_asr_async.py \
   qwen_asr/cli/realtime_connection.py
-rg -n 'PRESPEC_CONFIG|PRESPEC_LAUNCH|PRESPEC_REQUEST|PRESPEC_PROBE|PRESPEC_TARGET' \
-  qwen_asr/inference/qwen3_asr_async.py qwen_asr/cli/realtime_connection.py
+rg -n 'PRESPEC_CONFIG|PRESPEC_LAUNCH|PRESPEC_SKIP|PRESPEC_REQUEST|PRESPEC_PROBE|PRESPEC_TARGET' \
+  qwen_asr/inference/qwen3_asr_async.py qwen_asr/inference/streaming_prespec_helpers.py \
+  qwen_asr/cli/realtime_connection.py
 ```
 
 ## 2. 单连接链路检查：B 组先强制 shadow
@@ -282,7 +305,7 @@ rg -n 'PRESPEC_CONFIG|PRESPEC_LAUNCH|PRESPEC_REQUEST|PRESPEC_PROBE|PRESPEC_TARGE
 tail -F /path/to/server.log | rg --line-buffered 'PRESPEC_|inference submit|Commit received|Segment done'
 ```
 
-若服务由 systemd 管理，改用 `journalctl -u <实际服务单元名> -f -o cat` 作为管道左侧。预期按序看到 `PRESPEC_CONFIG`、中点 `PRESPEC_LAUNCH launched=True`、`PRESPEC_REQUEST submit/done` 和正式 chunk 的 `PRESPEC_PROBE boundary=chunk status=ready_shadow_only`。`ready_lead_ms > 0` 表示候选早于正式 chunk 提交完成；若为 `pending`，候选被取消，不应等待它。随后分别重放提前 commit、≤0.4 秒短尾和断连，确认无遗留 `prespec-...` 请求、重复 begin 或未结束的 session。
+若服务由 systemd 管理，改用 `journalctl -u <实际服务单元名> -f -o cat` 作为管道左侧。预期按序看到 `PRESPEC_CONFIG`、中点 `PRESPEC_LAUNCH launched=True`、`PRESPEC_REQUEST submit/done` 和正式 chunk 的 `PRESPEC_PROBE boundary=chunk status=ready_shadow_only`。`ready_lead_ms > 0` 表示候选早于正式 chunk 提交完成；若为 `pending`，候选被取消，不应等待它。若是 `candidate_exceeds_kmax`，shadow 的输出超过正式 proposer 可接收长度，协调器不会把它交给正式请求。随后分别重放提前 commit、≤0.4 秒短尾和断连，确认无遗留 `prespec-...` 请求、重复 begin 或未结束的 session。
 
 如果链路没有 launch，打开 DEBUG 日志后先看 `return None` 的跳过原因和 `PRESPEC_LAUNCH reason`；`force` 仅绕过实时负载门控，不绕过中点、草稿、在途正式请求和容量检查。
 
@@ -290,7 +313,7 @@ tail -F /path/to/server.log | rg --line-buffered 'PRESPEC_|inference submit|Comm
 
 ```bash
 rg -c 'PRESPEC_LAUNCH.*launched=True|PRESPEC_REQUEST event=done|PRESPEC_PROBE.*ready_' /path/to/run.log
-rg -o 'PRESPEC_LAUNCH.*reason=[^ ]+' /path/to/run.log | sort | uniq -c
+rg 'PRESPEC_SKIP|PRESPEC_LAUNCH' /path/to/run.log | rg -o 'reason=[^ ]+' | sort | uniq -c
 ```
 
 ## 3. 固定输入正确性：A、B、C 逐级比较
@@ -311,7 +334,7 @@ rg -o 'PRESPEC_LAUNCH.*reason=[^ ]+' /path/to/run.log | sort | uniq -c
 # 同一回放清单
 ```
 
-这里的 `<现有服务启动命令>` 和 WebSocket 回放命令是环境专属的唯一占位符：本仓库没有 910B 服务启动脚本或你的 `test_v2.py` 参数表，不能编造 CLI。A/B 应逐 chunk 对比已有的客户端 delta/done、最终文本与 commit 边界；若引擎本来就记录正式原始 token IDs，可额外对比，但不为此改造流式输出函数。C 还要确认候选实际写进正式 `ascend_external_draft` 并由引擎 verifier 验证，覆盖首 token 拒绝、部分接受、全拒绝、版本不匹配和候选超时。此步不通过就不要开始性能对比。
+这里的 `<现有服务启动命令>` 和 WebSocket 回放命令是环境专属的唯一占位符：本仓库没有 910B 服务启动脚本或你的 `test_v2.py` 参数表，不能编造 CLI。A/B 应逐 chunk 对比已有的客户端 delta/done、最终文本与 commit 边界；若引擎本来就记录正式原始 token IDs，可额外对比，但不为此改造流式输出函数。C 还要确认候选的后续 token 实际写进正式 `ascend_external_draft` 并由引擎 verifier 验证，覆盖首个草稿 token 拒绝、部分接受、全拒绝、版本不匹配和候选超时。此步不通过就不要开始性能对比。
 
 ## 4. 同负载性能对比：A→B、B→C、A→C
 

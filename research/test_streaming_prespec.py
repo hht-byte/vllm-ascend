@@ -59,7 +59,7 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         test_case = self
         repaired_state = object()
-        verified = VerifiedRollback((20, 99), repaired_state)
+        verified = VerifiedRollback(19, (20, 99), repaired_state)
 
         class Branch:
             async def verify_and_repair_old(self, rollback, budget):
@@ -80,10 +80,84 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 calls.append(("open", request.audio_epoch))
                 return Branch()
 
-        produced = await RepairExtendProducer(Backend())(self.request(), 4)
-        self.assertEqual(produced, (20, 99, 30, 31))
-        self.assertEqual(calls, [("open", 1), ("verify", (20, 21), 4),
+        produced = await RepairExtendProducer(Backend())(self.request(), 5)
+        self.assertEqual(produced, (19, 20, 99, 30, 31))
+        self.assertEqual(calls, [("open", 1), ("verify", (20, 21), 5),
                                  ("extend", (20, 99), 2), ("close",)])
+
+    async def test_producer_does_not_truncate_old_draft_before_verification(self):
+        calls = []
+
+        class Branch:
+            async def verify_and_repair_old(self, rollback, budget):
+                calls.append(("verify", rollback, budget))
+                return VerifiedRollback(19, (20, 21, 22), object())
+
+            async def extend_from_verified(self, result, budget):
+                calls.append(("extend", budget))
+                return (30,)
+
+            async def close(self):
+                pass
+
+        class Backend:
+            async def open_shadow(self, request):
+                return Branch()
+
+        request = replace(self.request(), rollback_tokens=(20, 21, 22))
+        result = await RepairExtendProducer(Backend())(request, 5)
+        self.assertEqual(result, (19, 20, 21, 22, 30))
+        self.assertEqual(calls, [("verify", (20, 21, 22), 5), ("extend", 1)])
+
+    async def test_coordinator_rejects_oversized_old_draft(self):
+        async def producer(request, budget):
+            self.fail("oversized draft must not reach producer")
+
+        policy = replace(self.policy, max_rollback_draft_tokens=2,
+                         max_candidate_tokens=5)
+        coordinator = PreSpecCoordinator(producer, policy, clock=lambda: self.now)
+        request = replace(self.request(), rollback_tokens=(20, 21, 22))
+        decision = coordinator.maybe_start(request, self.load(), 200)
+        self.assertEqual(decision.reason, "rollback_draft_exceeds_kmax")
+        self.assertFalse(decision.launched)
+
+    async def test_candidate_over_kmax_is_not_submitted_to_formal_proposer(self):
+        probes = []
+
+        async def producer(request, budget):
+            return (19, 20, 21, 22)
+
+        policy = replace(self.policy, max_rollback_draft_tokens=2,
+                         max_candidate_tokens=4)
+        coordinator = PreSpecCoordinator(producer, policy, clock=lambda: self.now,
+                                         shadow_only=False, on_probe=probes.append)
+        coordinator.maybe_start(self.request(), self.load(), 200)
+        await asyncio.sleep(0)
+        candidate = coordinator.begin_authoritative_chunk(
+            "ws-1", audio_epoch=1, prefix_version=2,
+            full_audio_end_samples=64_000)
+        self.assertIsNone(candidate)
+        self.assertEqual(probes[-1].status, "candidate_exceeds_kmax")
+        coordinator.end_authoritative_chunk("ws-1", audio_epoch=1)
+        await coordinator.close_session("ws-1")
+
+    async def test_candidate_draft_starts_after_shadow_first_token(self):
+        async def producer(request, budget):
+            return (19, 20, 21)
+
+        policy = replace(self.policy, max_rollback_draft_tokens=2,
+                         max_candidate_tokens=4)
+        coordinator = PreSpecCoordinator(producer, policy, clock=lambda: self.now,
+                                         shadow_only=False)
+        coordinator.maybe_start(self.request(), self.load(), 200)
+        await asyncio.sleep(0)
+        candidate = coordinator.begin_authoritative_chunk(
+            "ws-1", audio_epoch=1, prefix_version=2,
+            full_audio_end_samples=64_000)
+        self.assertEqual(candidate.token_ids, (19, 20, 21))
+        self.assertEqual(candidate.formal_draft_token_ids, (20, 21))
+        coordinator.end_authoritative_chunk("ws-1", audio_epoch=1)
+        await coordinator.close_session("ws-1")
 
     async def test_producer_closes_branch_when_verification_fails(self):
         closed = False
