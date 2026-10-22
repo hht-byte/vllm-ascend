@@ -37,9 +37,11 @@ parser.add_argument(
 )
 parser.add_argument(
     "--prespec-candidate-tokens", type=int, default=None,
-    help="shadow output max_tokens; default uses engine kmax + 1",
+    help="shadow output max_tokens; omitted means auto (engine kmax + 1)",
 )
 ```
+
+这里 `default=None` 是“未显式指定”的标记：parser 阶段尚未取得引擎 `kmax`，所以不能直接写 `default=kmax + 1`。启动时将 `None` 依次传给 `AsyncLLM()`、`enable_prespec()`；仅在启用预投机后，由 `enable_prespec()` 将它解析为 `kmax + 1`。显式传入整数时原样使用，并受下文预算检查约束。
 
 你现在的调用是 `Qwen3ASRModelAsync.AsyncLLM(**base_config)`。保留 `base_config` 原内容，在同一调用上显式追加 parser 参数：
 
@@ -183,7 +185,7 @@ if decision is not None and decision.launched:
     segment.prespec_started = True
 ```
 
-`try_start_prespec_for_state()` 在未达中点、已 commit、音频队列非空或无合法回滚草稿时返回 `None`，因此这些路径**不会**出现 `PRESPEC_LAUNCH`。真正进入 `try_start_prespec()` 后，旧草稿超出引擎 `kmax` 或输出预算放不下 `1 + 旧草稿长度 + 1` 时，分别返回 `rollback_draft_exceeds_kmax` / `candidate_budget_insufficient`，不会给引擎发缩短后的草稿；helper 对每个 `(ws_id, seg_id, reason)` 只输出一次 `PRESPEC_SKIP` INFO，避免后续 80 ms chunk 重复刷屏。若预期到达 3 秒却没有 launch，请在包装函数这些 `return None` 前临时加一条 `DEBUG` 日志，包含 `ws_id/seg/chunk_id/len(state.buffer)/reason`；不要据“无 launch 日志”直接判断负载门控拒绝。
+`try_start_prespec_for_state()` 在未达中点、已 commit、音频队列非空或无合法回滚草稿时返回 `None`，因此这些路径**不会**出现 `PRESPEC_LAUNCH`。真正进入 `try_start_prespec()` 后，旧草稿超出引擎 `kmax` 或输出预算放不下 `1 + 旧草稿长度 + 1` 时，分别返回 `rollback_draft_exceeds_kmax` / `candidate_budget_insufficient`，不会给引擎发缩短后的草稿。这两项准入检查在 shadow 和 consume 模式都执行；两者只在正式请求是否使用已完成候选上不同。helper 对每个 `(ws_id, seg_id, reason)` 只输出一次 `PRESPEC_SKIP` INFO，避免后续 80 ms chunk 重复刷屏。若预期到达 3 秒却没有 launch，请在包装函数这些 `return None` 前临时加一条 `DEBUG` 日志，包含 `ws_id/seg/chunk_id/len(state.buffer)/reason`；不要据“无 launch 日志”直接判断负载门控拒绝。
 
 ### 1.4 `qwen3_asr_async.py`：关联正式请求与候选
 
