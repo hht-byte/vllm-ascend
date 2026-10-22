@@ -375,7 +375,17 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             full_audio_end_samples=62_000))
         self.assertEqual(probes[-1].status, "ready_shadow_only")
         self.assertEqual(probes[-1].boundary, "formal")
-        coordinator.finish_formal("ws-1", 1, window_id=1)
+        with self.assertLogs("streaming_prespec", level="INFO") as captured:
+            evaluation = coordinator.finish_formal(
+                "ws-1", 1, (19, 20, 99), window_id=1)
+        self.assertEqual(evaluation.raw_matched_prefix_tokens, 2)
+        self.assertEqual(evaluation.draft_matched_prefix_tokens, 1)
+        self.assertTrue(any(
+            "PRESPEC_MATCH ws_id=ws-1 seg=1 window=1 boundary=formal "
+            "candidate_len=3 target_len=3 raw_matched_prefix_tokens=2 "
+            "draft_matched_prefix_tokens=1" in entry
+            for entry in captured.output
+        ))
         await coordinator.close_session("ws-1")
 
     async def test_commit_cancels_pending_candidate_before_finish(self):

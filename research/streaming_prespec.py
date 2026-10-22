@@ -526,7 +526,18 @@ class PreSpecCoordinator:
         else:
             del self._active_formals[session_id]
         try:
-            return self._evaluate(key, target_continuation_tokens)
+            evaluation = self._evaluate(key, target_continuation_tokens)
+            if evaluation is not None:
+                logger.info(
+                    "PRESPEC_MATCH ws_id=%s seg=%s window=%s boundary=formal "
+                    "candidate_len=%s target_len=%s raw_matched_prefix_tokens=%s "
+                    "draft_matched_prefix_tokens=%s",
+                    session_id, audio_epoch, window_id,
+                    len(evaluation.candidate_tokens), evaluation.target_token_count,
+                    evaluation.raw_matched_prefix_tokens,
+                    evaluation.draft_matched_prefix_tokens,
+                )
+            return evaluation
         finally:
             self._discard_window(key)
             self._finished_segments.add(segment_key)

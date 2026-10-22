@@ -263,7 +263,7 @@ new_audio_samples = current_audio_end_samples - last_formal_audio_end_samples
 
 **从 `async_streaming_transcribe()` 提取两段只读逻辑。** 草稿拆分一段单独复用，请求打包一段放进 `_pack_stream_request`：
 
-1. 将 L486–518 的 `state._raw_decoded → cur_ids → prefix / external_draft` 拆分代码提成一个**只读**函数，例如 `_split_stream_rollback(raw_decoded, chunk_id, unfixed_chunk_num, unfixed_token_num, kmax)`。正式 chunk 和中点都调用它；保留固定阶段 `prefix=""`、`cur_ids[1:][:kmax]`，以及动态阶段反复扩大回滚 token 数直到解码前缀不含 `�` 的原有细节。该函数返回原来的 `prefix` 文本、前缀 IDs 和草稿 IDs。提取时不要提前改写 `state._raw_decoded` 或 `state.chunk_id`。
+1. 将 L486–518 的 `state._raw_decoded → cur_ids → prefix / external_draft` 拆分代码提成一个**只读**函数，例如 `_split_stream_rollback(raw_decoded, chunk_id, unfixed_chunk_num, unfixed_token_num, kmax)`。正式 chunk、中点和使用上一轮转写构造稳定前缀的正式 finish 都调用它；保留固定阶段 `prefix=""`、`cur_ids[1:][:kmax]`，以及动态阶段反复扩大回滚 token 数直到解码前缀不含 `�` 的原有细节。该函数返回原来的 `prefix` 文本、前缀 IDs 和草稿 IDs。提取时不要提前改写 `state._raw_decoded` 或 `state.chunk_id`。
 2. 将 L520–554 的 `prompt = state.prompt_raw + prefix`、processor 输入、`TokensPrompt` 或 adapter 的 `build_request` 分支搬入 `_pack_stream_request`。输入改为下面六个显式形参，使用传入的完整音频，不从活跃 `state` 取 `audio_accum`。保持原有 `CACHE_ID` 路径和输入格式；这里不增加 KV 命中判断。
 3. 将 L559–568 向 `sampling_params.extra_args` 写入 `ascend_external_draft` 的原代码也搬入打包函数，使正式与 shadow 调用同一字段/格式。`_pack_stream_request` 只返回 generate 实参；不搬入 L557 的 `ChunkInferenceEvent`、L571–606 的打点、输出和状态写回。
 
@@ -659,6 +659,7 @@ finally:
 prespec_formal_begun: bool = False
 prespec_formal_window_id: int | None = None
 prespec_started_window: int | None = None
+prespec_finish_target_tokens: tuple[int, ...] | None = None
 ```
 
 `prespec_started_window` 只在 `decision.launched` 时设为当时的 `state.chunk_id`，避免该窗口随后的 80 ms append 一再复制完整音频。正式 chunk 完成后 `state.chunk_id` 递增，下一窗口自然可以再次启动；协调器按 `(ws_id, seg_id, window_id)` 做最终去重。新段创建时两个窗口字段为 `None`，`prespec_formal_begun` 为 `False`。
@@ -693,11 +694,38 @@ if self.prespec is not None and not segment.prespec_formal_begun:
 
 #### `_finish_segment()`：正常 finish 调用附加连接和段标识
 
-保留现有 `remaining <= 0.4s` 的跳过分支，不在该分支领取候选。正常调用 `async_finish_streaming_transcribe(...)` 时，**原有位置实参保持不变**，在调用末尾增加 `prespec_ws_id=self.connection_id, prespec_seg_id=seg_id` 两个关键字。模型函数签名末尾也增加同名可选形参，供未接入预投机的旧调用方继续使用。`connection_id` 是现有 `ws-...`，`seg_id` 是当前日志段号。
+保留现有 `remaining <= 0.4s` 的跳过分支，不在该分支领取候选。正常调用 `async_finish_streaming_transcribe(...)` 时，**原有位置实参保持不变**，在调用末尾增加 `prespec_ws_id=self.connection_id, prespec_seg_id=seg_id, on_finish_tokens=record_finish_tokens` 三个关键字。连接层在这次调用之前定义只记录本段原始 token IDs 的同步回调：
+
+```python
+segment.prespec_finish_target_tokens = None
+
+def record_finish_tokens(token_ids: tuple[int, ...]) -> None:
+    segment.prespec_finish_target_tokens = token_ids
+
+# 原有 await self.asr.async_finish_streaming_transcribe(...) 的位置和
+# 原有位置实参不变，只在末尾加上述三个关键字参数。
+```
+
+模型函数签名末尾增加这三个可选形参，默认均为 `None`，供未接入预投机的旧调用方继续使用。`connection_id` 是现有 `ws-...`，`seg_id` 是当前日志段号。这个回调不发送客户端事件，也不改变 finish 的返回类型；短尾跳过时字段保持 `None`。
 
 #### `async_finish_streaming_transcribe()`：在 `finish_...` 正式请求提交前领取
 
-此函数原有流程先把剩余 `state.buffer` 并入 `state.audio_accum`，再构造完整音频的正式 finish 请求。**在合并完成、原函数已确定本次前缀、回滚草稿和本次 `sampling_params` 之后，紧邻 finish 请求打包之前**插入：
+此函数原有流程先把剩余 `state.buffer` 并入 `state.audio_accum`，再构造完整音频的正式 finish 请求。如果 finish 和正式 chunk 一样从 `state._raw_decoded` 提取稳定前缀及回滚草稿，应在合并音频后调用**同一个** `_split_stream_rollback()`；不能让 finish 另用一套不检查 `\ufffd` 的切分。按实际成员名替换示例中的配置字段：
+
+```python
+prefix_text, stable_prefix_token_ids, rollback_draft_token_ids = (
+    self._split_stream_rollback(
+        state._raw_decoded, state.chunk_id,
+        self.unfixed_chunk_num, self.unfixed_token_num, self.kmax,
+    )
+)
+# 后续 finish prompt 仍为 state.prompt_raw + prefix_text；音频仍为
+# 已合并完成的完整 state.audio_accum，不把回滚草稿拼入 prompt。
+```
+
+动态阶段的 `\ufffd` 循环应留在这个只读 helper 中：如果当前 token 边界解码出的 `prefix_text` 含替换字符，就扩大待验证的回滚后缀、缩短稳定前缀，再解码检查；直到前缀有效或退到空前缀。候选和正式 finish 必须使用相同的前缀拆分，否则即使 `prefix_version`、`window_id` 相同，也可能把相对于另一条 prompt 构造的草稿交给 finish。若扩大的回滚后缀超过引擎 `kmax`，不能静默截短后继续使用该稳定前缀；正式 chunk 和 finish 都需要安全回退，并禁止消费不再对齐的候选。若实际 finish 从头解码、完全不使用上一轮稳定前缀，则不能机械加入这套拆分；它的候选也必须按该 finish 请求的真实 prompt 合同构造。由于本仓库没有服务端函数源码，这一分支需对照 910B 实现确认。
+
+**在上述拆分和本次 `sampling_params` 确定后，紧邻 finish 请求打包之前**插入：
 
 ```python
 prespec = getattr(self, "prespec", None)
@@ -711,11 +739,11 @@ if (prespec is not None and prespec_ws_id is not None
         full_audio_end_samples=len(state.audio_accum),
     )
 
-# 原函数如已有 finish 回滚草稿，沿用其 token IDs；没有则用空元组。
-# 此处不要重新 tokenize 文本，也不要把候选首 token 拼进 prompt。
+# 与中点及正式 chunk 采用同一拆分结果；不要重新 tokenize 文本，
+# 也不要把候选首 token 拼进 prompt。
 finish_draft_token_ids = (
     candidate.formal_draft_token_ids if candidate is not None
-    else existing_finish_draft_token_ids
+    else rollback_draft_token_ids
 )
 sampling_params.extra_args = {
     **(sampling_params.extra_args or {}),
@@ -723,7 +751,7 @@ sampling_params.extra_args = {
 }
 ```
 
-上面的 `existing_finish_draft_token_ids` 对应原 finish 代码算出的回滚草稿；若原 finish 没有这个变量，在该分支先设 `existing_finish_draft_token_ids = ()`。`sampling_params` 必须是本次 finish 请求专用的原有对象；保留其 temperature、max_tokens、output_kind、stop/EOS 等参数和原有完整音频 prompt，**只替换** `ascend_external_draft` 的值。若正式 finish 用 `_pack_stream_request(...)` 打包，传入相同的 `finish_draft_token_ids`，不要重复写一遍 `extra_args`。现有 `finish_...` `request_id`、`engine.generate(...)`、输出解析及状态更新位置不变。紧邻原 `engine.generate(...)` 前加一条来源日志：
+`sampling_params` 必须是本次 finish 请求专用的原有对象；保留其 temperature、max_tokens、output_kind、stop/EOS 等参数和完整音频 prompt，**只替换** `ascend_external_draft` 的值。若正式 finish 用 `_pack_stream_request(...)` 打包，传入相同的 `prefix_text`、`stable_prefix_token_ids` 与 `finish_draft_token_ids`，不要重复写一遍 `extra_args`。正式结果沿用原 finish 的输出拼接与解析位置，并核对稳定前缀恰好包含一次；`finish_...` `request_id`、`engine.generate(...)` 和状态写回位置保持原有时序。紧邻原 `engine.generate(...)` 前加一条来源日志：
 
 ```python
 logger.info(
@@ -738,6 +766,39 @@ logger.info(
 
 `claim_formal_candidate()` 不等待候选，只在其完成、版本相同、候选音频截止不晚于完整正式音频、草稿长度不超 `kmax` 且窗口号仍相同时返回候选。shadow 模式下返回 `None`，但记录 `PRESPEC_PROBE boundary=formal status=ready_shadow_only`，正式请求继续使用原 finish 草稿；consume 模式下可返回候选并记录 `ready_consumed`。consume 的候选必须由现有引擎在**完整正式音频**上验证，不能直接把 shadow 文本发给客户端。
 
+#### `async_finish_streaming_transcribe()`：从同一次 `finish_...` 输出采集 token
+
+在已有的 `engine.generate(...)` 输出消费循环中插入以下采集，保留原有文本拼接、解析、状态写回和返回值。使用本次 finish 请求实际的 `sampling_params.output_kind`；不要再次调用 `generate`，也不要从最终文本重新 tokenize：
+
+```python
+finish_raw_token_ids: list[int] = []
+finish_output_complete = False
+finish_output_valid = True
+
+# 在原有 async for output in finish_stream 循环内、原文本处理之前：
+if output.outputs:
+    if len(output.outputs) != 1:
+        finish_output_valid = False  # 统计不可用，不影响正式输出
+    elif finish_output_valid:
+        ids = output.outputs[0].token_ids
+        if sampling_params.output_kind == RequestOutputKind.DELTA:
+            finish_raw_token_ids.extend(ids)
+        else:  # CUMULATIVE / FINAL_ONLY：保留最新完整快照
+            finish_raw_token_ids[:] = ids
+if output.finished:
+    finish_output_complete = True
+
+# 原输出循环和原结果解析成功结束后、原 return 之前：
+if (on_finish_tokens is not None and finish_output_complete
+        and finish_output_valid):
+    try:
+        on_finish_tokens(tuple(finish_raw_token_ids))
+    except Exception:
+        logger.exception("PRESPEC_FINISH_CAPTURE callback failed")
+```
+
+只有观察到 `output.finished` 才记录 token；真正完成但生成零个 token 时记录 `()`，中断/异常时仍为 `None`。这里记录的是 **prompt 之后的原始生成 token**，不拼接稳定前缀，也不改 `_yield_delta_text()` 的 `on_output`。若本地 finish 用的是 `async for output in engine.generate(...)` 而没有 `finish_stream` 局部变量，就把中间代码放入该现有循环。
+
 #### `_process_segment()`：用最外层 try/finally 包住原函数主体
 
 ```python
@@ -749,10 +810,13 @@ finally:
     if self.prespec is not None and segment.prespec_formal_begun:
         try:
             self.prespec.finish_formal(
-                ws_id, seg_id, window_id=segment.prespec_formal_window_id)
+                ws_id, seg_id,
+                target_continuation_tokens=segment.prespec_finish_target_tokens,
+                window_id=segment.prespec_formal_window_id)
         finally:
             segment.prespec_formal_begun = False
             segment.prespec_formal_window_id = None
+            segment.prespec_finish_target_tokens = None
 ```
 
 #### `cleanup()`：在生成任务已经退出之后插入
@@ -767,7 +831,7 @@ if self.prespec is not None:
 #### 异常路径和配对规则
 
 - `handle_event()` 处理真实 commit 时，在注入 None 之前读取当前 `state.chunk_id`，调用 `begin_formal(ws_id, seg_id, version, 0, window_id=window_id, defer_candidate=True)`，并把 `window_id` 存入 `segment.prespec_formal_window_id`。这个 0 是尚未消费队列时的占位参数；保留已经完成的本窗口候选，取消仍在运行的 shadow。重复 commit 不能重复 begin；state 尚未初始化时版本和窗口 ID 均可取 0。
-- `_process_segment()` 最外层 finally 检查上述标志，用保存的 `prespec_formal_window_id` 调用 `finish_formal(ws_id, seg_id, window_id=...)` 并清标志。不能在 finish 时重新读取可能已经递增的 `state.chunk_id`。此处包住流式循环与 `_finish_segment()`，所以短尾跳过、正常完成和中途异常都会配对；不传 token IDs 表示只清理、不做候选质量评估。
+- `_process_segment()` 最外层 finally 检查上述标志，用保存的 `prespec_formal_window_id` 调用 `finish_formal(ws_id, seg_id, target_continuation_tokens=segment.prespec_finish_target_tokens, window_id=...)` 并清标志。不能在 finish 时重新读取可能已经递增的 `state.chunk_id`。此处包住流式循环与 `_finish_segment()`，所以短尾跳过、正常完成和中途异常都会配对；token IDs 为 `None` 时只清理、不做候选质量评估。正式 finish 完成且候选已选中时，协调器自动输出 `PRESPEC_MATCH_TOKENS` 和 `PRESPEC_MATCH boundary=formal`，无需在服务端再打印同一条摘要。
 - 如果某段已 begin 但入队失败或被取消前根本未进入 `_process_segment()`，由对应异常处理或连接 cleanup 清理；不能期待一个从未进入的 finally 自动执行。
 - `cleanup()` 先取消并等待生成任务及其流式生成器退出，再 `await asr.prespec.close_session(ws_id)`，最后做原有队列/统计清理。不要先删协调器计数再让模型 finally 退出。
 
@@ -775,7 +839,7 @@ if self.prespec is not None:
 
 ### 七、最小版范围与验证
 
-910B 上按“回滚投机 baseline → shadow → 消费候选”逐步验证的可执行命令、最小日志接线和判定表见 [streaming_prespec_validation.md](streaming_prespec_validation.md)。协调器本身不自动打印 launch、probe 或 evaluation；只看原有服务日志无法判断预投机是否运行。
+910B 上按“回滚投机 baseline → shadow → 消费候选”逐步验证的可执行命令、最小日志接线和判定表见 [streaming_prespec_validation.md](streaming_prespec_validation.md)。launch/probe 仍需要按文档接入日志；正式输出 token 交给协调器后，它会打印匹配 token 和 formal 摘要。只看原有服务日志无法判断预投机是否运行。
 
 当前协调器按 `(session_id, audio_epoch, window_id)` 去重，其中 `audio_epoch=seg_id`、`window_id=state.chunk_id`。**每个尚未提交的正式 chunk 窗口可启动一次**：`chunk-0` 在约 1 s 中点用空旧草稿起草；2 s 正式结果后，3 s 中点为 4 s 的 `chunk-1` 起草；4 s 正式结果写回后，5 s 中点为 6 s 的 `chunk-2` 起草。每次正式 chunk 结束回收该窗口；提前 commit 则保留已完成的本窗口候选，在 residual finish 正式请求提交时核对并领取。后续窗口按原规则验证已有回滚草稿；不能跨 VAD 段借用旧 token，也不能把旧窗口候选交给新窗口。
 
