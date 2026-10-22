@@ -219,6 +219,26 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evaluation.ready_lead_ms, 0)
         await coordinator.close_session("ws-1")
 
+    async def test_shadow_match_reports_raw_and_draft_aligned_prefixes(self):
+        async def producer(request, budget):
+            return (19, 20, 21, 22)
+
+        policy = replace(self.policy, max_candidate_tokens=4)
+        coordinator = PreSpecCoordinator(producer, policy, clock=lambda: self.now)
+        self.assertTrue(coordinator.maybe_start(self.request(), self.load(),
+                                                predicted_draft_ms=200).launched)
+        await asyncio.sleep(0)
+        self.assertIsNone(coordinator.begin_authoritative_chunk(
+            "ws-1", audio_epoch=1, prefix_version=2,
+            full_audio_end_samples=64_000))
+        evaluation = coordinator.end_authoritative_chunk(
+            "ws-1", audio_epoch=1,
+            target_continuation_tokens=(99, 20, 21, 77))
+        self.assertEqual(evaluation.target_token_count, 4)
+        self.assertEqual(evaluation.raw_matched_prefix_tokens, 0)
+        self.assertEqual(evaluation.draft_matched_prefix_tokens, 2)
+        await coordinator.close_session("ws-1")
+
     async def test_consume_only_ready_version_compatible_candidate(self):
         async def producer(request, budget):
             return (20, 21)

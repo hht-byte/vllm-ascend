@@ -84,12 +84,21 @@ class Candidate:
 
 @dataclass(frozen=True)
 class Evaluation:
+    """Offline output comparisons; neither match count is verifier acceptance."""
+
     session_id: str
     audio_epoch: int
     candidate_tokens: tuple[int, ...]
-    continuous_accepted_tokens: int
+    raw_matched_prefix_tokens: int
+    draft_matched_prefix_tokens: int
+    target_token_count: int
     ready_before_formal: bool
     ready_lead_ms: float
+
+    @property
+    def continuous_accepted_tokens(self) -> int:
+        """Compatibility alias for the old raw-output comparison, not verifier acceptance."""
+        return self.raw_matched_prefix_tokens
 
 
 @dataclass(frozen=True)
@@ -441,14 +450,26 @@ class PreSpecCoordinator:
         ready_lead_ms = (self._selected_at_ns.pop(key) - candidate.ready_ns) / 1e6
         if target_continuation_tokens is None:
             return None
-        accepted = 0
-        for draft, actual in zip(candidate.token_ids, target_continuation_tokens):
-            if draft != actual:
-                break
-            accepted += 1
-        return Evaluation(key[0], key[1], candidate.token_ids, accepted,
-                          ready_before_formal=True,
-                          ready_lead_ms=ready_lead_ms)
+        def matched_prefix_len(left: Sequence[int], right: Sequence[int]) -> int:
+            count = 0
+            for candidate_token, target_token in zip(left, right):
+                if candidate_token != target_token:
+                    break
+                count += 1
+            return count
+
+        raw_match = matched_prefix_len(candidate.token_ids,
+                                       target_continuation_tokens)
+        draft_match = matched_prefix_len(candidate.formal_draft_token_ids,
+                                         target_continuation_tokens[1:])
+        return Evaluation(
+            key[0], key[1], candidate.token_ids,
+            raw_matched_prefix_tokens=raw_match,
+            draft_matched_prefix_tokens=draft_match,
+            target_token_count=len(target_continuation_tokens),
+            ready_before_formal=True,
+            ready_lead_ms=ready_lead_ms,
+        )
 
     async def close_session(self, session_id: str) -> None:
         """Cancel and await shadow work when the WebSocket session closes."""

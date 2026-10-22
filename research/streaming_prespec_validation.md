@@ -262,14 +262,17 @@ finally:
         if evaluation is not None:
             logger.info(
                 "PRESPEC_MATCH ws_id=%s seg=%s chunk=%s candidate_len=%s "
-                "matched_prefix_tokens=%s",
+                "target_len=%s raw_matched_prefix_tokens=%s "
+                "draft_matched_prefix_tokens=%s",
                 ws_id, seg_id, this_chunk_id,
                 len(evaluation.candidate_tokens),
-                evaluation.continuous_accepted_tokens,
+                evaluation.target_token_count,
+                evaluation.raw_matched_prefix_tokens,
+                evaluation.draft_matched_prefix_tokens,
             )
 ```
 
-这段仅展示采集与统计挂点，不能替换原函数的其他实参或原有状态写回。只有观察到 `output.finished` 才传入 token 列表；中断/取消时传 `None`，避免把部分输出或尚未采集的 `()` 算作 0 匹配。完成且确实生成 0 个 token 时，空元组才是有效观测。`PRESPEC_MATCH` 是候选与正式**最终输出**的最长公共前缀长度，不是引擎 verifier 的实际草稿接受数；后者仍从 verifier 打点取得。候选和正式请求必须使用相同的输出 token 对齐起点（prompt 之后），且这里假设正式请求只有一个 completion。
+这段仅展示采集与统计挂点，不能替换原函数的其他实参或原有状态写回。只有观察到 `output.finished` 才传入 token 列表；中断/取消时传 `None`，避免把部分输出或尚未采集的 `()` 算作 0 匹配。完成且确实生成 0 个 token 时，空元组才是有效观测；此时 `target_len=0`，不能解释为候选首 token 不匹配。`raw_matched_prefix_tokens` 比较候选完整原始输出与正式完整原始输出。`draft_matched_prefix_tokens` 比较实际拟提交的候选 `token_ids[1:]` 与正式输出的 `token_ids[1:]`，跳过两个请求各自采样的首 token；例如候选 `(19, 20, 21)`、正式 `(99, 20, 22)` 时，两个值分别是 0 和 1。两者都是 shadow 离线匹配指标，**都不是引擎 verifier 的实际草稿接受数**；后者仍从 verifier 打点取得。候选和正式请求必须使用相同的输出 token 对齐起点（prompt 之后），且这里假设正式请求只有一个 completion。
 
 日志关联以 `ws_id + seg + chunk` 为正式键，以 `prespec-...` 为 shadow 引擎请求键；不要把不同 request 的 prefill/decode 打点混在一起。`PRESPEC_PROBE status=ready_consumed` 发生在正式验证**之前**，不能代替 verifier 日志。
 
