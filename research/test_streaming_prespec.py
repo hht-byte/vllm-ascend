@@ -335,6 +335,113 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         ).reason, "epoch_already_used")
         await coordinator.close_session("ws-1")
 
+    async def test_commit_defers_ready_candidate_until_finish_request(self):
+        probes = []
+
+        async def producer(request, budget):
+            return (19, 20, 21)
+
+        coordinator = PreSpecCoordinator(
+            producer, self.policy, clock=lambda: self.now,
+            shadow_only=False, on_probe=probes.append)
+        self.assertTrue(coordinator.maybe_start(
+            self.request(window_id=1), self.load(), 200).launched)
+        await asyncio.sleep(0)
+        self.assertIsNone(coordinator.begin_formal(
+            "ws-1", 1, 2, 0, window_id=1, defer_candidate=True))
+        candidate = coordinator.claim_formal_candidate(
+            "ws-1", 1, window_id=1, prefix_version=2,
+            full_audio_end_samples=62_000)
+        self.assertEqual(candidate.formal_draft_token_ids, (20, 21))
+        self.assertEqual(probes[-1].status, "ready_consumed")
+        coordinator.finish_formal("ws-1", 1, window_id=1)
+        await coordinator.close_session("ws-1")
+
+    async def test_shadow_commit_observes_ready_candidate_without_submitting_it(self):
+        probes = []
+
+        async def producer(request, budget):
+            return (19, 20, 21)
+
+        coordinator = PreSpecCoordinator(
+            producer, self.policy, clock=lambda: self.now,
+            shadow_only=True, on_probe=probes.append)
+        coordinator.maybe_start(self.request(window_id=1), self.load(), 200)
+        await asyncio.sleep(0)
+        coordinator.begin_formal(
+            "ws-1", 1, 2, 0, window_id=1, defer_candidate=True)
+        self.assertIsNone(coordinator.claim_formal_candidate(
+            "ws-1", 1, window_id=1, prefix_version=2,
+            full_audio_end_samples=62_000))
+        self.assertEqual(probes[-1].status, "ready_shadow_only")
+        self.assertEqual(probes[-1].boundary, "formal")
+        coordinator.finish_formal("ws-1", 1, window_id=1)
+        await coordinator.close_session("ws-1")
+
+    async def test_commit_cancels_pending_candidate_before_finish(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def producer(request, budget):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        coordinator = PreSpecCoordinator(producer, self.policy,
+                                         clock=lambda: self.now)
+        coordinator.maybe_start(self.request(window_id=1), self.load(), 200)
+        await started.wait()
+        coordinator.begin_formal(
+            "ws-1", 1, 2, 0, window_id=1, defer_candidate=True)
+        await asyncio.wait_for(cancelled.wait(), 0.2)
+        self.assertIsNone(coordinator.claim_formal_candidate(
+            "ws-1", 1, window_id=1, prefix_version=2,
+            full_audio_end_samples=62_000))
+        coordinator.finish_formal("ws-1", 1, window_id=1)
+        await coordinator.close_session("ws-1")
+
+    async def test_commit_short_tail_discards_unclaimed_ready_candidate(self):
+        async def producer(request, budget):
+            return (19, 20)
+
+        coordinator = PreSpecCoordinator(producer, self.policy,
+                                         clock=lambda: self.now)
+        coordinator.maybe_start(self.request(window_id=1), self.load(), 200)
+        await asyncio.sleep(0)
+        coordinator.begin_formal(
+            "ws-1", 1, 2, 0, window_id=1, defer_candidate=True)
+        coordinator.finish_formal("ws-1", 1, window_id=1)
+        self.assertFalse(coordinator._tasks)
+        self.assertEqual(coordinator.maybe_start(
+            self.request(window_id=2), self.load(), 200).reason,
+            "epoch_already_used")
+        await coordinator.close_session("ws-1")
+
+    async def test_commit_cannot_claim_previous_window_after_full_chunk(self):
+        async def producer(request, budget):
+            return (19, 20)
+
+        coordinator = PreSpecCoordinator(
+            producer, self.policy, clock=lambda: self.now,
+            shadow_only=False)
+        coordinator.maybe_start(self.request(window_id=1), self.load(), 200)
+        await asyncio.sleep(0)
+        coordinator.begin_formal(
+            "ws-1", 1, 2, 0, window_id=1, defer_candidate=True)
+        candidate = coordinator.begin_authoritative_chunk(
+            "ws-1", audio_epoch=1, window_id=1, prefix_version=2,
+            full_audio_end_samples=64_000)
+        self.assertIsNotNone(candidate)
+        coordinator.end_authoritative_chunk(
+            "ws-1", audio_epoch=1, window_id=1)
+        self.assertIsNone(coordinator.claim_formal_candidate(
+            "ws-1", 1, window_id=2, prefix_version=3,
+            full_audio_end_samples=70_000))
+        coordinator.finish_formal("ws-1", 1, window_id=1)
+        await coordinator.close_session("ws-1")
+
     async def test_chunk_end_rejects_a_different_window_id(self):
         async def producer(request, budget):
             return (19, 20)

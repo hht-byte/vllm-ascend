@@ -200,8 +200,9 @@ class PreSpecCoordinator:
     """One process-wide coordinator; call its methods on one asyncio event loop.
 
     ``shadow_only=True`` is the safe default: formal decoding never receives
-    draft tokens. With ``False``, ``begin_formal`` returns a ready candidate to
-    the service's existing authoritative verifier; it is never a final answer.
+    candidate draft tokens. With ``False``, a ready candidate can be selected
+    at chunk submit or deferred from commit receipt to finish submit. It is
+    always passed to the existing authoritative verifier, never a final answer.
     """
 
     def __init__(self, producer: Producer,
@@ -346,9 +347,13 @@ class PreSpecCoordinator:
                                       full_audio_end_samples,
                                       allow_candidate and not previous_active)
 
-    def _cancel_pending_shadows(self) -> None:
+    def _cancel_pending_shadows(self, *,
+                                preserve_ready_key: WindowKey | None = None) -> None:
         for key in list(self._tasks):
-            task = self._tasks.pop(key)
+            task = self._tasks[key]
+            if key == preserve_ready_key and task.done():
+                continue
+            self._tasks.pop(key)
             if task.done():
                 self._reserved.discard(task)
             else:
@@ -382,6 +387,12 @@ class PreSpecCoordinator:
         return None
 
     def _discard_window(self, key: WindowKey) -> None:
+        task = self._tasks.pop(key, None)
+        if task is not None:
+            if task.done():
+                self._reserved.discard(task)
+            else:
+                task.cancel()
         self._launched.discard(key)
         segment_key = key[:2]
         self._last_finished_window[segment_key] = max(
@@ -452,8 +463,9 @@ class PreSpecCoordinator:
                      prefix_version: int,
                      full_audio_end_samples: int, *,
                      window_id: int,
-                     allow_candidate: bool = True) -> Candidate | None:
-        """Nonblocking formal entry; cancel an unfinished shadow immediately."""
+                     allow_candidate: bool = True,
+                     defer_candidate: bool = False) -> Candidate | None:
+        """Mark commit; optionally keep a ready candidate for finish submit."""
         segment_key = (session_id, audio_epoch)
         key = (session_id, audio_epoch, window_id)
         if segment_key in self._begun:
@@ -463,6 +475,9 @@ class PreSpecCoordinator:
         self._active_formals[session_id] = previous_active + 1
         self._begun.add(segment_key)
         self._begun_window_ids[segment_key] = window_id
+        if defer_candidate:
+            self._cancel_pending_shadows(preserve_ready_key=key)
+            return None
         task = self._tasks.pop(key, None)
         self._cancel_pending_shadows()
         if key in self._selected:
@@ -471,6 +486,26 @@ class PreSpecCoordinator:
         return self._select_candidate(task, key, "formal", started_ns, prefix_version,
                                       full_audio_end_samples,
                                       allow_candidate and not previous_active)
+
+    def claim_formal_candidate(self, session_id: str, audio_epoch: int, *,
+                               window_id: int, prefix_version: int,
+                               full_audio_end_samples: int) -> Candidate | None:
+        """At actual finish submit, take a ready candidate without waiting."""
+        segment_key = (session_id, audio_epoch)
+        if segment_key not in self._begun:
+            raise ValueError(f"formal boundary was not begun: {segment_key}")
+        key = (session_id, audio_epoch, window_id)
+        started_ns = self.clock()
+        if self._begun_window_ids[segment_key] != window_id:
+            self._emit_probe(key, "formal", started_ns, "window_changed")
+            return None
+        task = self._tasks.pop(key, None)
+        if key in self._selected:
+            self._emit_probe(key, "formal", started_ns, "already_selected")
+            return None
+        return self._select_candidate(task, key, "formal", started_ns,
+                                      prefix_version, full_audio_end_samples,
+                                      self._active_formals[session_id] == 1)
 
     def finish_formal(self, session_id: str, audio_epoch: int,
                       target_continuation_tokens: Sequence[int] | None = None,

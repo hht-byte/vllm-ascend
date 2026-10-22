@@ -312,13 +312,13 @@ rg -n 'PRESPEC_CONFIG|PRESPEC_LAUNCH|PRESPEC_SKIP|PRESPEC_REQUEST|PRESPEC_PROBE|
 <现有服务启动命令> --prespec-mode shadow --prespec-admission force
 ```
 
-使用现有 WebSocket 测试脚本发送**同一段超过 4 秒、在 2 秒正式 chunk 后仍有合法回滚草稿**的音频；这一步并发为 1，不开启自动补位。服务若写日志文件：
+使用现有 WebSocket 测试脚本发送**同一段超过 6 秒、6 秒前不 commit**的音频；这一步并发为 1，不开启自动补位。服务若写日志文件：
 
 ```bash
 tail -F /path/to/server.log | rg --line-buffered 'PRESPEC_|inference submit|Commit received|Segment done'
 ```
 
-若服务由 systemd 管理，改用 `journalctl -u <实际服务单元名> -f -o cat` 作为管道左侧。先用**连续超过 6 秒且 6 秒前不 commit 的单段音频**核对三个窗口：约 1、3、5 秒分别看到 `window=0/1/2` 的 `PRESPEC_LAUNCH/REQUEST`，约 2、4、6 秒分别看到对应 `window=0/1/2 boundary=chunk status=ready_shadow_only`。三个窗口的 `request_id` 应不同，正式 `chunk=0/1/2` 分别只关联同号窗口；任一窗口跳过时不应误领前一窗口候选。`ready_lead_ms > 0` 表示候选早于对应正式 chunk 提交完成；若为 `pending`，候选被取消，不应等待它。若是 `candidate_exceeds_kmax`，shadow 的输出超过正式 proposer 可接收长度，协调器不会把它交给正式请求。随后分别重放提前 commit、≤0.4 秒短尾和断连，确认无遗留 `prespec-...` 请求、重复 begin 或未结束的 session。约 5.95 秒就 commit 的段仍会在 5 秒启动 `window=2`，但未到 6 秒正式 chunk，commit 的 residual finish 不消费该候选。
+若服务由 systemd 管理，改用 `journalctl -u <实际服务单元名> -f -o cat` 作为管道左侧。先用**连续超过 6 秒且 6 秒前不 commit 的单段音频**核对三个窗口：约 1、3、5 秒分别看到 `window=0/1/2` 的 `PRESPEC_LAUNCH/REQUEST`，约 2、4、6 秒分别看到对应 `window=0/1/2 boundary=chunk status=ready_shadow_only`。三个窗口的 `request_id` 应不同，正式 `chunk=0/1/2` 分别只关联同号窗口；任一窗口跳过时不应误领前一窗口候选。`ready_lead_ms > 0` 表示候选早于对应正式请求提交完成；若为 `pending`，候选被取消，不应等待它。若是 `candidate_exceeds_kmax`，shadow 的输出超过正式 proposer 可接收长度，协调器不会把它交给正式请求。随后分别重放提前 commit、≤0.4 秒短尾和断连，确认无遗留 `prespec-...` 请求、重复 begin 或未结束的 session。约 5.95 秒就 commit 的段在 5 秒启动 `window=2`，若未凑足 6 秒正式 chunk，应在实际 `finish_...` 请求提交时看到 `PRESPEC_PROBE window=2 boundary=formal status=ready_shadow_only`；consume 模式则应为 `ready_consumed`，且 `PRESPEC_TARGET boundary=formal` 的 `candidate_request_id` 对应先前的 `prespec-...`。commit 到达时只保留已完成候选，不立即打印 formal probe；若后续完整 chunk 先领取了它，finish 不得重复领取。短尾跳过 finish 时也不会出现 formal probe，外层清理会丢弃候选。
 
 如果链路没有 launch，打开 DEBUG 日志后先看 `return None` 的跳过原因和 `PRESPEC_LAUNCH reason`；`force` 仅绕过实时负载门控，不绕过中点、草稿、在途正式请求和容量检查。
 
@@ -347,7 +347,7 @@ rg 'PRESPEC_SKIP|PRESPEC_LAUNCH' /path/to/run.log | rg -o 'reason=[^ ]+' | sort 
 # 同一回放清单
 ```
 
-这里的 `<现有服务启动命令>` 和 WebSocket 回放命令是环境专属的唯一占位符：本仓库没有 910B 服务启动脚本或你的 `test_v2.py` 参数表，不能编造 CLI。A/B 应逐 chunk 对比已有的客户端 delta/done、最终文本与 commit 边界；若引擎本来就记录正式原始 token IDs，可额外对比，但不为此改造流式输出函数。C 还要确认候选的后续 token 实际写进正式 `ascend_external_draft` 并由引擎 verifier 验证，覆盖首个草稿 token 拒绝、部分接受、全拒绝、版本不匹配和候选超时。此步不通过就不要开始性能对比。
+这里的 `<现有服务启动命令>` 和 WebSocket 回放命令是环境专属的唯一占位符：本仓库没有 910B 服务启动脚本或你的 `test_v2.py` 参数表，不能编造 CLI。A/B 应逐 chunk 对比已有的客户端 delta/done、最终文本与 commit 边界；若引擎本来就记录正式原始 token IDs，可额外对比，但不为此改造流式输出函数。C 还要确认候选的后续 token 实际写进**正式 chunk 与提前 commit 的 `finish_...` 请求**的 `ascend_external_draft` 并由引擎 verifier 验证；分别覆盖首个草稿 token 拒绝、部分接受、全拒绝、版本不匹配和候选超时。提前 commit 的 `PRESPEC_TARGET boundary=formal` 必须显示真实 `finish_...` 请求 ID、候选 ID 和提交草稿长度；短尾跳过或窗口号已改变时不得提交候选。此步不通过就不要开始性能对比。
 
 ## 4. 同负载性能对比：A→B、B→C、A→C
 

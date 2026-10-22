@@ -168,12 +168,12 @@ AsyncLLM() 构造 model，并设置 model.prespec
 | 同文件 `init_streaming_state()` | 初始化 `state.prespec_prefix_version=0`；流式函数已有第三个参数 `connection_id` 可作 `ws_id`，只需另传当前 `seg_id`，具体见第五、六节；`audio_accum` 和 `buffer` 沿用原有字段 |
 | 同文件 `async_streaming_transcribe()` | **每个正式 chunk 内部**，在准备好正式音频/保留前缀、尚未把 external draft 写进请求时领取候选；实际 engine 输出迭代结束后配对退出 |
 | 同文件 `_yield_delta_text()` | 正式输出流程保留；若外层拿不到原始 token IDs，增加一个可选的“最终 token 回调”，用于评估；shadow 不调用此函数 |
-| 同文件 `async_finish_streaming_transcribe()` | 第一版保留原 finish 路径；commit 到达已取消 shadow 并标记正式任务，finish 不重复领取候选 |
+| 同文件 `async_finish_streaming_transcribe()` | 合并 `state.buffer` 到完整音频后、构造 `finish_...` 请求前，领取 commit 时保留的就绪候选；完整音频和当前前缀仍由正式请求验证 |
 | `realtime_connection.py`：`_process_segment()` | 每次 `async for ... async_streaming_transcribe(...)` 完整结束后尝试中点；最外层 `finally` 配对结束该段的 commit 标记 |
 | 同文件 `handle_event()` | append 保留解码入队；commit 在注入 None 前通知协调器，并保存一次配对标志；`session.update` 沿用原语义，若影响活跃段则使旧快照版本失效 |
 | 同文件 `cleanup()` | 先取消并等待生成任务退出，再清理该连接 shadow；等待期间仍须让 chunk/segment 的 finally 执行 |
 
-`handle_connection()`、`_run_generation()`、`_send_stream_item()`、`send()`、`async_transcribe()`、`_infer_asr_vllm_async()` 不需要为最小版增加预投机逻辑。`_finish_segment()` 的短尾跳过、done 统计及协议事件保持原流程；清理标记放外层 finally，才能覆盖到达 finish 之前的异常。
+`handle_connection()`、`_run_generation()`、`_send_stream_item()`、`send()`、`async_transcribe()`、`_infer_asr_vllm_async()` 不需要为最小版增加预投机逻辑。`_finish_segment()` 的短尾跳过、done 统计及协议事件保持原流程；正常 finish 调用需把当前 `seg_id` 传入模型。清理标记放外层 finally，才能覆盖到达 finish 之前的异常。
 
 ### 三、中点触发：在本次 `async_streaming_transcribe()` 生成器退出后
 
@@ -647,7 +647,7 @@ finally:
 
 上段是**插入位置示意**：注释所列的 L520–606 必须保留原函数实际代码，不能把注释当作代码替换。最小版不采集正式请求的原始 token IDs，也不修改 `_yield_delta_text()`。`end_authoritative_chunk()` 不传 `target_continuation_tokens` 时只清理候选，返回 `None`；不得把缺失的对照数据记作“接受 0 个 token”。若需要离线候选质量评估，按 [验证手册的可选采集挂点](streaming_prespec_validation.md) 从正式请求的 DELTA 输出流收集 token IDs；不能初始化 `raw_target_tokens = ()` 后不更新便传入。`try/finally` 覆盖 L557–606 以及真正的生成迭代；清理调用者时显式退出生成器，使 finally 执行。
 
-`shadow_only=True` 时 candidate 恒为 None，正式路径仍用原回滚草稿；默认只记录候选是否赶上正式边界。若按验证手册另行采集正式输出 token，可离线计算原始输出前缀匹配和跳过首 token 后的草稿前缀匹配；它们不是 verifier 接受数。若候选只有首 token、无可提交后续 token，probe 为 `candidate_no_draft`；若后续 token 长度超过 `kmax`，probe 为 `candidate_exceeds_kmax`，两者都不进入正式请求。切换消费模式后，预投机候选仍经过现有 verifier 在完整正式音频上重新验证；实际接受数从引擎 verifier 日志获取。
+`shadow_only=True` 时 candidate 恒为 None，正式路径仍用原回滚草稿；默认只记录候选是否赶上正式边界。若按验证手册另行采集正式输出 token，可离线计算原始输出前缀匹配和跳过首 token 后的草稿前缀匹配；它们不是 verifier 接受数。若候选只有首 token、无可提交后续 token，probe 为 `candidate_no_draft`；若后续 token 长度超过 `kmax`，probe 为 `candidate_exceeds_kmax`，两者都不进入正式请求。切换消费模式后，预投机候选仍经过现有 verifier 在完整正式音频上重新验证；实际接受数从引擎 verifier 日志获取。commit 的 residual finish 使用相同的领取与验证规则，接线见下一节。
 
 ### 六、commit 与清理：给出插入代码和字段初始化
 
@@ -681,15 +681,62 @@ if self.prespec is not None and not segment.prespec_formal_begun:
                  if segment.asr_state is not None else 0)
     self.prespec.begin_formal(
         ws_id, seg_id, current_prefix_version,
-        0,  # allow_candidate=False；此处只标记正式任务忙，不按音频截止领取候选
+        0,  # 此时队列尚未消费完，不能用它验证完整音频截止
         window_id=window_id,
-        allow_candidate=False,
+        defer_candidate=True,  # 保留已完成候选；未完成候选立即取消
     )
     segment.prespec_formal_window_id = window_id
     segment.prespec_formal_begun = True
 
 # 随后继续你原有的 None 入队代码，不新增第二个 None。
 ```
+
+#### `_finish_segment()`：正常 finish 调用附加连接和段标识
+
+保留现有 `remaining <= 0.4s` 的跳过分支，不在该分支领取候选。正常调用 `async_finish_streaming_transcribe(...)` 时，**原有位置实参保持不变**，在调用末尾增加 `prespec_ws_id=self.connection_id, prespec_seg_id=seg_id` 两个关键字。模型函数签名末尾也增加同名可选形参，供未接入预投机的旧调用方继续使用。`connection_id` 是现有 `ws-...`，`seg_id` 是当前日志段号。
+
+#### `async_finish_streaming_transcribe()`：在 `finish_...` 正式请求提交前领取
+
+此函数原有流程先把剩余 `state.buffer` 并入 `state.audio_accum`，再构造完整音频的正式 finish 请求。**在合并完成、原函数已确定本次前缀、回滚草稿和本次 `sampling_params` 之后，紧邻 finish 请求打包之前**插入：
+
+```python
+prespec = getattr(self, "prespec", None)
+candidate = None
+if (prespec is not None and prespec_ws_id is not None
+        and prespec_seg_id is not None):
+    candidate = prespec.claim_formal_candidate(
+        prespec_ws_id, prespec_seg_id,
+        window_id=state.chunk_id,
+        prefix_version=state.prespec_prefix_version,
+        full_audio_end_samples=len(state.audio_accum),
+    )
+
+# 原函数如已有 finish 回滚草稿，沿用其 token IDs；没有则用空元组。
+# 此处不要重新 tokenize 文本，也不要把候选首 token 拼进 prompt。
+finish_draft_token_ids = (
+    candidate.formal_draft_token_ids if candidate is not None
+    else existing_finish_draft_token_ids
+)
+sampling_params.extra_args = {
+    **(sampling_params.extra_args or {}),
+    "ascend_external_draft": list(finish_draft_token_ids),
+}
+```
+
+上面的 `existing_finish_draft_token_ids` 对应原 finish 代码算出的回滚草稿；若原 finish 没有这个变量，在该分支先设 `existing_finish_draft_token_ids = ()`。`sampling_params` 必须是本次 finish 请求专用的原有对象；保留其 temperature、max_tokens、output_kind、stop/EOS 等参数和原有完整音频 prompt，**只替换** `ascend_external_draft` 的值。若正式 finish 用 `_pack_stream_request(...)` 打包，传入相同的 `finish_draft_token_ids`，不要重复写一遍 `extra_args`。现有 `finish_...` `request_id`、`engine.generate(...)`、输出解析及状态更新位置不变。紧邻原 `engine.generate(...)` 前加一条来源日志：
+
+```python
+logger.info(
+    "PRESPEC_TARGET ws_id=%s seg=%s window=%s boundary=formal "
+    "formal_request_id=%s candidate_request_id=%s submitted_draft_tokens=%s",
+    prespec_ws_id, prespec_seg_id, state.chunk_id,
+    finish_request_id,  # 换成原 finish 请求实际使用的 request_id 局部变量
+    candidate.request_id if candidate is not None else None,
+    len(finish_draft_token_ids),
+)
+```
+
+`claim_formal_candidate()` 不等待候选，只在其完成、版本相同、候选音频截止不晚于完整正式音频、草稿长度不超 `kmax` 且窗口号仍相同时返回候选。shadow 模式下返回 `None`，但记录 `PRESPEC_PROBE boundary=formal status=ready_shadow_only`，正式请求继续使用原 finish 草稿；consume 模式下可返回候选并记录 `ready_consumed`。consume 的候选必须由现有引擎在**完整正式音频**上验证，不能直接把 shadow 文本发给客户端。
 
 #### `_process_segment()`：用最外层 try/finally 包住原函数主体
 
@@ -719,18 +766,18 @@ if self.prespec is not None:
 
 #### 异常路径和配对规则
 
-- `handle_event()` 处理真实 commit 时，在注入 None 之前读取当前 `state.chunk_id`，调用 `begin_formal(ws_id, seg_id, version, 0, window_id=window_id, allow_candidate=False)`，并把 `window_id` 存入 `segment.prespec_formal_window_id`。这个 0 只是未消费候选时的音频截止占位参数，不与真正的段内音频截止比较。重复 commit 不能重复 begin；state 尚未初始化时版本和窗口 ID 均可取 0。
+- `handle_event()` 处理真实 commit 时，在注入 None 之前读取当前 `state.chunk_id`，调用 `begin_formal(ws_id, seg_id, version, 0, window_id=window_id, defer_candidate=True)`，并把 `window_id` 存入 `segment.prespec_formal_window_id`。这个 0 是尚未消费队列时的占位参数；保留已经完成的本窗口候选，取消仍在运行的 shadow。重复 commit 不能重复 begin；state 尚未初始化时版本和窗口 ID 均可取 0。
 - `_process_segment()` 最外层 finally 检查上述标志，用保存的 `prespec_formal_window_id` 调用 `finish_formal(ws_id, seg_id, window_id=...)` 并清标志。不能在 finish 时重新读取可能已经递增的 `state.chunk_id`。此处包住流式循环与 `_finish_segment()`，所以短尾跳过、正常完成和中途异常都会配对；不传 token IDs 表示只清理、不做候选质量评估。
 - 如果某段已 begin 但入队失败或被取消前根本未进入 `_process_segment()`，由对应异常处理或连接 cleanup 清理；不能期待一个从未进入的 finally 自动执行。
 - `cleanup()` 先取消并等待生成任务及其流式生成器退出，再 `await asr.prespec.close_session(ws_id)`，最后做原有队列/统计清理。不要先删协调器计数再让模型 finally 退出。
 
-`_finish_segment()` 的 `<=0.4s` 跳过条件保持原样。commit 已到达时的 residual finish 第一版不消费候选；这也是为什么正式 chunk 的接入必须放在 `async_streaming_transcribe()` 内，而不能只改 finish。
+`_finish_segment()` 的 `<=0.4s` 跳过条件保持原样：没有正式 finish 推理就不领取候选，外层 `finish_formal()` 丢弃它。若 commit 后队列中的音频又凑足一个完整 chunk，该 chunk 仍可用自己的候选；如果它使 `state.chunk_id` 前进，原窗口的候选不能转交给新的 residual finish，`claim_formal_candidate()` 会记录 `window_changed` 并回退到原 finish 草稿。任何异常或断连都由外层 finally 和 `close_session()` 清理，不等待 shadow。
 
 ### 七、最小版范围与验证
 
 910B 上按“回滚投机 baseline → shadow → 消费候选”逐步验证的可执行命令、最小日志接线和判定表见 [streaming_prespec_validation.md](streaming_prespec_validation.md)。协调器本身不自动打印 launch、probe 或 evaluation；只看原有服务日志无法判断预投机是否运行。
 
-当前协调器按 `(session_id, audio_epoch, window_id)` 去重，其中 `audio_epoch=seg_id`、`window_id=state.chunk_id`。**每个尚未提交的正式 chunk 窗口可启动一次**：`chunk-0` 在约 1 s 中点用空旧草稿起草；2 s 正式结果后，3 s 中点为 4 s 的 `chunk-1` 起草；4 s 正式结果写回后，5 s 中点为 6 s 的 `chunk-2` 起草。每次正式 chunk 结束回收该窗口，commit 只处理当时的窗口并保持段级 begin/finish 配对。后续窗口按原规则验证已有回滚草稿；不能跨 VAD 段借用旧 token。若音频在下一正式 chunk 前 commit，残余 finish 仍不消费该窗口的候选。
+当前协调器按 `(session_id, audio_epoch, window_id)` 去重，其中 `audio_epoch=seg_id`、`window_id=state.chunk_id`。**每个尚未提交的正式 chunk 窗口可启动一次**：`chunk-0` 在约 1 s 中点用空旧草稿起草；2 s 正式结果后，3 s 中点为 4 s 的 `chunk-1` 起草；4 s 正式结果写回后，5 s 中点为 6 s 的 `chunk-2` 起草。每次正式 chunk 结束回收该窗口；提前 commit 则保留已完成的本窗口候选，在 residual finish 正式请求提交时核对并领取。后续窗口按原规则验证已有回滚草稿；不能跨 VAD 段借用旧 token，也不能把旧窗口候选交给新窗口。
 
 首次用共享的单个协调器、一个 active shadow、`shadow_only=True`、默认候选预算为 `kmax+1`。受控低并发实验可用 `admission_mode="force"` 和现有旁路监测，先打通链路；它不保证不干扰正式时延。在线 `gated` 模式仍需新鲜队列/利用率和实测耗时预算，约 2 s 的 `npu-smi` 读数不能冒充默认 200 ms 的 admission 读数。
 
