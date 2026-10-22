@@ -51,7 +51,7 @@ class PreSpecModelHelpers:
     """
 
     def try_start_prespec(
-        self, *, ws_id, seg_id, prefix_version, full_audio_pcm_f32le,
+        self, *, ws_id, seg_id, window_id, prefix_version, full_audio_pcm_f32le,
         current_audio_end_samples, last_formal_audio_end_samples,
         chunk_size_samples, prefix_text, stable_prefix_token_ids,
         rollback_draft_token_ids,
@@ -72,26 +72,24 @@ class PreSpecModelHelpers:
             return LaunchDecision(False, "before_midpoint")
         if new_samples >= chunk_size_samples:
             return LaunchDecision(False, "formal_chunk_due")
-        if not rollback_draft_token_ids:
-            return LaunchDecision(False, "no_rollback_draft")
         draft_len = len(rollback_draft_token_ids)
         if draft_len > coordinator.policy.max_rollback_draft_tokens:
             if coordinator.should_log_budget_skip(
-                    ws_id, seg_id, "rollback_draft_exceeds_kmax"):
+                    ws_id, seg_id, window_id, "rollback_draft_exceeds_kmax"):
                 logger.info(
-                    "PRESPEC_SKIP ws_id=%s seg=%s reason=rollback_draft_exceeds_kmax "
+                    "PRESPEC_SKIP ws_id=%s seg=%s window=%s reason=rollback_draft_exceeds_kmax "
                     "draft_tokens=%s kmax=%s",
-                    ws_id, seg_id, draft_len,
+                    ws_id, seg_id, window_id, draft_len,
                     coordinator.policy.max_rollback_draft_tokens,
                 )
             return LaunchDecision(False, "rollback_draft_exceeds_kmax")
         if draft_len + 2 > coordinator.policy.max_candidate_tokens:
             if coordinator.should_log_budget_skip(
-                    ws_id, seg_id, "candidate_budget_insufficient"):
+                    ws_id, seg_id, window_id, "candidate_budget_insufficient"):
                 logger.info(
-                    "PRESPEC_SKIP ws_id=%s seg=%s reason=candidate_budget_insufficient "
+                    "PRESPEC_SKIP ws_id=%s seg=%s window=%s reason=candidate_budget_insufficient "
                     "draft_tokens=%s candidate_budget=%s required=%s",
-                    ws_id, seg_id, draft_len,
+                    ws_id, seg_id, window_id, draft_len,
                     coordinator.policy.max_candidate_tokens, draft_len + 2,
                 )
             return LaunchDecision(False, "candidate_budget_insufficient")
@@ -104,7 +102,7 @@ class PreSpecModelHelpers:
         if len(audio_bytes) // 4 != current_audio_end_samples:
             raise ValueError("audio bytes and sample cutoff disagree")
         request = ModelShadowRequest(
-            session_id=ws_id, audio_epoch=seg_id,
+            session_id=ws_id, audio_epoch=seg_id, window_id=window_id,
             base_prefix_version=prefix_version,
             visible_audio_end_samples=current_audio_end_samples,
             window_audio_samples=new_samples,

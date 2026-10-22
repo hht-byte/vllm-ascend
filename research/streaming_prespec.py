@@ -27,6 +27,7 @@ class ShadowRequest:
 
     session_id: str
     audio_epoch: int
+    window_id: int
     base_prefix_version: int
     visible_audio_end_samples: int
     window_audio_samples: int
@@ -71,6 +72,7 @@ class Candidate:
     request_id: str
     session_id: str
     audio_epoch: int
+    window_id: int
     base_prefix_version: int
     visible_audio_end_samples: int
     token_ids: tuple[int, ...]
@@ -88,6 +90,7 @@ class Evaluation:
 
     session_id: str
     audio_epoch: int
+    window_id: int
     candidate_tokens: tuple[int, ...]
     raw_matched_prefix_tokens: int
     draft_matched_prefix_tokens: int
@@ -105,6 +108,7 @@ class Evaluation:
 class CandidateProbe:
     session_id: str
     audio_epoch: int
+    window_id: int
     boundary: Literal["chunk", "formal"]
     target_start_ns: int
     status: str
@@ -115,6 +119,8 @@ class CandidateProbe:
 Producer = Callable[[ShadowRequest, int], Awaitable[Sequence[int]]]
 Clock = Callable[[], int]
 ProbeSink = Callable[[CandidateProbe], None]
+WindowKey = tuple[str, int, int]
+SegmentKey = tuple[str, int]
 
 
 @dataclass(frozen=True)
@@ -209,20 +215,24 @@ class PreSpecCoordinator:
         self.shadow_only = shadow_only
         self.on_probe = on_probe
         self.probe_error_count = 0
-        self._tasks: dict[tuple[str, int], asyncio.Task[Candidate]] = {}
+        self._tasks: dict[WindowKey, asyncio.Task[Candidate]] = {}
         self._reserved: set[asyncio.Task[Candidate]] = set()
         self._task_sessions: dict[asyncio.Task[Candidate], str] = {}
-        self._launched: set[tuple[str, int]] = set()
-        self._begun: set[tuple[str, int]] = set()
-        self._selected: dict[tuple[str, int], Candidate] = {}
-        self._selected_at_ns: dict[tuple[str, int], int] = {}
+        self._launched: set[WindowKey] = set()
+        self._begun: set[SegmentKey] = set()
+        self._begun_window_ids: dict[SegmentKey, int] = {}
+        self._selected: dict[WindowKey, Candidate] = {}
+        self._selected_at_ns: dict[WindowKey, int] = {}
+        self._last_finished_window: dict[SegmentKey, int] = {}
+        self._finished_segments: set[SegmentKey] = set()
         self._active_formals: dict[str, int] = {}
         self._active_chunks: dict[str, int] = {}
-        self._logged_budget_skips: set[tuple[str, int, str]] = set()
+        self._active_window_keys: set[WindowKey] = set()
+        self._logged_budget_skips: set[tuple[str, int, int, str]] = set()
 
     def should_log_budget_skip(self, session_id: str, audio_epoch: int,
-                               reason: str) -> bool:
-        key = (session_id, audio_epoch, reason)
+                               window_id: int, reason: str) -> bool:
+        key = (session_id, audio_epoch, window_id, reason)
         if key in self._logged_budget_skips:
             return False
         self._logged_budget_skips.add(key)
@@ -231,7 +241,8 @@ class PreSpecCoordinator:
     def maybe_start(self, request: ShadowRequest, load: LoadSnapshot | None,
                     predicted_draft_ms: float) -> LaunchDecision:
         """Try one midpoint request; never put a shadow task in a waiting queue."""
-        key = (request.session_id, request.audio_epoch)
+        key = (request.session_id, request.audio_epoch, request.window_id)
+        segment_key = key[:2]
         now = self.clock()
         if request.window_audio_samples < self.policy.midpoint_samples:
             return LaunchDecision(False, "before_midpoint")
@@ -239,7 +250,10 @@ class PreSpecCoordinator:
             return LaunchDecision(False, "rollback_draft_exceeds_kmax")
         if len(request.rollback_tokens) + 2 > self.policy.max_candidate_tokens:
             return LaunchDecision(False, "candidate_budget_insufficient")
-        if key in self._launched or key in self._begun:
+        if (key in self._launched or segment_key in self._begun
+                or segment_key in self._finished_segments
+                or request.window_id <= self._last_finished_window.get(
+                    segment_key, -1)):
             return LaunchDecision(False, "epoch_already_used")
         if self._active_formals.get(request.session_id, 0):
             return LaunchDecision(False, "session_formal_inflight")
@@ -287,7 +301,7 @@ class PreSpecCoordinator:
         if not all(isinstance(token, int) and token >= 0 for token in token_ids):
             raise ValueError("producer returned invalid token IDs")
         return Candidate(request.request_id, request.session_id, request.audio_epoch,
-                         request.base_prefix_version,
+                         request.window_id, request.base_prefix_version,
                          request.visible_audio_end_samples, token_ids,
                          self.clock())
 
@@ -299,17 +313,24 @@ class PreSpecCoordinator:
 
     def begin_authoritative_chunk(self, session_id: str, *,
                                   audio_epoch: int | None = None,
+                                  window_id: int | None = None,
                                   prefix_version: int | None = None,
                                   full_audio_end_samples: int | None = None,
                                   allow_candidate: bool = True) -> Candidate | None:
         """At target chunk submit, take a ready draft or cancel shadow work."""
-        if audio_epoch is not None and (prefix_version is None or
+        if audio_epoch is not None and (window_id is None or
+                                        prefix_version is None or
                                         full_audio_end_samples is None):
-            raise ValueError("chunk candidate needs prefix version and audio end")
+            raise ValueError("chunk candidate needs window, prefix version and audio end")
+        key = ((session_id, audio_epoch, window_id)
+               if audio_epoch is not None else None)
+        if key is not None:
+            if key in self._active_window_keys:
+                raise ValueError(f"chunk window already active: {key}")
+            self._active_window_keys.add(key)
         started_ns = self.clock()
         previous_active = self._active_chunks.get(session_id, 0)
         self._active_chunks[session_id] = previous_active + 1
-        key = (session_id, audio_epoch) if audio_epoch is not None else None
         task = self._tasks.pop(key, None) if key is not None else None
         self._cancel_pending_shadows()
         if key is None:
@@ -331,9 +352,16 @@ class PreSpecCoordinator:
 
     def end_authoritative_chunk(self, session_id: str, *,
                                 audio_epoch: int | None = None,
+                                window_id: int | None = None,
                                 target_continuation_tokens: Sequence[int] | None = None
                                 ) -> Evaluation | None:
         """End a chunk; omit target tokens to discard without quality scoring."""
+        if audio_epoch is not None and window_id is None:
+            raise ValueError("chunk cleanup needs window id")
+        key = ((session_id, audio_epoch, window_id)
+               if audio_epoch is not None else None)
+        if key is not None and key not in self._active_window_keys:
+            raise ValueError(f"chunk window was not begun: {key}")
         active = self._active_chunks.get(session_id, 0)
         if active <= 0:
             raise ValueError(f"no authoritative chunk in flight: {session_id}")
@@ -341,18 +369,29 @@ class PreSpecCoordinator:
             del self._active_chunks[session_id]
         else:
             self._active_chunks[session_id] = active - 1
-        if audio_epoch is not None:
-            return self._evaluate((session_id, audio_epoch),
-                                  target_continuation_tokens)
+        if key is not None:
+            self._active_window_keys.remove(key)
+            try:
+                return self._evaluate(key, target_continuation_tokens)
+            finally:
+                self._discard_window(key)
         return None
 
-    def _emit_probe(self, key: tuple[str, int],
+    def _discard_window(self, key: WindowKey) -> None:
+        self._launched.discard(key)
+        segment_key = key[:2]
+        self._last_finished_window[segment_key] = max(
+            key[2], self._last_finished_window.get(segment_key, -1))
+        self._logged_budget_skips.discard((*key, "rollback_draft_exceeds_kmax"))
+        self._logged_budget_skips.discard((*key, "candidate_budget_insufficient"))
+
+    def _emit_probe(self, key: WindowKey,
                     boundary: Literal["chunk", "formal"], started_ns: int,
                     status: str, candidate: Candidate | None = None) -> None:
         if self.on_probe is None:
             return
         probe = CandidateProbe(
-            key[0], key[1], boundary, started_ns, status,
+            key[0], key[1], key[2], boundary, started_ns, status,
             (started_ns - candidate.ready_ns) / 1e6 if candidate else None,
             candidate.request_id if candidate else None)
         try:
@@ -361,7 +400,7 @@ class PreSpecCoordinator:
             self.probe_error_count += 1  # Measurement must not fail target work.
 
     def _select_candidate(self, task: asyncio.Task[Candidate] | None,
-                          key: tuple[str, int],
+                          key: WindowKey,
                           boundary: Literal["chunk", "formal"], started_ns: int,
                           prefix_version: int,
                           full_audio_end_samples: int,
@@ -387,6 +426,7 @@ class PreSpecCoordinator:
             self._emit_probe(key, boundary, started_ns, "version_mismatch", candidate)
             return None
         if (candidate.audio_epoch != key[1]
+                or candidate.window_id != key[2]
                 or candidate.visible_audio_end_samples > full_audio_end_samples):
             self._emit_probe(key, boundary, started_ns, "audio_mismatch", candidate)
             return None
@@ -407,15 +447,18 @@ class PreSpecCoordinator:
     def begin_formal(self, session_id: str, audio_epoch: int,
                      prefix_version: int,
                      full_audio_end_samples: int, *,
+                     window_id: int,
                      allow_candidate: bool = True) -> Candidate | None:
         """Nonblocking formal entry; cancel an unfinished shadow immediately."""
-        key = (session_id, audio_epoch)
-        if key in self._begun:
-            raise ValueError(f"formal boundary already begun: {key}")
+        segment_key = (session_id, audio_epoch)
+        key = (session_id, audio_epoch, window_id)
+        if segment_key in self._begun:
+            raise ValueError(f"formal boundary already begun: {segment_key}")
         started_ns = self.clock()
         previous_active = self._active_formals.get(session_id, 0)
         self._active_formals[session_id] = previous_active + 1
-        self._begun.add(key)
+        self._begun.add(segment_key)
+        self._begun_window_ids[segment_key] = window_id
         task = self._tasks.pop(key, None)
         self._cancel_pending_shadows()
         if key in self._selected:
@@ -426,22 +469,30 @@ class PreSpecCoordinator:
                                       allow_candidate and not previous_active)
 
     def finish_formal(self, session_id: str, audio_epoch: int,
-                      target_continuation_tokens: Sequence[int] | None = None
+                      target_continuation_tokens: Sequence[int] | None = None,
+                      *, window_id: int
                       ) -> Evaluation | None:
         """End a formal boundary; optional tokens enable quality scoring."""
-        key = (session_id, audio_epoch)
-        if key not in self._begun:
-            raise ValueError(f"formal boundary was not begun: {key}")
-        self._begun.remove(key)
+        segment_key = (session_id, audio_epoch)
+        key = (session_id, audio_epoch, window_id)
+        if segment_key not in self._begun:
+            raise ValueError(f"formal boundary was not begun: {segment_key}")
+        if self._begun_window_ids[segment_key] != window_id:
+            raise ValueError(f"formal window mismatch: {segment_key}")
+        self._begun.remove(segment_key)
+        del self._begun_window_ids[segment_key]
         active = self._active_formals[session_id] - 1
         if active:
             self._active_formals[session_id] = active
         else:
             del self._active_formals[session_id]
-        self._launched.discard(key)
-        return self._evaluate(key, target_continuation_tokens)
+        try:
+            return self._evaluate(key, target_continuation_tokens)
+        finally:
+            self._discard_window(key)
+            self._finished_segments.add(segment_key)
 
-    def _evaluate(self, key: tuple[str, int],
+    def _evaluate(self, key: WindowKey,
                   target_continuation_tokens: Sequence[int] | None
                   ) -> Evaluation | None:
         candidate = self._selected.pop(key, None)
@@ -463,7 +514,7 @@ class PreSpecCoordinator:
         draft_match = matched_prefix_len(candidate.formal_draft_token_ids,
                                          target_continuation_tokens[1:])
         return Evaluation(
-            key[0], key[1], candidate.token_ids,
+            key[0], key[1], key[2], candidate.token_ids,
             raw_matched_prefix_tokens=raw_match,
             draft_matched_prefix_tokens=draft_match,
             target_token_count=len(target_continuation_tokens),
@@ -488,8 +539,22 @@ class PreSpecCoordinator:
                           if key[0] != session_id}
         self._selected_at_ns = {key: when for key, when in self._selected_at_ns.items()
                                 if key[0] != session_id}
+        self._last_finished_window = {
+            key: window for key, window in self._last_finished_window.items()
+            if key[0] != session_id
+        }
+        self._finished_segments = {
+            key for key in self._finished_segments if key[0] != session_id
+        }
+        self._begun_window_ids = {
+            key: window for key, window in self._begun_window_ids.items()
+            if key[0] != session_id
+        }
         self._active_formals.pop(session_id, None)
         self._active_chunks.pop(session_id, None)
+        self._active_window_keys = {
+            key for key in self._active_window_keys if key[0] != session_id
+        }
         self._logged_budget_skips = {
             key for key in self._logged_budget_skips if key[0] != session_id
         }

@@ -103,9 +103,9 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
 ```python
 def log_prespec_probe(p):
     logger.info(
-        "PRESPEC_PROBE ws_id=%s seg=%s boundary=%s status=%s "
+        "PRESPEC_PROBE ws_id=%s seg=%s window=%s boundary=%s status=%s "
         "request_id=%s ready_lead_ms=%s",
-        p.session_id, p.audio_epoch, p.boundary, p.status,
+        p.session_id, p.audio_epoch, p.window_id, p.boundary, p.status,
         p.request_id, p.ready_lead_ms,
     )
 
@@ -138,30 +138,34 @@ logger.info(
 async def _logged_prespec_producer(self, request, budget):
     started_ns = time.monotonic_ns()
     logger.info(
-        "PRESPEC_REQUEST event=submit ws_id=%s seg=%s request_id=%s "
+        "PRESPEC_REQUEST event=submit ws_id=%s seg=%s window=%s request_id=%s "
         "audio_end_samples=%s rollback_tokens=%s budget=%s",
-        request.session_id, request.audio_epoch, request.request_id,
+        request.session_id, request.audio_epoch, request.window_id,
+        request.request_id,
         request.visible_audio_end_samples, len(request.rollback_tokens), budget,
     )
     try:
         token_ids = await self._run_prespec(request, budget)
     except asyncio.CancelledError:
         logger.info(
-            "PRESPEC_REQUEST event=cancel ws_id=%s seg=%s request_id=%s elapsed_ms=%.3f",
-            request.session_id, request.audio_epoch, request.request_id,
+            "PRESPEC_REQUEST event=cancel ws_id=%s seg=%s window=%s request_id=%s elapsed_ms=%.3f",
+            request.session_id, request.audio_epoch, request.window_id,
+            request.request_id,
             (time.monotonic_ns() - started_ns) / 1e6,
         )
         raise
     except Exception:
         logger.exception(
-            "PRESPEC_REQUEST event=failed ws_id=%s seg=%s request_id=%s",
-            request.session_id, request.audio_epoch, request.request_id,
+            "PRESPEC_REQUEST event=failed ws_id=%s seg=%s window=%s request_id=%s",
+            request.session_id, request.audio_epoch, request.window_id,
+            request.request_id,
         )
         raise
     logger.info(
-        "PRESPEC_REQUEST event=done ws_id=%s seg=%s request_id=%s "
+        "PRESPEC_REQUEST event=done ws_id=%s seg=%s window=%s request_id=%s "
         "tokens=%s elapsed_ms=%.3f",
-        request.session_id, request.audio_epoch, request.request_id,
+        request.session_id, request.audio_epoch, request.window_id,
+        request.request_id,
         len(token_ids), (time.monotonic_ns() - started_ns) / 1e6,
     )
     return token_ids
@@ -171,21 +175,21 @@ async def _logged_prespec_producer(self, request, budget):
 
 ### 1.3 `realtime_connection.py`：记录中点准入决定
 
-在 [第三节](streaming_prespec.md) 的 `_process_segment()` 中，紧跟 `try_start_prespec_for_state(...)` 返回之后插入。保留原有 `segment.prespec_started` 赋值：
+在 [第三节](streaming_prespec.md) 的 `_process_segment()` 中，用下列代码替换 `try_start_prespec_for_state(...)` 返回后的简短 `if decision...` 块。该节已在调用前保存 `window_id = segment.asr_state.chunk_id`；`segment.prespec_started_window` 只赋值一次：
 
 ```python
 if decision is not None:
     log = logger.info if decision.launched else logger.debug
     log(
-        "PRESPEC_LAUNCH ws_id=%s seg=%s launched=%s reason=%s slack_ms=%s",
-        self.connection_id, seg_id, decision.launched,
+        "PRESPEC_LAUNCH ws_id=%s seg=%s window=%s launched=%s reason=%s slack_ms=%s",
+        self.connection_id, seg_id, window_id, decision.launched,
         decision.reason, decision.slack_ms,
     )
 if decision is not None and decision.launched:
-    segment.prespec_started = True
+    segment.prespec_started_window = window_id
 ```
 
-`try_start_prespec_for_state()` 在未达中点、已 commit、音频队列非空或无合法回滚草稿时返回 `None`，因此这些路径**不会**出现 `PRESPEC_LAUNCH`。真正进入 `try_start_prespec()` 后，旧草稿超出引擎 `kmax` 或输出预算放不下 `1 + 旧草稿长度 + 1` 时，分别返回 `rollback_draft_exceeds_kmax` / `candidate_budget_insufficient`，不会给引擎发缩短后的草稿。这两项准入检查在 shadow 和 consume 模式都执行；两者只在正式请求是否使用已完成候选上不同。helper 对每个 `(ws_id, seg_id, reason)` 只输出一次 `PRESPEC_SKIP` INFO，避免后续 80 ms chunk 重复刷屏。若预期到达 3 秒却没有 launch，请在包装函数这些 `return None` 前临时加一条 `DEBUG` 日志，包含 `ws_id/seg/chunk_id/len(state.buffer)/reason`；不要据“无 launch 日志”直接判断负载门控拒绝。
+`try_start_prespec_for_state()` 在未达中点、已 commit 或音频队列非空时返回 `None`，因此这些路径**不会**出现 `PRESPEC_LAUNCH`。`chunk-0` 没有旧回滚草稿，空草稿有效；在 consume 模式下，正式请求可验证它在 1 s 音频下生成的候选。真正进入 `try_start_prespec()` 后，旧草稿超出引擎 `kmax` 或输出预算放不下 `1 + 旧草稿长度 + 1` 时，分别返回 `rollback_draft_exceeds_kmax` / `candidate_budget_insufficient`，不会给引擎发缩短后的草稿。这两项准入检查在 shadow 和 consume 模式都执行；两者只在正式请求是否使用已完成候选上不同。helper 对每个 `(ws_id, seg_id, window_id, reason)` 只输出一次 `PRESPEC_SKIP` INFO，避免同一窗口的后续 80 ms chunk 重复刷屏。若预期到达中点却没有 launch，请在包装函数这些 `return None` 前临时加一条 `DEBUG` 日志，包含 `ws_id/seg/window_id/len(state.buffer)/reason`；不要据“无 launch 日志”直接判断负载门控拒绝。
 
 ### 1.4 `qwen3_asr_async.py`：关联正式请求与候选
 
@@ -207,7 +211,8 @@ logger.info(
 
 ```python
 if prespec is not None:
-    prespec.end_authoritative_chunk(ws_id, audio_epoch=seg_id)
+    prespec.end_authoritative_chunk(
+        ws_id, audio_epoch=seg_id, window_id=this_chunk_id)
 ```
 
 不传 `target_continuation_tokens` 表示**只清理候选，不计算匹配长度**，协调器返回 `None`；不能把此结果记为“接受 0 个 token”。C 组仍须在引擎实际处理 `ascend_external_draft` 的验证结果处记录 `request_id`、提交的草稿长度、实际连续接受长度、**首个草稿 token** 是否拒绝、修正 token 数、目标模型前向步数。首个 target token 已在 proposer 之前采样，不属于 external draft。只在 proposer 的 `propose()` 打日志不足以证明草稿被验证；该函数只负责提出 token。先在服务/引擎仓库定位挂点：
@@ -255,6 +260,7 @@ finally:
         evaluation = prespec.end_authoritative_chunk(
             ws_id,
             audio_epoch=seg_id,
+            window_id=this_chunk_id,
             target_continuation_tokens=(
                 tuple(raw_target_tokens) if formal_output_finished else None
             ),
@@ -276,7 +282,7 @@ finally:
 
 日志关联以 `ws_id + seg + chunk` 为正式键，以 `prespec-...` 为 shadow 引擎请求键；不要把不同 request 的 prefill/decode 打点混在一起。`PRESPEC_PROBE status=ready_consumed` 发生在正式验证**之前**，不能代替 verifier 日志。
 
-先把本仓库的两个模块复制到服务的 `qwen_asr/inference/`，监测脚本复制到测试工作目录；若两仓库在同一主机上，在服务项目根目录执行（替换检出路径）：
+先把本仓库的两个模块复制到服务的 `qwen_asr/inference/`，并**在同一次部署中**按主接入文档更新连接层、模型包装函数和正式 chunk 的 `window_id` 实参。新协调器要求 `begin_authoritative_chunk`、`end_authoritative_chunk`、`begin_formal`、`finish_formal` 携带窗口 ID；只替换模块而保留旧调用会报错。监测脚本复制到测试工作目录；若两仓库在同一主机上，在服务项目根目录执行（替换检出路径）：
 
 ```bash
 cp /path/to/vllm-ascend/research/streaming_prespec.py qwen_asr/inference/
@@ -310,7 +316,7 @@ rg -n 'PRESPEC_CONFIG|PRESPEC_LAUNCH|PRESPEC_SKIP|PRESPEC_REQUEST|PRESPEC_PROBE|
 tail -F /path/to/server.log | rg --line-buffered 'PRESPEC_|inference submit|Commit received|Segment done'
 ```
 
-若服务由 systemd 管理，改用 `journalctl -u <实际服务单元名> -f -o cat` 作为管道左侧。预期按序看到 `PRESPEC_CONFIG`、中点 `PRESPEC_LAUNCH launched=True`、`PRESPEC_REQUEST submit/done` 和正式 chunk 的 `PRESPEC_PROBE boundary=chunk status=ready_shadow_only`。`ready_lead_ms > 0` 表示候选早于正式 chunk 提交完成；若为 `pending`，候选被取消，不应等待它。若是 `candidate_exceeds_kmax`，shadow 的输出超过正式 proposer 可接收长度，协调器不会把它交给正式请求。随后分别重放提前 commit、≤0.4 秒短尾和断连，确认无遗留 `prespec-...` 请求、重复 begin 或未结束的 session。
+若服务由 systemd 管理，改用 `journalctl -u <实际服务单元名> -f -o cat` 作为管道左侧。先用**连续超过 6 秒且 6 秒前不 commit 的单段音频**核对三个窗口：约 1、3、5 秒分别看到 `window=0/1/2` 的 `PRESPEC_LAUNCH/REQUEST`，约 2、4、6 秒分别看到对应 `window=0/1/2 boundary=chunk status=ready_shadow_only`。三个窗口的 `request_id` 应不同，正式 `chunk=0/1/2` 分别只关联同号窗口；任一窗口跳过时不应误领前一窗口候选。`ready_lead_ms > 0` 表示候选早于对应正式 chunk 提交完成；若为 `pending`，候选被取消，不应等待它。若是 `candidate_exceeds_kmax`，shadow 的输出超过正式 proposer 可接收长度，协调器不会把它交给正式请求。随后分别重放提前 commit、≤0.4 秒短尾和断连，确认无遗留 `prespec-...` 请求、重复 begin 或未结束的 session。约 5.95 秒就 commit 的段仍会在 5 秒启动 `window=2`，但未到 6 秒正式 chunk，commit 的 residual finish 不消费该候选。
 
 如果链路没有 launch，打开 DEBUG 日志后先看 `return None` 的跳过原因和 `PRESPEC_LAUNCH reason`；`force` 仅绕过实时负载门控，不绕过中点、草稿、在途正式请求和容量检查。
 

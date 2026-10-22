@@ -190,22 +190,24 @@ async for stream_item in self.asr.async_streaming_transcribe(
 ):
     await self._send_stream_item(stream_item)
 
-if self.prespec is not None and not segment.prespec_started:
+window_id = segment.asr_state.chunk_id  # 下一次正式 chunk 的 ID
+if (self.prespec is not None
+        and segment.prespec_started_window != window_id):
     decision = self.asr.try_start_prespec_for_state(
         segment.asr_state, ws_id=self.connection_id, seg_id=seg_id,
         committed=segment.committed,
         audio_queue_empty=segment.audio_queue.empty(),
     )
     if decision is not None and decision.launched:
-        segment.prespec_started = True
+        segment.prespec_started_window = window_id
 ```
 
 本次调用可能刚完成一个 2 s chunk，也可能仅向 `state.buffer` 追加了 80 ms 而没有进入 `while`。**后者正是检查 1 s 中点的机会。** 在生成器退出后，`state.audio_accum` 和 `state.buffer` 都已更新；这里先调用 `try_start_prespec_for_state(state, ...)`，由它构造完整快照、回滚拆分和采样截止位置，再调用 `try_start_prespec(...)`。两层实参分别列在 4.5。它仅在以下条件满足时调用现有 `maybe_start()`：
 
 1. segment 未 commit、当前段音频队列无积压、上一轮正式推理已结束。commit 后合并剩余音频的路径不启动 shadow。
 2. 自上次正式请求的音频截止位置以来，新增音频量 `new_audio_samples` 位于 `[中点, chunk_size_samples)`；对 2 s chunk，就是 `[16000, 32000)`。这只是触发计数，传给引擎的音频仍是完整累计音频。
-3. 按**下一次正式请求的现有回滚规则**可以得到合法回滚草稿。包括 `unfixed_chunk_num` 的预热条件、`unfixed_token_num` 和 `kmax`，不要另写固定“最后 5 个 token”的拆分。
-4. 当前段尚未成功启动过预投机；正式队列、负载、剩余时间是否允许，再由协调器判定。
+3. 按**下一次正式请求的现有回滚规则**拆分前缀和回滚草稿。包括 `unfixed_chunk_num` 的预热条件、`unfixed_token_num` 和 `kmax`，不要另写固定“最后 5 个 token”的拆分。首个 `chunk-0` 没有上一轮结果，空草稿是合法输入；它在约 1 s 中点也可起草。
+4. 当前窗口尚未成功启动过预投机；正式队列、负载、剩余时间是否允许，再由协调器判定。
 
 这里检查队列是防止消费协程追赶积压时制造“伪空档”：如果下一正式 chunk 所需音频已经在队列里，只是还没取出，就不应再起 shadow。段级队列非空是这一额外跳过条件，不能把它当作 `LoadSnapshot.waiting`（vLLM 等待请求数）。
 
@@ -366,7 +368,7 @@ class PreSpecModelHelpers:
     """
 
     def try_start_prespec(
-        self, *, ws_id, seg_id, prefix_version, full_audio_pcm_f32le,
+        self, *, ws_id, seg_id, window_id, prefix_version, full_audio_pcm_f32le,
         current_audio_end_samples, last_formal_audio_end_samples,
         chunk_size_samples, prefix_text, stable_prefix_token_ids,
         rollback_draft_token_ids,
@@ -387,26 +389,24 @@ class PreSpecModelHelpers:
             return LaunchDecision(False, "before_midpoint")
         if new_samples >= chunk_size_samples:
             return LaunchDecision(False, "formal_chunk_due")
-        if not rollback_draft_token_ids:
-            return LaunchDecision(False, "no_rollback_draft")
         draft_len = len(rollback_draft_token_ids)
         if draft_len > coordinator.policy.max_rollback_draft_tokens:
             if coordinator.should_log_budget_skip(
-                    ws_id, seg_id, "rollback_draft_exceeds_kmax"):
+                    ws_id, seg_id, window_id, "rollback_draft_exceeds_kmax"):
                 logger.info(
-                    "PRESPEC_SKIP ws_id=%s seg=%s reason=rollback_draft_exceeds_kmax "
+                    "PRESPEC_SKIP ws_id=%s seg=%s window=%s reason=rollback_draft_exceeds_kmax "
                     "draft_tokens=%s kmax=%s",
-                    ws_id, seg_id, draft_len,
+                    ws_id, seg_id, window_id, draft_len,
                     coordinator.policy.max_rollback_draft_tokens,
                 )
             return LaunchDecision(False, "rollback_draft_exceeds_kmax")
         if draft_len + 2 > coordinator.policy.max_candidate_tokens:
             if coordinator.should_log_budget_skip(
-                    ws_id, seg_id, "candidate_budget_insufficient"):
+                    ws_id, seg_id, window_id, "candidate_budget_insufficient"):
                 logger.info(
-                    "PRESPEC_SKIP ws_id=%s seg=%s reason=candidate_budget_insufficient "
+                    "PRESPEC_SKIP ws_id=%s seg=%s window=%s reason=candidate_budget_insufficient "
                     "draft_tokens=%s candidate_budget=%s required=%s",
-                    ws_id, seg_id, draft_len,
+                    ws_id, seg_id, window_id, draft_len,
                     coordinator.policy.max_candidate_tokens, draft_len + 2,
                 )
             return LaunchDecision(False, "candidate_budget_insufficient")
@@ -419,7 +419,7 @@ class PreSpecModelHelpers:
         if len(audio_bytes) // 4 != current_audio_end_samples:
             raise ValueError("audio bytes and sample cutoff disagree")
         request = ModelShadowRequest(
-            session_id=ws_id, audio_epoch=seg_id,
+            session_id=ws_id, audio_epoch=seg_id, window_id=window_id,
             base_prefix_version=prefix_version,
             visible_audio_end_samples=current_audio_end_samples,
             window_audio_samples=new_samples,
@@ -528,6 +528,7 @@ class PreSpecModelHelpers:
 | `try_start_prespec` 形参 | 包装函数中的取值 |
 |---|---|
 | `ws_id`、`seg_id`、`committed`、`audio_queue_empty` | 原样转发连接层传入值 |
+| `window_id` | `state.chunk_id`，标识下一次正式 chunk；同段每轮递增 |
 | `prefix_version` | `state.prespec_prefix_version` |
 | `full_audio_pcm_f32le`、`current_audio_end_samples`、`last_formal_audio_end_samples` | `snapshot_stream_audio(state.audio_accum, state.buffer)` 的三个返回值；音频包含完整历史和当前 buffer |
 | `chunk_size_samples` | `state.chunk_size_samples` |
@@ -554,14 +555,12 @@ def try_start_prespec_for_state(
             self.unfixed_chunk_num, self.unfixed_token_num, self.kmax,
         )
     )
-    if not rollback_draft_token_ids:
-        return None
     audio_pcm_f32le, current_end, last_formal_end = snapshot_stream_audio(
         state.audio_accum, state.buffer,
     )
     model_context = {"prompt_raw": state.prompt_raw}  # 加上原 processor 所需语言/context
     return self.try_start_prespec(
-        ws_id=ws_id, seg_id=seg_id,
+        ws_id=ws_id, seg_id=seg_id, window_id=state.chunk_id,
         prefix_version=state.prespec_prefix_version,
         full_audio_pcm_f32le=audio_pcm_f32le,
         current_audio_end_samples=current_end,
@@ -621,10 +620,11 @@ prespec = getattr(self, "prespec", None)
 if ws_id is None or seg_id is None:
     prespec = None  # 未传标识的旧调用方不使用这条预投机接线
 candidate = None
+this_chunk_id = state.chunk_id  # 必须在本轮末尾 chunk_id += 1 之前保存
 this_chunk_audio_end = len(state.audio_accum)
 if prespec is not None:
     candidate = prespec.begin_authoritative_chunk(
-        ws_id, audio_epoch=seg_id,
+        ws_id, audio_epoch=seg_id, window_id=this_chunk_id,
         prefix_version=state.prespec_prefix_version,
         full_audio_end_samples=this_chunk_audio_end,
     )
@@ -641,7 +641,8 @@ try:
     state.prespec_prefix_version += 1  # 仅在正式状态成功写回后
 finally:
     if prespec is not None:
-        prespec.end_authoritative_chunk(ws_id, audio_epoch=seg_id)
+        prespec.end_authoritative_chunk(
+            ws_id, audio_epoch=seg_id, window_id=this_chunk_id)
 ```
 
 上段是**插入位置示意**：注释所列的 L520–606 必须保留原函数实际代码，不能把注释当作代码替换。最小版不采集正式请求的原始 token IDs，也不修改 `_yield_delta_text()`。`end_authoritative_chunk()` 不传 `target_continuation_tokens` 时只清理候选，返回 `None`；不得把缺失的对照数据记作“接受 0 个 token”。若需要离线候选质量评估，按 [验证手册的可选采集挂点](streaming_prespec_validation.md) 从正式请求的 DELTA 输出流收集 token IDs；不能初始化 `raw_target_tokens = ()` 后不更新便传入。`try/finally` 覆盖 L557–606 以及真正的生成迭代；清理调用者时显式退出生成器，使 finally 执行。
@@ -656,10 +657,11 @@ finally:
 
 ```python
 prespec_formal_begun: bool = False
-prespec_started: bool = False
+prespec_formal_window_id: int | None = None
+prespec_started_window: int | None = None
 ```
 
-`prespec_started` 只在 `decision.launched` 时设为 True，避免同段随后的 80 ms append 一再复制完整音频；协调器仍按 `(ws_id, seg_id)` 做最终去重。新段创建时两个字段都从 False 开始。
+`prespec_started_window` 只在 `decision.launched` 时设为当时的 `state.chunk_id`，避免该窗口随后的 80 ms append 一再复制完整音频。正式 chunk 完成后 `state.chunk_id` 递增，下一窗口自然可以再次启动；协调器按 `(ws_id, seg_id, window_id)` 做最终去重。新段创建时两个窗口字段为 `None`，`prespec_formal_begun` 为 `False`。
 
 **版本只保存在 ASRStreamingState，不在 SegmentState 再保存一份。** 在 ASRStreamingState 的字段定义中新增 `prespec_prefix_version: int = 0`；`init_streaming_state()` 创建它时初始值为 0。若该类型在另一个文件定义，字段声明也要加在那个定义处，不能假设允许动态附加属性。在每次正式 chunk 成功写回文本/回滚状态之后增加：
 
@@ -675,11 +677,15 @@ state.prespec_prefix_version += 1
 
 ```python
 if self.prespec is not None and not segment.prespec_formal_begun:
+    window_id = (segment.asr_state.chunk_id
+                 if segment.asr_state is not None else 0)
     self.prespec.begin_formal(
         ws_id, seg_id, current_prefix_version,
         0,  # allow_candidate=False；此处只标记正式任务忙，不按音频截止领取候选
+        window_id=window_id,
         allow_candidate=False,
     )
+    segment.prespec_formal_window_id = window_id
     segment.prespec_formal_begun = True
 
 # 随后继续你原有的 None 入队代码，不新增第二个 None。
@@ -695,9 +701,11 @@ try:
 finally:
     if self.prespec is not None and segment.prespec_formal_begun:
         try:
-            self.prespec.finish_formal(ws_id, seg_id)
+            self.prespec.finish_formal(
+                ws_id, seg_id, window_id=segment.prespec_formal_window_id)
         finally:
             segment.prespec_formal_begun = False
+            segment.prespec_formal_window_id = None
 ```
 
 #### `cleanup()`：在生成任务已经退出之后插入
@@ -711,8 +719,8 @@ if self.prespec is not None:
 
 #### 异常路径和配对规则
 
-- `handle_event()` 处理真实 commit 时，在注入 None 之前调用 `begin_formal(ws_id, seg_id, version, 0, allow_candidate=False)`，随后置 `segment.prespec_formal_begun=True`。这个 0 只是未消费候选时的占位参数，不与真正的段内音频截止比较。重复 commit 不能重复 begin；state 尚未初始化时版本参数可用段的初始值。
-- `_process_segment()` 最外层 finally 检查上述标志，调用 `finish_formal(ws_id, seg_id)` 并清标志。此处包住流式循环与 `_finish_segment()`，所以短尾跳过、正常完成和中途异常都会配对；不传 token IDs 表示只清理、不做候选质量评估。
+- `handle_event()` 处理真实 commit 时，在注入 None 之前读取当前 `state.chunk_id`，调用 `begin_formal(ws_id, seg_id, version, 0, window_id=window_id, allow_candidate=False)`，并把 `window_id` 存入 `segment.prespec_formal_window_id`。这个 0 只是未消费候选时的音频截止占位参数，不与真正的段内音频截止比较。重复 commit 不能重复 begin；state 尚未初始化时版本和窗口 ID 均可取 0。
+- `_process_segment()` 最外层 finally 检查上述标志，用保存的 `prespec_formal_window_id` 调用 `finish_formal(ws_id, seg_id, window_id=...)` 并清标志。不能在 finish 时重新读取可能已经递增的 `state.chunk_id`。此处包住流式循环与 `_finish_segment()`，所以短尾跳过、正常完成和中途异常都会配对；不传 token IDs 表示只清理、不做候选质量评估。
 - 如果某段已 begin 但入队失败或被取消前根本未进入 `_process_segment()`，由对应异常处理或连接 cleanup 清理；不能期待一个从未进入的 finally 自动执行。
 - `cleanup()` 先取消并等待生成任务及其流式生成器退出，再 `await asr.prespec.close_session(ws_id)`，最后做原有队列/统计清理。不要先删协调器计数再让模型 finally 退出。
 
@@ -722,9 +730,7 @@ if self.prespec is not None:
 
 910B 上按“回滚投机 baseline → shadow → 消费候选”逐步验证的可执行命令、最小日志接线和判定表见 [streaming_prespec_validation.md](streaming_prespec_validation.md)。协调器本身不自动打印 launch、probe 或 evaluation；只看原有服务日志无法判断预投机是否运行。
 
-当前协调器按 `(session_id, audio_epoch)` 去重，最小版继续 `audio_epoch=seg_id`，**每段最多成功启动一次**。选择段内第一个已有合法回滚草稿的中点，例如 2 s 正式结果之后，累计到 3 s 时为 4 s chunk 起草。没有合法回滚草稿的首个窗口跳过；不能跨 VAD 段借用旧 token。`seg-24/chunk-0` 若是新段首次推理，本版不能据其等待日志声称可获得预投机收益。
-
-要覆盖每个 2 s 窗口，下一步需把 `(ws, seg, chunk/window)` 候选 epoch 与段级 commit 生命周期拆开，并在每次 chunk 结束回收对应 epoch。**仅把 `audio_epoch=seg` 改成 `chunk_id` 不够**：chunk 可能跨段重号，且现有 finish_formal 不会回收所有窗口。此改动不属于本次文档适配，当前代码仍是每段一次接口。
+当前协调器按 `(session_id, audio_epoch, window_id)` 去重，其中 `audio_epoch=seg_id`、`window_id=state.chunk_id`。**每个尚未提交的正式 chunk 窗口可启动一次**：`chunk-0` 在约 1 s 中点用空旧草稿起草；2 s 正式结果后，3 s 中点为 4 s 的 `chunk-1` 起草；4 s 正式结果写回后，5 s 中点为 6 s 的 `chunk-2` 起草。每次正式 chunk 结束回收该窗口，commit 只处理当时的窗口并保持段级 begin/finish 配对。后续窗口按原规则验证已有回滚草稿；不能跨 VAD 段借用旧 token。若音频在下一正式 chunk 前 commit，残余 finish 仍不消费该窗口的候选。
 
 首次用共享的单个协调器、一个 active shadow、`shadow_only=True`、默认候选预算为 `kmax+1`。受控低并发实验可用 `admission_mode="force"` 和现有旁路监测，先打通链路；它不保证不干扰正式时延。在线 `gated` 模式仍需新鲜队列/利用率和实测耗时预算，约 2 s 的 `npu-smi` 读数不能冒充默认 200 ms 的 admission 读数。
 

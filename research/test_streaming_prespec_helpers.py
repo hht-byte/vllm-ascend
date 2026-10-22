@@ -73,7 +73,7 @@ class Model(PreSpecModelHelpers):
 class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
     def inputs(self):
         return dict(
-            ws_id="ws-test", seg_id=1, prefix_version=2,
+            ws_id="ws-test", seg_id=1, window_id=0, prefix_version=2,
             full_audio_pcm_f32le=bytearray(b"\x01\x02\x03\x04" * 48000),
             current_audio_end_samples=48000, last_formal_audio_end_samples=32000,
             chunk_size_samples=32000, stable_prefix_token_ids=[10],
@@ -91,6 +91,7 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
         engine = FakeEngine()
         model = Model(engine)
         inputs = self.inputs()
+        inputs["window_id"] = 1
         try:
             self.assertTrue(model.try_start_prespec(**inputs).launched)
             # Mutations before the background task runs must not enter its input.
@@ -103,8 +104,9 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             candidate = model.prespec.begin_authoritative_chunk(
                 "ws-test", audio_epoch=1, prefix_version=2,
-                full_audio_end_samples=64000)
+                full_audio_end_samples=64000, window_id=1)
             self.assertEqual(candidate.token_ids, (20, 99, 30))
+            self.assertEqual(candidate.window_id, 1)
             self.assertEqual(candidate.formal_draft_token_ids, (99, 30))
             call = engine.calls[0]
             self.assertEqual(len(call["prompt"]["audio"]), 48000 * 4)
@@ -122,7 +124,7 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(engine.aborted)
             self.assertEqual(engine.closed, [call["request_id"]])
             model.prespec.end_authoritative_chunk(
-                "ws-test", audio_epoch=1, target_continuation_tokens=(20, 99, 30))
+                "ws-test", audio_epoch=1, target_continuation_tokens=(20, 99, 30), window_id=1)
         finally:
             await model.prespec.close_session("ws-test")
 
@@ -133,7 +135,6 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
             ({"audio_queue_empty": False}, "audio_backlog"),
             ({"current_audio_end_samples": 40000}, "before_midpoint"),
             ({"current_audio_end_samples": 64000}, "formal_chunk_due"),
-            ({"rollback_draft_token_ids": []}, "no_rollback_draft"),
         ]:
             inputs = self.inputs()
             inputs.update(overrides)
@@ -141,6 +142,33 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(model.try_start_prespec(**inputs).reason, reason)
                 self.assertEqual(inputs["last_formal_audio_end_samples"], 32000)
         self.assertFalse(model.prespec_engine.calls)
+
+    async def test_first_chunk_without_old_draft_can_launch(self):
+        engine = FakeEngine()
+        model = Model(engine)
+        inputs = self.inputs()
+        inputs.update(
+            full_audio_pcm_f32le=bytearray(b"\x01\x02\x03\x04" * 16000),
+            current_audio_end_samples=16000,
+            last_formal_audio_end_samples=0,
+            prefix_version=0,
+            stable_prefix_token_ids=[],
+            prefix_text="",
+            rollback_draft_token_ids=[],
+        )
+        try:
+            self.assertTrue(model.try_start_prespec(**inputs).launched)
+            await engine.started.wait()
+            await asyncio.sleep(0)
+            self.assertEqual(engine.calls[0]["test_draft"], [])
+            candidate = model.prespec.begin_authoritative_chunk(
+                "ws-test", audio_epoch=1, window_id=0,
+                prefix_version=0, full_audio_end_samples=32000)
+            self.assertEqual(candidate.formal_draft_token_ids, (99, 30))
+            model.prespec.end_authoritative_chunk(
+                "ws-test", audio_epoch=1, window_id=0)
+        finally:
+            await model.prespec.close_session("ws-test")
 
     async def test_snapshot_joins_consumed_chunks_and_pending_buffer(self):
         committed = np.full(32000, 0.25, dtype=np.float32)
@@ -207,9 +235,9 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(engine.calls[0]["test_draft"], [20, 21, 22])
             self.assertIsNone(model.prespec.begin_authoritative_chunk(
                 "ws-test", audio_epoch=1, prefix_version=2,
-                full_audio_end_samples=64000))
+                full_audio_end_samples=64000, window_id=0))
             self.assertEqual(probes[-1].status, "candidate_exceeds_kmax")
-            model.prespec.end_authoritative_chunk("ws-test", audio_epoch=1)
+            model.prespec.end_authoritative_chunk("ws-test", audio_epoch=1, window_id=0)
         finally:
             await model.prespec.close_session("ws-test")
 
@@ -220,9 +248,9 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
         await engine.started.wait()
         self.assertIsNone(model.prespec.begin_authoritative_chunk(
             "ws-test", audio_epoch=1, prefix_version=2,
-            full_audio_end_samples=64000))
+            full_audio_end_samples=64000, window_id=0))
         model.prespec.end_authoritative_chunk(
-            "ws-test", audio_epoch=1, target_continuation_tokens=())
+            "ws-test", audio_epoch=1, target_continuation_tokens=(), window_id=0)
         await model.prespec.close_session("ws-test")
         self.assertEqual(engine.aborted, [engine.calls[0]["request_id"]])
         self.assertEqual(engine.closed, engine.aborted)
@@ -237,9 +265,9 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
                 self.assertIsNone(model.prespec.begin_authoritative_chunk(
                     "ws-test", audio_epoch=1, prefix_version=2,
-                    full_audio_end_samples=64000))
+                    full_audio_end_samples=64000, window_id=0))
                 model.prespec.end_authoritative_chunk(
-                    "ws-test", audio_epoch=1, target_continuation_tokens=())
+                    "ws-test", audio_epoch=1, target_continuation_tokens=(), window_id=0)
                 await model.prespec.close_session("ws-test")
                 self.assertEqual(engine.aborted, [engine.calls[0]["request_id"]])
 
@@ -256,9 +284,9 @@ class ModelHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.aborted, [engine.calls[0]["request_id"]])
         self.assertIsNone(model.prespec.begin_authoritative_chunk(
             "ws-test", audio_epoch=1, prefix_version=2,
-            full_audio_end_samples=64000))
+            full_audio_end_samples=64000, window_id=0))
         model.prespec.end_authoritative_chunk(
-            "ws-test", audio_epoch=1, target_continuation_tokens=())
+            "ws-test", audio_epoch=1, target_continuation_tokens=(), window_id=0)
         await model.prespec.close_session("ws-test")
 
 
