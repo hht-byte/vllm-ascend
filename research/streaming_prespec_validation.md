@@ -469,6 +469,80 @@ python streaming_prespec_monitor.py compare \
 
 上面两个 UTC 是**格式示例**，必须改成真实起止时间；B/C 也各自运行 `summarize` 后才能 `compare`。`--aligned-out` 可省略。另用同一批汇总比较 B→C，便于区分后台开销和消费收益。`compare` 只算描述性差值，不自动宣称通过。
 
+### 4.1 正式输出 token、解码轮次与 verifier 接受数
+
+这里按**正式 vLLM 请求**统计，键是实际 `stream_...` / `finish_...` `request_id`，A（rollback）、B（shadow）、C（consume）都要打开相同打点。`output_token_count` 是该请求完成时，`DELTA` 输出中 `token_ids` 的累计长度，包含模型原始输出的特殊 token；它不是最终转写文本重新分词后的长度。`decode_rounds` 沿用 `_yield_delta_text()` 现有的 `token_count` 计数器，记录解码轮次。两者不能互换；一次轮次可能产出多个 token。跳过 finish 推理的 commit 没有正式请求，仍只在 `commits.jsonl` 中计入对应 commit 时延，不能给它补一条零轮次请求。
+
+在服务项目 `qwen_asr/inference/qwen3_asr_async.py` 中，沿用 1.4 节的 `on_output` 收集器：它必须对 A/B/C 的**每次正式请求**运行，而不以 `prespec is not None` 为条件。正式输出完成后，`output_token_count = len(raw_target_tokens)`；只对 `output.finished` 为真的请求写一行。为取到现有局部计数器，在 `_yield_delta_text()` 原来计算/打印 `token_count`、`prefill_ms`、`decode_total_ms` 的位置，把这些数写入本次调用传入的可选字典 `formal_metrics`（需给函数签名和调用点加 `formal_metrics=None`）：
+
+```python
+# _yield_delta_text() 中，在原有三个量都已计算之后：
+if formal_metrics is not None:
+    formal_metrics.update(
+        decode_rounds=token_count,  # 现有计数器：解码轮次
+        prefill_ms=prefill_ms,
+        decode_total_ms=decode_total_ms,
+    )
+```
+
+正式 chunk 和 finish 的原调用点各建一个 `formal_metrics = {}`，把它与已有 `on_output` 一起传给同一条 `_yield_delta_text(...)` 流。该流结束后，在正式输出确实完成时记录一条 JSON 日志；下面的 `formal_request_id`、`seg_id`、`boundary`、`draft_token_ids` 使用**该调用点已经构造好的值**，`draft_source` 按实际提交内容赋为 `prespec`（使用候选）、`rollback`（只使用回滚草稿）或 `none`（无草稿）：
+
+```python
+import json
+
+if formal_output_finished:
+    logger.info("ASR_FORMAL_STATS %s", json.dumps({
+        "request_id": formal_request_id,
+        "ws_id": connection_id,
+        "seg": seg_id,
+        "boundary": boundary,  # "chunk" 或 "finish"
+        "draft_source": draft_source,
+        "submitted_draft_tokens": len(draft_token_ids),
+        "output_token_count": len(raw_target_tokens),
+        "decode_rounds": formal_metrics["decode_rounds"],
+        "prefill_ms": formal_metrics.get("prefill_ms"),
+        "decode_total_ms": formal_metrics.get("decode_total_ms"),
+        "finished": True,
+    }, separators=(",", ":")))
+```
+
+`PRESPEC_REQUEST event=done tokens=...` 是后台候选的输出长度，不可填到 `output_token_count`。若服务不能从 `_yield_delta_text()` 取得真实轮次，就先修通 `formal_metrics`，不要用输出 token 数或耗时反推。`on_output` 对 DELTA 的 `token_ids` 只累计一次；finish 若不是 DELTA，先改成与 chunk 一致的输出语义或按其实际输出类型去重。
+
+在 **vLLM-Ascend 引擎真正完成 verifier 判定之后**，对每个正式请求的每个验证轮次记录一行；不要用 `propose()` 的提议长度或服务端 `PRESPEC_MATCH` 推测接受数。下面是日志格式，等号右侧需要接入该引擎 verifier 的实际变量：
+
+```python
+import json
+
+logger.info("ASR_VERIFY_STEP %s", json.dumps({
+    "request_id": formal_request_id,  # 与 ASR_FORMAL_STATS 完全一致
+    "round_index": request_local_verify_round_index,
+    "effective_draft_tokens": len(draft_tokens_given_to_verifier),
+    "accepted_draft_tokens": accepted_contiguous_draft_prefix_len,
+    "verifier_complete": is_last_external_draft_step,
+    # 仅最后一轮填写：proposer 实际交给 verifier 的总草稿数。
+    "actual_effective_draft_tokens": (
+        request_total_effective_draft_tokens
+        if is_last_external_draft_step else None
+    ),
+}, separators=(",", ":")))
+```
+
+`accepted_draft_tokens` 只计 verifier 实际接受的**连续 external draft 前缀**，不含 proposer 之前已采样的首个 target token、拒绝后修正 token、bonus token。`effective_draft_tokens` 是该轮真正参与验证的长度；末轮的 `actual_effective_draft_tokens` 是这个正式请求在 proposer 运行时裁剪后**所有轮次的总长度**，可能小于服务提交的 `submitted_draft_tokens`。它必须来自引擎实际提议结果，不能直接复制服务端提交长度。现有 external proposer 使用 `pop(req_id, [])` 一次性取走草稿，正常情况下只需一条完成事件，此时 `verifier_complete=true` 且 `actual_effective_draft_tokens=effective_draft_tokens`。只有观察到完成事件且各轮有效长度之和等于该总长度，分析脚本才计算接受率；部分丢失的轮次标为不完整。引擎日志可省略 `draft_source`：分析脚本按相同正式 `request_id` 从服务日志关联来源；若引擎也记录来源，两者必须一致。
+
+运行时若因 `spec_decode_unsupported_reqs`、上下文空间不足等原因把草稿阻断在 verifier 之前，需在**实际阻断路径**补一条同格式事件，`effective_draft_tokens=0`、`accepted_draft_tokens=0`、`verifier_complete=true`、`actual_effective_draft_tokens=0`，并加 `reason="spec_unsupported"` 或具体原因。它表示明确未验证，不计入接受率。服务提交了草稿却既无验证事件、也无明确阻断事件时，分析脚本标为 `missing_verifier`；不能据此推断实际接受数为 0。
+
+部署两处打点后，将本仓库分析脚本复制到 910B 服务项目根目录，再用每轮完整日志（含服务和引擎日志）运行；若两者本来写在同一个文件，每组只传该文件一次：
+
+```bash
+cp /path/to/vllm-ascend/research/streaming_prespec_gain.py ./
+python streaming_prespec_gain.py \
+  --rollback-log rollback-server.log rollback-engine.log \
+  --consume-log consume-server.log consume-engine.log \
+  --out gain-c20.json
+```
+
+`gain-c20.json` 的 `runs.rollback`、`runs.consume` 分别有每请求 `records` 与 `all`、`by_boundary`、`by_draft_source` 汇总；`comparison.rollback_to_consume` 给出 consume 减 rollback 的均值/P95 差值。先看 `missing_verifier_count`、`incomplete_verifier_count` 和 `explicit_zero_effective_count`，再按 `boundary=chunk/finish` 与 `draft_source` 看每请求输出 token、轮次、`tokens_per_round`、实际接受数/有效草稿数及 `observed_acceptance_rate`。无草稿请求的接受数记 0，但不进入接受率分母；有草稿却缺验证/阻断事件记缺失。可加 `--shadow-log shadow-server.log shadow-engine.log` 输出 B 组及 A→B、B→C 差值。脚本只报告 `case_id_count`（带此字段的请求数），**不自动配对**；相同音频回放能提供稳定 `case_id` 时可用 `records` 另做逐条配对或按输出长度分组。不同音频或不同 finish 跳过比例下，均值只能作描述。最终仍以同负载的**全部非空 commit** P50/P95/P99 为收益判据，并同时报告段级音频队列等待与 vLLM waiting/running。
+
 判定表：
 
 | 顺序 | 必查指标 | 通过条件 |
