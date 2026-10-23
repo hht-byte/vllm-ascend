@@ -167,7 +167,7 @@ AsyncLLM() 构造 model，并设置 model.prespec
 | `qwen3_asr_async.py`：`AsyncLLM()` | **插入一处调用**：在返回实例前调用新增 `enable_prespec()`，具体见步骤 2–3 |
 | 同文件 `init_streaming_state()` | 初始化 `state.prespec_prefix_version=0`；流式函数已有第三个参数 `connection_id` 可作 `ws_id`，只需另传当前 `seg_id`，具体见第五、六节；`audio_accum` 和 `buffer` 沿用原有字段 |
 | 同文件 `async_streaming_transcribe()` | **每个正式 chunk 内部**，在准备好正式音频/保留前缀、尚未把 external draft 写进请求时领取候选；实际 engine 输出迭代结束后配对退出 |
-| 同文件 `_yield_delta_text()` | 正式输出流程保留；若外层拿不到原始 token IDs，增加一个可选的“最终 token 回调”，用于评估；shadow 不调用此函数 |
+| 同文件 `_yield_delta_text()` | 正式 chunk 继续使用；finish 若采用同样的 DELTA 输出，也复用它消费原有正式请求流，并通过可选 `on_output` 采集原始 token；shadow 不调用此函数 |
 | 同文件 `async_finish_streaming_transcribe()` | 合并 `state.buffer` 到完整音频后、构造 `finish_...` 请求前，领取 commit 时保留的就绪候选；完整音频和当前前缀仍由正式请求验证 |
 | `realtime_connection.py`：`_process_segment()` | 每次 `async for ... async_streaming_transcribe(...)` 完整结束后尝试中点；最外层 `finally` 配对结束该段的 commit 标记 |
 | 同文件 `handle_event()` | append 保留解码入队；commit 在注入 None 前通知协调器，并保存一次配对标志；`session.update` 沿用原语义，若影响活跃段则使旧快照版本失效 |
@@ -766,29 +766,48 @@ logger.info(
 
 `claim_formal_candidate()` 不等待候选，只在其完成、版本相同、候选音频截止不晚于完整正式音频、草稿长度不超 `kmax` 且窗口号仍相同时返回候选。shadow 模式下返回 `None`，但记录 `PRESPEC_PROBE boundary=formal status=ready_shadow_only`，正式请求继续使用原 finish 草稿；consume 模式下可返回候选并记录 `ready_consumed`。consume 的候选必须由现有引擎在**完整正式音频**上验证，不能直接把 shadow 文本发给客户端。
 
-#### `async_finish_streaming_transcribe()`：从同一次 `finish_...` 输出采集 token
+#### `async_finish_streaming_transcribe()`：复用 `_yield_delta_text()` 消费正式输出
 
-在已有的 `engine.generate(...)` 输出消费循环中插入以下采集，保留原有文本拼接、解析、状态写回和返回值。使用本次 finish 请求实际的 `sampling_params.output_kind`；不要再次调用 `generate`，也不要从最终文本重新 tokenize：
+如果 finish 的正式请求与 `async_streaming_transcribe()` 一样使用 `RequestOutputKind.DELTA`，可以用相同的 `_yield_delta_text()` 调用方式**替换原有 finish 输出消费循环**。不要再起第二次 `generate`，也不要保留另一个循环同时消费 `stream`。`_yield_delta_text(on_output=...)` 中的回调接收的是每次引擎输出对象；连接层传进来的 `on_finish_tokens` 接收的是完成后的 `tuple[int, ...]`，所以二者不能直接写成 `on_output=on_finish_tokens`：
 
 ```python
+accumulated_text: list[str] = []
 finish_raw_token_ids: list[int] = []
 finish_output_complete = False
 finish_output_valid = True
 
-# 在原有 async for output in finish_stream 循环内、原文本处理之前：
-if output.outputs:
-    if len(output.outputs) != 1:
-        finish_output_valid = False  # 统计不可用，不影响正式输出
-    elif finish_output_valid:
-        ids = output.outputs[0].token_ids
-        if sampling_params.output_kind == RequestOutputKind.DELTA:
-            finish_raw_token_ids.extend(ids)
-        else:  # CUMULATIVE / FINAL_ONLY：保留最新完整快照
-            finish_raw_token_ids[:] = ids
-if output.finished:
-    finish_output_complete = True
+def capture_finish_output(output) -> None:
+    nonlocal finish_output_complete, finish_output_valid
+    try:
+        if output.outputs:
+            if len(output.outputs) != 1:
+                finish_output_valid = False  # 统计不可用，不影响正式输出
+            elif finish_output_valid:
+                finish_raw_token_ids.extend(output.outputs[0].token_ids)
+        if output.finished:
+            finish_output_complete = True
+    except Exception:
+        finish_output_valid = False  # 观测失败不阻断正式转写
 
-# 原输出循环和原结果解析成功结束后、原 return 之前：
+delta_generator = self._yield_delta_text(
+    stream,
+    base_text=state._raw_decoded,
+    prefix=prefix_text,
+    accumulated_text=accumulated_text,
+    chunk_id=state.chunk_id,
+    connection_id=connection_id,
+    stats_id=stats_id,
+    segment_id=state.segment_id,
+    on_output=capture_finish_output,
+)
+async for _delta in delta_generator:
+    pass  # finish 原本返回最终结果，不在这里额外发送客户端 delta
+
+# 与正式 chunk 相同地还原原始结果；若其原代码使用其他
+# accumulated_text 拼接方式，直接复用原代码而非新增一次解码。
+raw_decoded = prefix_text + "".join(accumulated_text)
+# 再保留原 finish 的 parse_asr_output、状态写回及返回值。
+# 原结果解析成功后、原 return 之前：
 if (on_finish_tokens is not None and finish_output_complete
         and finish_output_valid):
     try:
@@ -797,7 +816,9 @@ if (on_finish_tokens is not None and finish_output_complete
         logger.exception("PRESPEC_FINISH_CAPTURE callback failed")
 ```
 
-只有观察到 `output.finished` 才记录 token；真正完成但生成零个 token 时记录 `()`，中断/异常时仍为 `None`。这里记录的是 **prompt 之后的原始生成 token**，不拼接稳定前缀，也不改 `_yield_delta_text()` 的 `on_output`。若本地 finish 用的是 `async for output in engine.generate(...)` 而没有 `finish_stream` 局部变量，就把中间代码放入该现有循环。
+这里的 `stream` 是本次 `finish_...` 的原有 `engine.generate(...)` 异步流，`connection_id/stats_id` 使用 finish 函数现有的同义局部变量；若其名称不同，按原函数映射。`_yield_delta_text()` 内已有的文本增量、计时和资源释放逻辑会随完整迭代执行，原 finish 不得再重复执行相同清理。`accumulated_text` 的还原公式以正式 chunk 的现有写回代码为准，核对最终文本和旧 finish 完全相同后再替换其旧输出循环。只有观察到 `output.finished` 才记录 token；真正完成但生成零个 token 时记录 `()`，中断/异常时仍为 `None`。这里记录的是 **prompt 之后的原始生成 token**，不拼接稳定前缀。
+
+如果当前 finish 使用 CUMULATIVE/FINAL_ONLY，而 `_yield_delta_text()` 只支持 DELTA，则不能直接套用上段：先让正式 finish 使用与 chunk 相同的 DELTA 输出并核对最终文本等价，或保留原 finish 循环并按输出类型采集 token。不要只为统计而改变正式请求的输出语义。
 
 #### `_process_segment()`：用最外层 try/finally 包住原函数主体
 

@@ -280,7 +280,7 @@ finally:
 
 这段仅展示采集与统计挂点，不能替换原函数的其他实参或原有状态写回。只有观察到 `output.finished` 才传入 token 列表；中断/取消时传 `None`，避免把部分输出或尚未采集的 `()` 算作 0 匹配。完成且确实生成 0 个 token 时，空元组才是有效观测；此时 `target_len=0`，不能解释为候选首 token 不匹配。`raw_matched_prefix_tokens` 比较候选完整原始输出与正式完整原始输出。`draft_matched_prefix_tokens` 比较实际拟提交的候选 `token_ids[1:]` 与正式输出的 `token_ids[1:]`，跳过两个请求各自采样的首 token；例如候选 `(19, 20, 21)`、正式 `(99, 20, 22)` 时，两个值分别是 0 和 1。两者都是 shadow 离线匹配指标，**都不是引擎 verifier 的实际草稿接受数**；后者仍从 verifier 打点取得。候选和正式请求必须使用相同的输出 token 对齐起点（prompt 之后），且这里假设正式请求只有一个 completion。
 
-finish 复用 `_split_stream_rollback()` 处理 `\ufffd` 时，`on_output` 本身不用改：它只采集 prompt 之后的原始生成 token，不读取或重算稳定前缀。上面的挂点只覆盖调用 `_yield_delta_text()` 的正式 chunk。要看 **提前 commit 的 finish 候选匹配统计**，按[主接入文档第六节](streaming_prespec.md)在 `async_finish_streaming_transcribe()` 实际消费 `finish_...` 输出的循环里采集同一请求的原始 token IDs，通过 `_finish_segment()` 的回调存到本段，再由 `_process_segment()` 的 finally 传给 `finish_formal(..., target_continuation_tokens=...)`。DELTA 输出逐次 `extend`，CUMULATIVE/FINAL_ONLY 输出以最新列表覆盖；仅在观察到 `output.finished` 后传 token 列表，中断时传 `None`。这个回调不会改变客户端转写文本或正式请求的输入。
+finish 复用 `_split_stream_rollback()` 处理 `\ufffd` 时，`on_output` 本身不用改：它只采集 prompt 之后的原始生成 token，不读取或重算稳定前缀。要看 **提前 commit 的 finish 候选匹配统计**，优先按[主接入文档第六节](streaming_prespec.md)让 DELTA 输出的 finish 复用 `_yield_delta_text()` 消费同一条 `finish_...` 流，并通过适配回调收集原始 token IDs。`on_output` 接收单次 `RequestOutput`，不能直接传接收最终 token 元组的 `on_finish_tokens`。完成后的元组通过 `_finish_segment()` 存到本段，再由 `_process_segment()` 的 finally 传给 `finish_formal(..., target_continuation_tokens=...)`。仅在观察到 `output.finished` 后传 token 列表，中断时传 `None`；原 finish 若使用 CUMULATIVE/FINAL_ONLY，先核对 `_yield_delta_text()` 的输出语义，不能直接按 DELTA 累积。这个回调不会改变客户端转写文本或正式请求的输入。
 
 910B 服务接入并重放一个在完整 chunk 到来前提前 commit、且剩余音频超过 0.4 秒的段后，查同一 `ws_id/seg/window` 的日志：
 
