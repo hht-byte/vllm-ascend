@@ -584,6 +584,7 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
     async def test_streaming_chunk_inflight_blocks_and_preempts_shadow(self):
         started = asyncio.Event()
         cancelled = asyncio.Event()
+        probes = []
 
         async def producer(request, budget):
             started.set()
@@ -592,7 +593,8 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 cancelled.set()
 
-        coordinator = PreSpecCoordinator(producer, self.policy, clock=lambda: self.now)
+        coordinator = PreSpecCoordinator(producer, self.policy, clock=lambda: self.now,
+                                         on_probe=probes.append)
         coordinator.begin_authoritative_chunk("ws-1")
         self.assertEqual(coordinator.maybe_start(self.request(), self.load(), 200).reason,
                          "session_chunk_inflight")
@@ -603,32 +605,107 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(cancelled.wait(), 0.2)
         coordinator.end_authoritative_chunk("ws-1")
         self.assertIsNone(coordinator.begin_formal("ws-1", 1, 2, 64_000, window_id=0))
+        self.assertEqual(probes[-1].status, "discarded_before_boundary")
         coordinator.finish_formal("ws-1", 1, (), window_id=0)
         await coordinator.close_session("ws-1")
 
-    async def test_other_sessions_authoritative_work_preempts_shadow(self):
-        cancelled = asyncio.Event()
+    async def test_other_session_targets_do_not_preempt_or_block_shadow(self):
+        release = asyncio.Event()
+        cancelled = []
 
         async def producer(request, budget):
             try:
-                await asyncio.Future()
-            finally:
-                cancelled.set()
+                await release.wait()
+                return (19, 20, 21)
+            except asyncio.CancelledError:
+                cancelled.append(request.session_id)
+                raise
 
-        coordinator = PreSpecCoordinator(producer, self.policy, clock=lambda: self.now)
+        policy = replace(self.policy, max_active_shadows=3)
+        coordinator = PreSpecCoordinator(producer, policy, clock=lambda: self.now,
+                                         shadow_only=False)
         coordinator.maybe_start(self.request(), self.load(), 200)
+        first_task = coordinator._tasks[("ws-1", 1, 0)]
         await asyncio.sleep(0)
         coordinator.begin_authoritative_chunk("ws-2")
-        await asyncio.wait_for(cancelled.wait(), 0.2)
+        coordinator.begin_formal("ws-2", 1, 2, 0, window_id=0, defer_candidate=True)
+        other = replace(self.request(), session_id="ws-3")
+        self.assertTrue(coordinator.maybe_start(other, self.load(), 200).launched)
+        second_task = coordinator._tasks[("ws-3", 1, 0)]
+        release.set()
+        await asyncio.gather(first_task, second_task)
+        self.assertEqual(cancelled, [])
+
         coordinator.end_authoritative_chunk("ws-2")
-        self.assertIsNone(coordinator.begin_formal("ws-1", 1, 2, 64_000, window_id=0))
-        coordinator.finish_formal("ws-1", 1, (), window_id=0)
-        coordinator.begin_formal("ws-2", 1, 2, 64_000, window_id=0)
-        other = replace(self.request(epoch=2), session_id="ws-3")
-        self.assertEqual(coordinator.maybe_start(other, self.load(), 200).reason,
-                         "formal_inflight_on_device")
-        coordinator.finish_formal("ws-2", 1, (), window_id=0)
+        coordinator.finish_formal("ws-2", 1, window_id=0)
+        for session_id in ("ws-1", "ws-3"):
+            candidate = coordinator.begin_authoritative_chunk(
+                session_id, audio_epoch=1, window_id=0, prefix_version=2,
+                full_audio_end_samples=64_000)
+            self.assertIsNotNone(candidate)
+            self.assertEqual(candidate.session_id, session_id)
+            coordinator.end_authoritative_chunk(session_id, audio_epoch=1, window_id=0)
+            await coordinator.close_session(session_id)
+
+    async def test_default_policy_runs_twenty_connection_shadows_concurrently(self):
+        release = asyncio.Event()
+        all_started = asyncio.Event()
+        started = set()
+
+        async def producer(request, budget):
+            started.add(request.session_id)
+            if len(started) == 20:
+                all_started.set()
+            await release.wait()
+            return (19, 20, 21)
+
+        coordinator = PreSpecCoordinator(producer, clock=lambda: self.now,
+                                         shadow_only=False)
+        requests = [replace(self.request(), session_id=f"ws-{i}") for i in range(20)]
+        for request in requests:
+            self.assertTrue(coordinator.maybe_start(request, self.load(), 200).launched)
+        await asyncio.wait_for(all_started.wait(), 0.5)
+        tasks = list(coordinator._tasks.values())
+        self.assertTrue(all(not task.done() for task in tasks))
+        release.set()
+        await asyncio.gather(*tasks)
+        for request in requests:
+            candidate = coordinator.begin_authoritative_chunk(
+                request.session_id, audio_epoch=1, window_id=0, prefix_version=2,
+                full_audio_end_samples=64_000)
+            self.assertIsNotNone(candidate)
+            self.assertEqual(candidate.request_id, request.request_id)
+            coordinator.end_authoritative_chunk(request.session_id,
+                                                 audio_epoch=1, window_id=0)
+            await coordinator.close_session(request.session_id)
+
+    async def test_other_targets_preserve_completed_candidate_until_its_boundary(self):
+        async def producer(request, budget):
+            return (19, 20, 21)
+
+        coordinator = PreSpecCoordinator(producer, self.policy, clock=lambda: self.now,
+                                         shadow_only=False)
+        request = self.request()
+        coordinator.maybe_start(request, self.load(), 200)
+        await coordinator._tasks[("ws-1", 1, 0)]
+        coordinator.begin_authoritative_chunk("ws-2")
+        coordinator.end_authoritative_chunk("ws-2")
+        coordinator.begin_formal("ws-3", 1, 2, 0, window_id=0, defer_candidate=True)
+        coordinator.finish_formal("ws-3", 1, window_id=0)
+        candidate = coordinator.begin_authoritative_chunk(
+            "ws-1", audio_epoch=1, window_id=0, prefix_version=2,
+            full_audio_end_samples=64_000)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.request_id, request.request_id)
+        coordinator.end_authoritative_chunk("ws-1", audio_epoch=1, window_id=0)
         await coordinator.close_session("ws-1")
+
+    async def test_negative_shadow_capacity_is_rejected(self):
+        async def producer(request, budget):
+            return (19, 20, 21)
+
+        with self.assertRaisesRegex(ValueError, "max_active_shadows"):
+            PreSpecCoordinator(producer, replace(self.policy, max_active_shadows=-1))
 
     async def test_ready_candidate_is_consumed_at_precommit_chunk_submit(self):
         async def producer(request, budget):

@@ -59,7 +59,7 @@ class AdmissionPolicy:
     max_load_age_ms: float = 200.0
     cancel_margin_ms: float = 100.0
     safety_guard_ms: float = 100.0
-    max_active_shadows: int = 1
+    max_active_shadows: int = 0  # 0 disables the coordinator-wide concurrency cap.
     max_rollback_draft_tokens: int = 8
     max_candidate_tokens: int = 9
 
@@ -199,6 +199,10 @@ class RepairExtendProducer:
 class PreSpecCoordinator:
     """One process-wide coordinator; call its methods on one asyncio event loop.
 
+    Connection lifecycles are independent: a target only retires shadows owned
+    by its own session. Concurrent sessions share the optional capacity limit
+    and, in gated mode, the measured device-load admission checks.
+
     ``shadow_only=True`` is the safe default: formal decoding never receives
     candidate draft tokens. With ``False``, a ready candidate can be selected
     at chunk submit or deferred from commit receipt to finish submit. It is
@@ -216,6 +220,8 @@ class PreSpecCoordinator:
             raise ValueError("admission_mode must be gated or force")
         if policy.max_rollback_draft_tokens <= 0 or policy.max_candidate_tokens <= 0:
             raise ValueError("draft and candidate budgets must be positive")
+        if policy.max_active_shadows < 0:
+            raise ValueError("max_active_shadows must be nonnegative (0 means no cap)")
         self.clock = clock
         self.shadow_only = shadow_only
         self.on_probe = on_probe
@@ -262,11 +268,10 @@ class PreSpecCoordinator:
             return LaunchDecision(False, "epoch_already_used")
         if self._active_formals.get(request.session_id, 0):
             return LaunchDecision(False, "session_formal_inflight")
-        if self._active_formals:
-            return LaunchDecision(False, "formal_inflight_on_device")
         if self._active_chunks.get(request.session_id, 0):
             return LaunchDecision(False, "session_chunk_inflight")
-        if len(self._reserved) >= self.policy.max_active_shadows:
+        if (self.policy.max_active_shadows > 0
+                and len(self._reserved) >= self.policy.max_active_shadows):
             return LaunchDecision(False, "shadow_capacity_full")
         if predicted_draft_ms < 0:
             raise ValueError("predicted durations must be nonnegative")
@@ -337,7 +342,7 @@ class PreSpecCoordinator:
         previous_active = self._active_chunks.get(session_id, 0)
         self._active_chunks[session_id] = previous_active + 1
         task = self._tasks.pop(key, None) if key is not None else None
-        self._cancel_pending_shadows()
+        self._cancel_session_shadows(session_id)
         if key is None:
             return None
         if key in self._selected:
@@ -347,9 +352,12 @@ class PreSpecCoordinator:
                                       full_audio_end_samples,
                                       allow_candidate and not previous_active)
 
-    def _cancel_pending_shadows(self, *,
+    def _cancel_session_shadows(self, session_id: str, *,
                                 preserve_ready_key: WindowKey | None = None) -> None:
+        """Retire this connection's shadows without affecting other connections."""
         for key in list(self._tasks):
+            if key[0] != session_id:
+                continue
             task = self._tasks[key]
             if key == preserve_ready_key and task.done():
                 continue
@@ -422,7 +430,8 @@ class PreSpecCoordinator:
                           allow_candidate: bool) -> Candidate | None:
         if task is None:
             self._emit_probe(key, boundary, started_ns,
-                             "previously_used" if key in self._launched else "not_started")
+                             "discarded_before_boundary" if key in self._launched
+                             else "not_started")
             return None
         if not task.done():
             task.cancel()
@@ -476,10 +485,10 @@ class PreSpecCoordinator:
         self._begun.add(segment_key)
         self._begun_window_ids[segment_key] = window_id
         if defer_candidate:
-            self._cancel_pending_shadows(preserve_ready_key=key)
+            self._cancel_session_shadows(session_id, preserve_ready_key=key)
             return None
         task = self._tasks.pop(key, None)
-        self._cancel_pending_shadows()
+        self._cancel_session_shadows(session_id)
         if key in self._selected:
             self._emit_probe(key, "formal", started_ns, "already_selected")
             return None

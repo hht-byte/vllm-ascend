@@ -57,7 +57,8 @@ from qwen_asr.inference.streaming_prespec_helpers import (
 ```python
 def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
                    candidate_tokens=None, on_probe=None,
-                   admission_mode="force", shadow_only=True):
+                   admission_mode="force", shadow_only=True,
+                   max_active_shadows=0):
     # 仅在服务启动、连接尚未创建时调用一次。
     self.prespec = None
     if not enabled:
@@ -82,7 +83,7 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
             midpoint_samples=midpoint_samples,
             max_rollback_draft_tokens=kmax,
             max_candidate_tokens=candidate_tokens,
-            max_active_shadows=1,
+            max_active_shadows=max_active_shadows,
         ),
         shadow_only=shadow_only,
         on_probe=on_probe,
@@ -90,6 +91,8 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
 ```
 
 这个方法创建协调器并保存 engine 引用。`admission_mode="force"`、`shadow_only=True` 是初次受控实验的默认值；验证手册使用启动 parser 参数显式覆盖。`kmax` 是引擎 proposer 能接收的 external draft 上限，`candidate_tokens` 是 shadow 请求的 `max_tokens`，不再用 `min(candidate_tokens, kmax)` 混成一个预算。默认候选预算为 `kmax+1`：第一个位置由 target 采样，后面最多 `kmax` 个候选 token 可供正式请求提交。旧草稿加首 token、至少一个续写 token 放不下时会跳过。显式设置更大的候选预算时，若最终可提交的候选后缀超过 `kmax`，正式边界会返回 `candidate_exceeds_kmax`，避免 proposer 再次静默截断。`self._run_prespec` 已由 mixin 提供；第四节的 `_pack_stream_request` 接到已有实现前仍使用 `enabled=False`。`on_probe` 可传现有非阻塞日志回调；未传时不会自动输出 probe 日志。
+
+`max_active_shadows=0` 表示协调器不设进程级候选并发上限，各连接可同时运行候选；实际调度和容量仍由共享 engine 决定。正整数是可选的进程级上限，负数非法。不要保留旧接线中的 `max_active_shadows=1`，否则替换协调器后仍会把所有连接串行化。
 
 例如引擎 `kmax=8`、默认候选预算 9 时，旧回滚草稿最多 7 个 token 才能同时给首 token 和至少一个新续写留位置；长度恰为 8 时返回 `candidate_budget_insufficient`。把预算改为 10 虽可启动这条 shadow，但若它真输出 10 个 token，正式可提交后缀长 9，仍会以 `candidate_exceeds_kmax` 跳过。要让完整旧草稿和新续写都可提交，必须增大引擎的 `kmax` 或缩短原回滚草稿；不能在服务端静默截断旧草稿。
 
@@ -117,9 +120,9 @@ return model
 
 若原代码已是 `model = ...; return model`，只在 `return model` 前插入 `model.enable_prespec(...)`。`AsyncLLM()` 是类方法，不能在这里写 `self.prespec = ...`。这里的 `kmax` 是待映射到现有局部变量的名称，不是要求再读一次配置。初始化必须在 `set_asr(model)` 之前完成；不要运行中再次调用此方法，否则连接持有的旧协调器引用不会自动更新。
 
-上面的 `enabled=False` 是完成适配前的静态安全起点。A/B/C 验证时，按 [验证手册第 1.1 节](streaming_prespec_validation.md) 从现有启动 parser 的 `--prespec-mode`、`--prespec-admission` 传到 `AsyncLLM()`，再调用本方法；不要同时保留这个写死的 `enabled=False` 调用，也不要把两个新参数直接传给 vLLM engine 构造函数。
+上面的 `enabled=False` 是完成适配前的静态安全起点。A/B/C 验证时，按 [验证手册第 1.1 节](streaming_prespec_validation.md) 从现有启动 parser 传入预投机参数，再调用本方法；不要同时保留这个写死的 `enabled=False` 调用，也不要把服务侧参数直接传给 vLLM engine 构造函数。
 
-你当前的工厂调用是 `Qwen3ASRModelAsync.AsyncLLM(**base_config)`；验证手册给出的实际改法是在这一次调用中追加 `prespec_mode=args.prespec_mode`、`prespec_admission=args.prespec_admission`、`prespec_candidate_tokens=args.prespec_candidate_tokens`，并由 `AsyncLLM()` 的显式形参接收。`base_config` 保持原用途，不向 vLLM engine 透传这些服务侧参数。
+你当前的工厂调用是 `Qwen3ASRModelAsync.AsyncLLM(**base_config)`；验证手册给出的实际改法是在这一次调用中追加 `prespec_mode=args.prespec_mode`、`prespec_admission=args.prespec_admission`、`prespec_candidate_tokens=args.prespec_candidate_tokens`、`prespec_max_active_shadows=args.prespec_max_active_shadows`，并由 `AsyncLLM()` 的显式形参接收。工厂再将最后一项传给 `enable_prespec(max_active_shadows=prespec_max_active_shadows)`。`base_config` 保持原用途，不向 vLLM engine 透传这些服务侧参数。
 
 #### 步骤 4：`websocket_router.py` 不修改
 
@@ -501,7 +504,7 @@ class PreSpecModelHelpers:
 - `ModelShadowRequest` 在通用 `ShadowRequest` 上补了 `model_context/sampling_params`。创建时深拷贝小配置、音频转 bytes、token 转 tuple；它不持有真实 state。
 - `_build_stream_request` 给每次 shadow 建立参数副本，设置累计输出、单序列及总 token 上限；已有回滚草稿完整传入，预算不足时跳过。
 - `_run_prespec` 只取引擎给出的**已验证输出**，累计输出用覆盖赋值，不重复拼接；流异常结束时不发布半截候选。
-- 提前 commit/正式 chunk 导致取消时，只 abort 自己的 `prespec-...` 请求。到预估下一正式提交时间仍未结束也会取消；正式路径没有 await shadow 的操作。
+- 提前 commit/正式 chunk 只清理同一连接的候选：未完成候选取消，符合本次窗口和版本的已完成候选可领取；其他连接的候选无论运行中还是已完成都保留。到预估下一正式提交时间仍未结束也会取消；正式路径没有 await shadow 的操作。
 
 截止时间覆盖剩余生成时间，并扣除快照/打包已经花掉的时间；同步 processor 工作仍会占用事件循环，不能通过 `create_task` 或 timeout 自动抢占，应把这部分 CPU 成本计入实验。
 
@@ -864,13 +867,16 @@ if self.prespec is not None:
 
 当前协调器按 `(session_id, audio_epoch, window_id)` 去重，其中 `audio_epoch=seg_id`、`window_id=state.chunk_id`。**每个尚未提交的正式 chunk 窗口可启动一次**：`chunk-0` 在约 1 s 中点用空旧草稿起草；2 s 正式结果后，3 s 中点为 4 s 的 `chunk-1` 起草；4 s 正式结果写回后，5 s 中点为 6 s 的 `chunk-2` 起草。每次正式 chunk 结束回收该窗口；提前 commit 则保留已完成的本窗口候选，在 residual finish 正式请求提交时核对并领取。后续窗口按原规则验证已有回滚草稿；不能跨 VAD 段借用旧 token，也不能把旧窗口候选交给新窗口。
 
-首次用共享的单个协调器、一个 active shadow、`shadow_only=True`、默认候选预算为 `kmax+1`。受控低并发实验可用 `admission_mode="force"` 和现有旁路监测，先打通链路；它不保证不干扰正式时延。在线 `gated` 模式仍需新鲜队列/利用率和实测耗时预算，约 2 s 的 `npu-smi` 读数不能冒充默认 200 ms 的 admission 读数。
+共享的单个协调器按连接管理生命周期：连接 A 的 chunk/commit 不阻止连接 B 启动候选，也不取消或删除 B 的候选；同一连接的正式请求仍保护本连接的状态和候选边界。默认 `max_active_shadows=0`，允许多连接候选并行；正值才启用额外的全局容量限制。`PRESPEC_PROBE status=discarded_before_boundary` 表示该窗口曾启动候选、但候选在边界前已被丢弃，不能解释为曾被正式请求接受；它替代旧的 `previously_used` 状态。
+
+首次使用 `shadow_only=True`、默认候选预算 `kmax+1` 和 `admission_mode="force"`，配合现有旁路监测打通链路。`force` 不再因其他连接的 commit 生命周期否决新候选；它仍检查本连接状态、中点、预算和截止时间。在线 `gated` 继续根据共享设备的新鲜队列/利用率和实测耗时预算准入，可能因共享负载拒绝启动；生命周期隔离不代表设备资源隔离。约 2 s 的 `npu-smi` 读数不能冒充默认 200 ms 的 admission 读数。
 
 验收只保留直接相关的检查：
 
 1. 中点出现 `prespec-...` 请求；确认旧草稿有拒绝时，后续 decode 从 correction 状态继续。
 2. 正式 chunk submit 的 `ready_shadow_only/pending`、引擎 verifier 的实际接受长度与成本分开记录；shadow 不产生客户端事件、不改正式 state、不结束正式 session。
 3. 提前 commit、短尾 skip、断连时，无泄漏请求和未配对计数；注意 Python 取消不等于 NPU kernel 已抢占。
-4. 同音频/同并发 baseline 与 probe 比较正式 P95/P99、队列等待及总计算成本；在离线回放验证经 verifier 消费后的 token/提交边界等价，再启用消费模式。
+4. 多连接测试中，A 的正式请求到来后 B 的候选继续运行或保留到 B 的正式边界；默认配置下能观察到多个候选生命周期重叠。命令及日志检查见验证手册第 2.1 节。
+5. 同音频/同并发 baseline 与 probe 比较正式 P95/P99、队列等待及总计算成本；在离线回放验证经 verifier 消费后的 token/提交边界等价，再启用消费模式。
 
 服务源码到位后需确认的具体代码点只有：external draft 的打包字段及 kmax 约束、保留前缀/回滚草稿的实际拆分、raw output token 的含义、现有完整音频构造规则及采样截止计数、engine abort/生成器关闭方式、请求级清理与正式 session 结束的调用边界。KV 的可复用范围由引擎决定，不是服务端适配项。当前描述不能替代这些逐行核对或 910B 验证。

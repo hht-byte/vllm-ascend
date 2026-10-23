@@ -1,6 +1,6 @@
 # 910B 流式音频预投机验证手册
 
-本手册验证当前 **每个 `(ws_id, seg_id)` 最多一次中点候选** 的实现。baseline 是“现有回滚投机开启、预投机关闭”。服务端三个源文件不在此仓库；下面标明应插入的函数与代码，需在 910B 服务项目完成接线。本仓库的 Python mock 测试不能代替真机验证。
+本手册验证当前 **每个 `(ws_id, seg_id, window_id)` 最多一次中点候选、各连接可并行生成候选** 的实现。baseline 是“现有回滚投机开启、预投机关闭”。服务端三个源文件不在此仓库；下面标明应插入的函数与代码，需在 910B 服务项目完成接线。本仓库的 Python mock 测试不能代替真机验证。
 
 ## 0. 三组配置与共同前提
 
@@ -10,7 +10,7 @@
 | B | `shadow` | 开 | 后台生成候选，正式请求仍用原回滚草稿 |
 | C | `consume` | 开 | 后台生成候选，正式请求在完整音频上经现有 verifier 验证候选 |
 
-A/B/C 保持同一服务代码、模型、图配置、回滚参数、chunk 长度、音频和连接负载。配置变更后重启服务，不能在活跃连接期间替换协调器。**先用 `force` 完成链路和 A/B/C 初次对比**；此时仍受中点、正式请求在途和容量限制，但不按设备利用率准入。完成实时负载接线后，再用 `gated` 重跑 B/C，回答“低利用率空档是否存在且可安全利用”。若未接入新鲜 `LoadSnapshot`，`gated` 会返回 `missing_load`；旁路 `npu-smi` 的 1 秒采样不能冒充默认要求 200 ms 内的新鲜准入读数。
+A/B/C 保持同一服务代码、模型、图配置、回滚参数、chunk 长度、音频和连接负载。配置变更后重启服务，不能在活跃连接期间替换协调器。**先用 `force` 完成链路和 A/B/C 初次对比**；此时仍检查中点、本连接的正式请求状态、预算、截止时间及显式配置的候选容量，但其他连接的 chunk/commit 不会阻止启动或取消已有候选。默认候选容量参数为 0，协调器不设进程级上限。完成实时负载接线后，再用 `gated` 重跑 B/C，回答“低利用率空档是否存在且可安全利用”；`gated` 仍检查共享设备的队列/利用率。若未接入新鲜 `LoadSnapshot`，`gated` 会返回 `missing_load`；旁路 `npu-smi` 的 1 秒采样不能冒充默认要求 200 ms 内的新鲜准入读数。
 
 ## 1. 服务端加入最小日志：逐处修改
 
@@ -24,7 +24,7 @@ A/B/C 保持同一服务代码、模型、图配置、回滚参数、chunk 长�
 rg -n 'ArgumentParser|parse_args|AsyncLLM\(' qwen_asr
 ```
 
-在现有 `parser.parse_args()` **之前**增加三个参数；保留其余已有参数：
+在现有 `parser.parse_args()` **之前**增加四个参数；保留其余已有参数：
 
 ```python
 parser.add_argument(
@@ -39,6 +39,10 @@ parser.add_argument(
     "--prespec-candidate-tokens", type=int, default=None,
     help="shadow output max_tokens; omitted means auto (engine kmax + 1)",
 )
+parser.add_argument(
+    "--prespec-max-active-shadows", type=int, default=0,
+    help="process-wide shadow limit; 0=no coordinator limit; negative is invalid",
+)
 ```
 
 这里 `default=None` 是“未显式指定”的标记：parser 阶段尚未取得引擎 `kmax`，所以不能直接写 `default=kmax + 1`。启动时将 `None` 依次传给 `AsyncLLM()`、`enable_prespec()`；仅在启用预投机后，由 `enable_prespec()` 将它解析为 `kmax + 1`。显式传入整数时原样使用，并受下文预算检查约束。
@@ -51,17 +55,19 @@ model = Qwen3ASRModelAsync.AsyncLLM(
     prespec_mode=args.prespec_mode,
     prespec_admission=args.prespec_admission,
     prespec_candidate_tokens=args.prespec_candidate_tokens,
+    prespec_max_active_shadows=args.prespec_max_active_shadows,
 )
 ```
 
-`base_config` 不能同时含有这三个 `prespec_...` 名字，否则 Python 会因重复关键字报错。若原调用的结果变量不是 `model`，保留原变量名。
+`base_config` 不能同时含有这四个 `prespec_...` 名字，否则 Python 会因重复关键字报错。若原调用的结果变量不是 `model`，保留原变量名。
 
-在 `qwen3_asr_async.py` 的 `AsyncLLM()` 现有类方法签名增加三个显式形参；若签名有 `**kwargs`，把它们放在 `**kwargs` **之前**。不能只在调用处传参，否则可能得到 `unexpected keyword argument`，或落入 `**kwargs` 后被错误转发给 vLLM engine：
+在 `qwen3_asr_async.py` 的 `AsyncLLM()` 现有类方法签名增加四个显式形参；若签名有 `**kwargs`，把它们放在 `**kwargs` **之前**。不能只在调用处传参，否则可能得到 `unexpected keyword argument`，或落入 `**kwargs` 后被错误转发给 vLLM engine：
 
 ```python
 prespec_mode: str = "off",
 prespec_admission: str = "force",
 prespec_candidate_tokens: int | None = None,
+prespec_max_active_shadows: int = 0,
 ```
 
 这里假定现有入口用 `argparse` 且解析结果名为 `args`；若名字不同，只替换该局部变量名。服务启动脚本不在本仓库，无法填写其余既有 CLI 选项。
@@ -72,12 +78,13 @@ prespec_candidate_tokens: int | None = None,
 rg -n -A 35 'def enable_prespec' qwen_asr/inference/qwen3_asr_async.py
 ```
 
-这里的 `enable_prespec()` **不是上游已有 API**，而是 [主接入文档步骤 2](streaming_prespec.md) 要在 `Qwen3ASRModelAsync` 中新增的方法。该文档现在已把 `admission_mode` 和 `shadow_only` 加入签名并传给协调器；若你之前照旧版示例复制了函数，必须先同步更新签名与协调器构造，才可传下面两个实参。为记录 shadow 请求生命周期，再把其中的 `producer=self._run_prespec` 替换为 `producer=self._logged_prespec_producer`。完整的关键行是：
+这里的 `enable_prespec()` **不是上游已有 API**，而是 [主接入文档步骤 2](streaming_prespec.md) 要在 `Qwen3ASRModelAsync` 中新增的方法。同步其 `admission_mode`、`shadow_only`、`max_active_shadows` 形参，并把旧的 `max_active_shadows=1` 改为传入参数，否则更换协调器后仍只允许一个候选运行。为记录 shadow 请求生命周期，再把其中的 `producer=self._run_prespec` 替换为 `producer=self._logged_prespec_producer`。完整的关键行是：
 
 ```python
 def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
                    candidate_tokens=None, on_probe=None,
-                   admission_mode="force", shadow_only=True):
+                   admission_mode="force", shadow_only=True,
+                   max_active_shadows=0):
     # 保留主接入文档中已有的 enabled/kmax/engine 校验。
     if candidate_tokens is None:
         candidate_tokens = kmax + 1
@@ -91,7 +98,7 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
             midpoint_samples=midpoint_samples,
             max_rollback_draft_tokens=kmax,
             max_candidate_tokens=candidate_tokens,
-            max_active_shadows=1,
+            max_active_shadows=max_active_shadows,
         ),
         shadow_only=shadow_only,
         on_probe=on_probe,
@@ -113,18 +120,23 @@ if prespec_mode not in {"off", "shadow", "consume"}:
     raise ValueError(f"invalid prespec_mode: {prespec_mode}")
 if prespec_admission not in {"force", "gated"}:
     raise ValueError(f"invalid prespec_admission: {prespec_admission}")
+if prespec_max_active_shadows < 0:
+    raise ValueError("prespec_max_active_shadows must be >= 0")
 model.enable_prespec(
     enabled=(prespec_mode != "off"), kmax=kmax, engine=engine,
     chunk_size_sec=chunk_size_sec,
     candidate_tokens=prespec_candidate_tokens,
     admission_mode=prespec_admission,
+    max_active_shadows=prespec_max_active_shadows,
     shadow_only=(prespec_mode != "consume"),
     on_probe=log_prespec_probe if prespec_mode != "off" else None,
 )
 logger.info(
-    "PRESPEC_CONFIG mode=%s admission=%s kmax=%s candidate_budget=%s",
+    "PRESPEC_CONFIG mode=%s admission=%s kmax=%s candidate_budget=%s "
+    "max_active_shadows=%s",
     prespec_mode, prespec_admission, kmax,
     model.prespec.policy.max_candidate_tokens if model.prespec is not None else None,
+    prespec_max_active_shadows,
 )
 ```
 
@@ -330,7 +342,7 @@ tail -F /path/to/server.log | rg --line-buffered 'PRESPEC_|inference submit|Comm
 
 若服务由 systemd 管理，改用 `journalctl -u <实际服务单元名> -f -o cat` 作为管道左侧。先用**连续超过 6 秒且 6 秒前不 commit 的单段音频**核对三个窗口：约 1、3、5 秒分别看到 `window=0/1/2` 的 `PRESPEC_LAUNCH/REQUEST`，约 2、4、6 秒分别看到对应 `window=0/1/2 boundary=chunk status=ready_shadow_only`。三个窗口的 `request_id` 应不同，正式 `chunk=0/1/2` 分别只关联同号窗口；任一窗口跳过时不应误领前一窗口候选。`ready_lead_ms > 0` 表示候选早于对应正式请求提交完成；若为 `pending`，候选被取消，不应等待它。若是 `candidate_exceeds_kmax`，shadow 的输出超过正式 proposer 可接收长度，协调器不会把它交给正式请求。随后分别重放提前 commit、≤0.4 秒短尾和断连，确认无遗留 `prespec-...` 请求、重复 begin 或未结束的 session。约 5.95 秒就 commit 的段在 5 秒启动 `window=2`，若未凑足 6 秒正式 chunk，应在实际 `finish_...` 请求提交时看到 `PRESPEC_PROBE window=2 boundary=formal status=ready_shadow_only`；consume 模式则应为 `ready_consumed`，且 `PRESPEC_TARGET boundary=formal` 的 `candidate_request_id` 对应先前的 `prespec-...`。commit 到达时只保留已完成候选，不立即打印 formal probe；若后续完整 chunk 先领取了它，finish 不得重复领取。短尾跳过 finish 时也不会出现 formal probe，外层清理会丢弃候选。
 
-如果链路没有 launch，打开 DEBUG 日志后先看 `return None` 的跳过原因和 `PRESPEC_LAUNCH reason`；`force` 仅绕过实时负载门控，不绕过中点、草稿、在途正式请求和容量检查。
+如果链路没有 launch，打开 DEBUG 日志后先看 `return None` 的跳过原因和 `PRESPEC_LAUNCH reason`；`force` 仅绕过实时负载门控，不绕过中点、草稿、本连接的在途正式请求和显式开启的容量检查。`discarded_before_boundary` 表示本窗口启动过、但候选在边界前已被丢弃；它替代含义模糊的 `previously_used`，不表示正式请求已使用或接受候选。
 
 单轮结束后可快速检查事件是否齐全、拒绝原因分布；路径替换为该轮切出的服务日志：
 
@@ -338,6 +350,60 @@ tail -F /path/to/server.log | rg --line-buffered 'PRESPEC_|inference submit|Comm
 rg -c 'PRESPEC_LAUNCH.*launched=True|PRESPEC_REQUEST event=done|PRESPEC_PROBE.*ready_' /path/to/run.log
 rg 'PRESPEC_SKIP|PRESPEC_LAUNCH' /path/to/run.log | rg -o 'reason=[^ ]+' | sort | uniq -c
 ```
+
+### 2.1 多连接候选并发与生命周期隔离
+
+同步协调器及上面的参数接线，重启服务：
+
+```bash
+<现有服务启动命令> --prespec-mode shadow --prespec-admission force \
+  --prespec-max-active-shadows 0
+```
+
+用现有 `sustained_test` 运行并发 5、20 档，保留本轮完整日志；另用固定回放安排连接 A 在连接 B 的中点候选运行期间提交 commit。客户端参数按现有脚本填写。先查实际启动配置和候选生命周期：
+
+```bash
+rg 'PRESPEC_CONFIG|PRESPEC_REQUEST|PRESPEC_PROBE|Commit received|inference submit' /path/to/run.log
+rg 'formal_inflight_on_device|shadow_capacity_full|previously_used' /path/to/run.log
+```
+
+第二条命令在本次 `force + max_active_shadows=0` 运行中应没有结果；若仍出现，核对实际加载的协调器以及服务中是否残留 `max_active_shadows=1`。本连接仍可能返回 `session_formal_inflight` / `session_chunk_inflight`，同窗口已启动则返回 `epoch_already_used`，这些不代表全局串行。
+
+下面命令统计 producer 日志中同时运行的候选数量；必须输入单个服务进程的一轮完整日志，并在测试结束、连接清理后执行：
+
+```bash
+python - /path/to/run.log <<'PY'
+import re
+import sys
+
+active = {}
+peak = 0
+peak_sessions = 0
+with open(sys.argv[1], encoding="utf-8") as log:
+    for line in log:
+        if "PRESPEC_REQUEST " not in line:
+            continue
+        fields = dict(re.findall(r"(\w+)=([^\s]+)", line))
+        request_id = fields.get("request_id")
+        if fields.get("event") == "submit":
+            active[request_id] = fields["ws_id"]
+            peak = max(peak, len(active))
+            peak_sessions = max(peak_sessions, len(set(active.values())))
+        elif fields.get("event") in {"done", "cancel", "failed"}:
+            active.pop(request_id, None)
+print({"peak_shadow_requests": peak,
+       "peak_shadow_sessions": peak_sessions,
+       "unfinished_request_ids": sorted(active)})
+PY
+```
+
+安排中点重叠后，`peak_shadow_sessions > 1` 可确认多个连接的 producer 生命周期重叠；它不代表 NPU kernel 同时执行。完整日志的 `unfinished_request_ids` 应为空。按同一 `ws_id/seg/window` 继续检查：
+
+- B 的候选尚在运行时，A 的 chunk/commit 不应取消 B；B 自己到达正式边界或截止时间时仍可取消。
+- B 已出现 `event=done` 后，A 的正式请求不能删除 B 的候选；B 的窗口/版本/音频边界保持有效时，应在自己的正式边界看到 `ready_shadow_only`，consume 重跑时为 `ready_consumed`。
+- A 断连清理只影响 A；B 正常产出匹配统计。B 自己的 `pending`、窗口变化、版本变化或超时仍属于合法回退。
+
+如需显式设协调器上限，改传 `--prespec-max-active-shadows 4`；这时 `shadow_capacity_full` 是预期容量保护。切换 `gated` 后仍会根据共享设备负载拒绝候选，不能把该拒绝解释为跨连接生命周期互斥。并发能力确认后，按第 4 节比较同负载正式 P95/P99，不能由并发日志直接推断没有资源争用。
 
 ## 3. 固定输入正确性：A、B、C 逐级比较
 
