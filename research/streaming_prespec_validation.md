@@ -485,19 +485,53 @@ if formal_metrics is not None:
     )
 ```
 
-正式 chunk 和 finish 的原调用点各建一个 `formal_metrics = {}`，把它与已有 `on_output` 一起传给同一条 `_yield_delta_text(...)` 流。该流结束后，在正式输出确实完成时记录一条 JSON 日志；下面的 `formal_request_id`、`seg_id`、`boundary`、`draft_token_ids` 使用**该调用点已经构造好的值**，`draft_source` 按实际提交内容赋为 `prespec`（使用候选）、`rollback`（只使用回滚草稿）或 `none`（无草稿）：
+正式 chunk 和 finish 的原调用点各建一个 `formal_metrics = {}`，把它与已有 `on_output` 一起传给同一条 `_yield_delta_text(...)` 流。**当前接入示例尚未定义 `draft_source` 或下面统计用的 `boundary`；910B 服务端必须在两处正式请求打包完成后显式赋值。** 正式 chunk 的 `boundary = "chunk"`，正式 finish 的 `boundary = "finish"`；短尾跳过 finish 时没有正式请求，也不写本条统计日志。协调器的 `PRESPEC_PROBE boundary=formal` 表示 commit 边界，是另一套命名，不能直接填入这里只接受 `chunk/finish` 的分析脚本。
+
+两处都先从**实际传给 `engine.generate` 的** `SamplingParams.extra_args` 读取草稿。chunk 的 `draft_token_ids` 是第五节选出的候选或回滚草稿；finish 的同义变量是 `finish_draft_token_ids`。分别在对应调用点赋值：
+
+```python
+# async_streaming_transcribe() 的正式 chunk 调用点：
+boundary = "chunk"
+selected_draft_token_ids = draft_token_ids
+```
+
+```python
+# async_finish_streaming_transcribe() 的正式 finish 调用点：
+boundary = "finish"
+selected_draft_token_ids = finish_draft_token_ids
+```
+
+然后在**各自**的 `engine.generate` 之前执行同一段来源判定。这里的 `sampling_params` 指该次正式请求实际传入的对象（若已打包在 `request_kwargs`，先从中取出）：
+
+```python
+submitted_draft_ids = tuple(
+    (sampling_params.extra_args or {}).get("ascend_external_draft") or ()
+)
+draft_stats_valid = submitted_draft_ids == tuple(selected_draft_token_ids)
+if not draft_stats_valid:
+    logger.warning("ASR_FORMAL_STATS draft mismatch request_id=%s", formal_request_id)
+draft_source = (
+    "none" if not submitted_draft_ids else
+    "prespec" if candidate is not None else
+    "rollback"
+)
+```
+
+`candidate` 必须是本次正式请求**实际领取并选用**的候选，不能从 `PRESPEC_PROBE status=ready_*` 推断。若 `draft_stats_valid=False`，保留正式推理原流程，但不要输出带猜测来源的 `ASR_FORMAL_STATS`；先查打包函数为何改变了草稿。shadow 模式的 `candidate` 返回 `None`，于是正式请求依草稿是否为空标为 `rollback` 或 `none`。服务端提交长度取 `len(submitted_draft_ids)`；引擎运行时进一步裁剪的长度由 `ASR_VERIFY_STEP.effective_draft_tokens` 记录。
+
+该流结束后，仅在正式输出确实完成且来源已核对时记录一条 JSON 日志。下面的 `formal_request_id` 换成原 `stream_...` 或 `finish_...` 的实际局部变量，`seg_id` 取本段编号，不能填 shadow 请求 ID：
 
 ```python
 import json
 
-if formal_output_finished:
+if formal_output_finished and draft_stats_valid:
     logger.info("ASR_FORMAL_STATS %s", json.dumps({
         "request_id": formal_request_id,
         "ws_id": connection_id,
         "seg": seg_id,
         "boundary": boundary,  # "chunk" 或 "finish"
         "draft_source": draft_source,
-        "submitted_draft_tokens": len(draft_token_ids),
+        "submitted_draft_tokens": len(submitted_draft_ids),
         "output_token_count": len(raw_target_tokens),
         "decode_rounds": formal_metrics["decode_rounds"],
         "prefill_ms": formal_metrics.get("prefill_ms"),
