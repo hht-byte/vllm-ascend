@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from bisect import bisect_left
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,7 @@ METRICS = ("output_token_count", "decode_rounds", "tokens_per_round",
            "acceptance_rate")
 SOURCES = ("none", "rollback", "prespec")
 BOUNDARIES = ("chunk", "finish")
+VLLM_INTERNAL_ID = re.compile(r"^(.+)-[0-9a-fA-F]{8}$")
 
 
 def _integer(row: dict, key: str, where: str) -> int:
@@ -121,15 +123,38 @@ def _log_time(line: str) -> datetime | None:
         return None
 
 
+def _target_submit(line: str) -> dict | None:
+    """Read a formal request's submit marker for collision-safe log-order joins."""
+    marker = "PRESPEC_TARGET "
+    if marker not in line:
+        return None
+    fields = dict(re.findall(r"(?:^|\s)([a-z_]+)=([^\s]+)",
+                             line.split(marker, 1)[1]))
+    boundary = ("finish" if fields.get("boundary") == "formal" else
+                "chunk" if fields.get("event") == "submit" and "chunk" in fields
+                else None)
+    if boundary is None or not all(fields.get(key) for key in
+                                   ("formal_request_id", "ws_id", "seg")):
+        return None
+    return {"request_id": fields["formal_request_id"],
+            "ws_id": fields["ws_id"], "seg": fields["seg"],
+            "boundary": boundary}
+
+
 def parse_run(paths: list[str], *, allow_legacy_time_join: bool = False) -> list[dict]:
     """Join events, retaining distinct requests after a legacy ID collision."""
     formals: list[tuple[dict, datetime | None, Path]] = []
+    formal_lines: list[int] = []
     formal_by_id: dict[str, list[int]] = {}
-    verifiers: dict[str, list[tuple[dict, datetime | None, Path]]] = {}
+    verifiers: dict[str, list[tuple[dict, datetime | None, Path, int]]] = {}
+    targets: list[tuple[dict, Path, int]] = []
     for path_text in paths:
         path = Path(path_text)
         with path.open(encoding="utf-8") as stream:
             for line_number, line in enumerate(stream, 1):
+                target = _target_submit(line)
+                if target is not None:
+                    targets.append((target, path, line_number))
                 for marker, kind in MARKERS.items():
                     if marker not in line:
                         continue
@@ -152,45 +177,81 @@ def parse_run(paths: list[str], *, allow_legacy_time_join: bool = False) -> list
                             raise ValueError(f"{where}: duplicate formal request_id {request_id}")
                         siblings.append(len(formals))
                         formals.append((row, _log_time(line), path))
+                        formal_lines.append(line_number)
                     else:
                         row = _validated_verify(event, where)
                         verifiers.setdefault(row["request_id"], []).append(
-                            (row, _log_time(line), path))
+                            (row, _log_time(line), path, line_number))
                     break
     steps_by_formal: list[list[dict]] = [[] for _ in formals]
-    for request_id, events in verifiers.items():
-        indices = formal_by_id.get(request_id, [])
-        if not indices:
-            raise ValueError(f"orphan verifier request_id {request_id}")
+    verifier_ids_by_formal: list[set[str]] = [set() for _ in formals]
+    events_by_external_id: dict[str, list[tuple[dict, datetime | None, Path, int, str]]] = {}
+    for internal_id, events in verifiers.items():
+        if internal_id in formal_by_id:
+            external_id = internal_id
+        else:
+            match = VLLM_INTERNAL_ID.fullmatch(internal_id)
+            external_id = match.group(1) if match else None
+            if external_id not in formal_by_id:
+                raise ValueError(f"orphan verifier request_id {internal_id}")
+        events_by_external_id.setdefault(external_id, []).extend(
+            (row, timestamp, path, line_number, internal_id)
+            for row, timestamp, path, line_number in events)
+    for request_id, events in events_by_external_id.items():
+        indices = formal_by_id[request_id]
         if len(indices) == 1:
-            steps_by_formal[indices[0]] = [row for row, _, _ in events]
+            index = indices[0]
+            steps_by_formal[index].extend(row for row, _, _, _, _ in events)
+            verifier_ids_by_formal[index].update(raw_id for _, _, _, _, raw_id in events)
             continue
-        if not allow_legacy_time_join:
-            raise ValueError(f"ambiguous reused request_id {request_id} has verifier "
-                             "events; use unique IDs in new runs, or "
-                             "--allow-legacy-time-join for a complete single-file log")
-        # The verifier event has no ws/seg. For reused IDs, only a single
-        # timestamped log file provides a defensible lifetime boundary.
-        sources = {formals[index][2] for index in indices}
-        sources.update(path for _, _, path in events)
-        if len(sources) != 1 or any(formals[index][1] is None for index in indices) or \
-                any(timestamp is None for _, timestamp, _ in events):
-            raise ValueError(f"ambiguous reused request_id {request_id}: "
-                             "verifier events need timestamps in one log file")
-        ordered = sorted(indices, key=lambda index: formals[index][1])
-        completion_times = [formals[index][1] for index in ordered]
-        if len(set(completion_times)) != len(completion_times):
-            raise ValueError(f"ambiguous reused request_id {request_id}: "
-                             "formal completions have the same timestamp")
-        for row, timestamp, _ in events:
-            if timestamp in completion_times:
+        for row, timestamp, path, line_number, raw_id in events:
+            bracketed = []
+            for index in indices:
+                formal, _, formal_path = formals[index]
+                if path != formal_path or line_number >= formal_lines[index]:
+                    continue
+                starts = [target_line for target, target_path, target_line in targets
+                          if target_path == path and target_line < formal_lines[index]
+                          and target == {"request_id": request_id,
+                                         "ws_id": formal["ws_id"],
+                                         "seg": str(formal["seg"]),
+                                         "boundary": formal["boundary"]}]
+                if len(starts) == 1 and starts[0] < line_number:
+                    bracketed.append(index)
+            if len(bracketed) == 1:
+                index = bracketed[0]
+            elif any(target["request_id"] == request_id for target, _, _ in targets):
                 raise ValueError(f"ambiguous reused request_id {request_id}: "
-                                 "verifier and formal have the same timestamp")
-            position = bisect_left(completion_times, timestamp)
-            if position == len(ordered):
-                raise ValueError(f"ambiguous reused request_id {request_id}: "
-                                 "verifier occurs after the last formal completion")
-            steps_by_formal[ordered[position]].append(row)
+                                 "verifier has no unique submit/completion bracket")
+            else:
+                if not allow_legacy_time_join:
+                    raise ValueError(f"ambiguous reused request_id {request_id} has "
+                                     "verifier events; use unique IDs in new runs, or "
+                                     "--allow-legacy-time-join for a complete single-file log")
+                # Older logs lack submit markers. Only the explicit legacy mode
+                # may infer ownership from complete, timestamped single-file logs.
+                sources = {formals[candidate][2] for candidate in indices}
+                if len(sources) != 1 or path not in sources or timestamp is None or \
+                        any(formals[candidate][1] is None for candidate in indices):
+                    raise ValueError(f"ambiguous reused request_id {request_id}: "
+                                     "verifier events need timestamps in one log file")
+                ordered = sorted(indices, key=lambda candidate: formals[candidate][1])
+                completion_times = [formals[candidate][1] for candidate in ordered]
+                if len(set(completion_times)) != len(completion_times) or \
+                        timestamp in completion_times:
+                    raise ValueError(f"ambiguous reused request_id {request_id}: "
+                                     "verifier/formal completion timestamp conflict")
+                position = bisect_left(completion_times, timestamp)
+                if position == len(ordered):
+                    raise ValueError(f"ambiguous reused request_id {request_id}: "
+                                     "verifier occurs after the last formal completion")
+                index = ordered[position]
+            steps_by_formal[index].append(row)
+            verifier_ids_by_formal[index].add(raw_id)
+    for index, raw_ids in enumerate(verifier_ids_by_formal):
+        if len(raw_ids) > 1:
+            raise ValueError(f"multiple verifier request_ids for formal "
+                             f"{formals[index][0]['request_id']}: {sorted(raw_ids)}")
     for index, (formal, _, _) in enumerate(formals):
         request_id = formal["request_id"]
         steps = steps_by_formal[index]
@@ -249,6 +310,7 @@ def parse_run(paths: list[str], *, allow_legacy_time_join: bool = False) -> list
             "tokens_per_round": formal["output_token_count"] / formal["decode_rounds"]
             if formal["decode_rounds"] else None,
             "verifier_event_count": len(steps),
+            "verifier_request_ids": sorted(verifier_ids_by_formal[index]),
             "verifier_status": status,
             "missing_verifier": missing,
             "incomplete_verifier": incomplete,
@@ -374,7 +436,7 @@ def main() -> None:
     parser.add_argument("--out", required=True, metavar="PATH")
     parser.add_argument(
         "--allow-legacy-time-join", action="store_true",
-        help="infer colliding legacy request IDs from timestamps in one complete log file",
+        help="fallback for reused IDs without submit markers: infer ownership from full millisecond timestamps in one complete log file",
     )
     args = parser.parse_args()
     try:
@@ -393,7 +455,7 @@ def main() -> None:
             comparisons["rollback_to_shadow"] = compare(runs["rollback"], runs["shadow"])
             comparisons["shadow_to_consume"] = compare(runs["shadow"], runs["consume"])
         output = {
-            "methodology": "Request-level descriptive statistics. Runs are not paired by audio/case; differences are not causal. Output tokens are raw formal DELTA token IDs (including special tokens), decode_rounds are decode iterations, and accepted_draft_tokens are verifier-confirmed external draft tokens only. Missing and incomplete verifier logs are excluded from acceptance statistics; a completed 0/0 skip is distinct from both and is not an actual acceptance-rate observation. Time-based joins of reused legacy request IDs are opt-in heuristics for complete single-file logs; ambiguous collisions fail.",
+            "methodology": "Request-level descriptive statistics. Runs are not paired by audio/case; differences are not causal. Output tokens are raw formal DELTA token IDs (including special tokens), decode_rounds are decode iterations, and accepted_draft_tokens are verifier-confirmed external draft tokens only. Missing and incomplete verifier logs are excluded from acceptance statistics; a completed 0/0 skip is distinct from both and is not an actual acceptance-rate observation. vLLM internal -8hex request IDs are matched to service external IDs only when the external ID exists. Reused external IDs require a unique same-file submit-to-completion log bracket; without submit markers, timestamp-based joins are opt-in heuristics for complete single-file logs. Ambiguous collisions fail.",
             "legacy_time_join_enabled": args.allow_legacy_time_join,
             "runs": runs,
             "comparison": comparisons,

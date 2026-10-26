@@ -471,7 +471,7 @@ python streaming_prespec_monitor.py compare \
 
 ### 4.1 正式输出 token、解码轮次与 verifier 接受数
 
-这里按**正式 vLLM 请求**统计，键是实际 `stream_...` / `finish_...` `request_id`，A（rollback）、B（shadow）、C（consume）都要打开相同打点。`output_token_count` 是该请求完成时，`DELTA` 输出中 `token_ids` 的累计长度，包含模型原始输出的特殊 token；它不是最终转写文本重新分词后的长度。`decode_rounds` 沿用 `_yield_delta_text()` 现有的 `token_count` 计数器，记录解码轮次。两者不能互换；一次轮次可能产出多个 token。跳过 finish 推理的 commit 没有正式请求，仍只在 `commits.jsonl` 中计入对应 commit 时延，不能给它补一条零轮次请求。
+这里按**正式 vLLM 请求**统计。服务端的 `ASR_FORMAL_STATS.request_id` 是传给 `engine.generate()` 的外部 `stream_...` / `finish_...` ID；vLLM 默认再给内部 ID 追加 `-` 和 8 位十六进制随机后缀，调度器的 `req_id` 因而可能是 `stream_..._1-8934184b`。两者须按一次请求关联，不能直接按字符串相等合并。A（rollback）、B（shadow）、C（consume）都要打开相同打点。`output_token_count` 是该请求完成时，`DELTA` 输出中 `token_ids` 的累计长度，包含模型原始输出的特殊 token；它不是最终转写文本重新分词后的长度。`decode_rounds` 沿用 `_yield_delta_text()` 现有的 `token_count` 计数器，记录解码轮次。两者不能互换；一次轮次可能产出多个 token。跳过 finish 推理的 commit 没有正式请求，仍只在 `commits.jsonl` 中计入对应 commit 时延，不能给它补一条零轮次请求。
 
 在服务项目 `qwen_asr/inference/qwen3_asr_async.py` 中，沿用 1.4 节的 `on_output` 收集器：它必须对 A/B/C 的**每次正式请求**运行，而不以 `prespec is not None` 为条件。正式输出完成后，`output_token_count = len(raw_target_tokens)`；只对 `output.finished` 为真的请求写一行。为取到现有局部计数器，在 `_yield_delta_text()` 原来计算/打印 `token_count`、`prefill_ms`、`decode_total_ms` 的位置，把这些数写入本次调用传入的可选字典 `formal_metrics`（需给函数签名和调用点加 `formal_metrics=None`）：
 
@@ -542,7 +542,9 @@ if formal_output_finished and draft_stats_valid:
 
 `PRESPEC_REQUEST event=done tokens=...` 是后台候选的输出长度，不可填到 `output_token_count`。若服务不能从 `_yield_delta_text()` 取得真实轮次，就先修通 `formal_metrics`，不要用输出 token 数或耗时反推。`on_output` 对 DELTA 的 `token_ids` 只累计一次；finish 若不是 DELTA，先改成与 chunk 一致的输出语义或按其实际输出类型去重。
 
-**正式 `request_id` 必须在整份日志中唯一。**旧的 `stream_{id(state)}_{chunk_id}` / `finish_{id(state)}` 命名会在 Python 释放并复用对象 ID 后撞名。新采样应在 `ASRStreamingState` 中增加一个初始化时生成的 UUID 字段，用它代替 `id(state)`，例如 `stream_{state.request_namespace}_{chunk_id}` / `finish_{state.request_namespace}`；正式请求、服务端 `ASR_FORMAL_STATS` 和引擎 `ASR_VERIFY_STEP` 都使用实际传给 `engine.generate()` 的同一 ID。分析脚本能处理旧日志中不同连接的撞名：无 verifier 时分别计数；有 verifier 时默认报歧义。只有确认输入是**同一个完整、带毫秒时间戳的日志文件**时，才可显式传 `--allow-legacy-time-join`，按正式完成时间推断每个 verifier 的归属；日志切片缺少前一次完成事件时仍有错配风险。缺时间戳、跨文件或边界冲突时即使加此参数也会报错。
+**服务端正式请求的外部 `request_id` 应在整份日志中唯一。**旧的 `stream_{id(state)}_{chunk_id}` / `finish_{id(state)}` 命名会在 Python 释放并复用对象 ID 后撞名。新采样应在 `ASRStreamingState` 中增加一个初始化时生成的 UUID 字段，用它代替 `id(state)`，例如 `stream_{state.request_namespace}_{chunk_id}` / `finish_{state.request_namespace}`；正式请求和服务端 `ASR_FORMAL_STATS` 使用这个外部 ID。vLLM 的 `InputProcessor.assign_request_id()` 会保存外部 ID 并默认生成带 `-8hex` 后缀的内部 ID；调度器中的 `Request` 只保留内部 ID，不能在插桩处直接读取 `request.external_req_id`。因此 `ASR_VERIFY_STEP.request_id` 记录调度器实际 `req_id`，由分析器在确认后缀格式、外部 ID 存在和请求生命周期后关联到服务端记录；新外部 UUID 解决重名，但不会去掉 vLLM 的内部后缀。
+
+旧日志如有外部 ID 重复，不能仅剥离 `-8hex` 后缀后按裸 ID 合并：那会把不同连接的 verifier 错配。无 verifier 的不同 `(ws_id, seg, boundary)` 正式记录可分别计数。存在 verifier 时，分析器先在**同一文件**用 `PRESPEC_TARGET` 提交行与对应 `ASR_FORMAL_STATS` 完成行围出请求生命周期；某条 verifier 恰好只落在一个区间内才自动关联。你贴出的 EngineCore 行只有 `MM-DD HH:MM:SS`，但这种行号关联不依赖其毫秒时间戳。若缺少 `PRESPEC_TARGET`，只有服务与引擎 verifier **都带完整毫秒时间戳且写入同一文件**时，才能显式使用 `--allow-legacy-time-join` 按完成时间推断；重叠、缺边界或跨文件时应报歧义。优先改用唯一外部 ID 重采样。
 
 在 **vLLM-Ascend 完成 rejection sampling、调度器收到本轮输出之后**，对每个正式请求的每个验证轮次记录一行。不要用 `propose()` 的提议长度、服务端 `PRESPEC_MATCH` 或 Ascend sampler 的整批非占位输出数推测接受数。参考本地源码快照，实际判定在 `vllm_ascend/sample/rejection_sampler.py` 的 `rejection_sample(...)`；推荐打点放在 **vLLM 包**的 `vllm/v1/core/sched/scheduler.py::Scheduler.update_from_output()`，现有 `if scheduled_spec_token_ids and generated_token_ids:` 分支内，紧跟 `num_accepted = len(generated_token_ids) - 1`，且在 `_update_request_with_output()` 处理 stop token 之前。若 910B **实际启用** Ascend `RecomputeScheduler`，则改其覆盖的 `vllm_ascend/core/recompute_scheduler.py::RecomputeScheduler.update_from_output()` 同一分支；只修改实际被加载的调度器。源码快照的对应行分别约为 1369 和 923，部署版须按函数名定位。
 
@@ -552,7 +554,7 @@ if formal_output_finished and draft_stats_valid:
 
 | 日志字段 | 当前代码中的来源 |
 |---|---|
-| `request_id` | 循环变量 `req_id`，即服务提交的 `stream_...` / `finish_...` |
+| `request_id` | 循环变量 `req_id`，即 vLLM 内部 ID；默认是在服务提交的 `stream_...` / `finish_...` 外部 ID 后追加 `-8hex`，不是服务端原始 ID |
 | `effective_draft_tokens` | `len(scheduled_spec_token_ids) - (scheduler_output.num_invalid_spec_tokens or {}).get(req_id, 0)`；调度器可能截短草稿，结构化输出还可能补无效占位 |
 | `accepted_draft_tokens` | 已有 `num_accepted = len(generated_token_ids) - 1`；生成列表在这里尚未被 stop 逻辑截断，最后一个是修正或 bonus token |
 | `round_index` | 原代码没有；当前一次性 external proposer 的唯一验证轮为 `0` |
@@ -585,7 +587,7 @@ if req_id.startswith(("stream_", "finish_")):
         )
 ```
 
-`scheduled_spec_token_ids` 来自当轮 `scheduler_output.scheduled_spec_decode_tokens.get(req_id)`，比服务提交的 `submitted_draft_tokens` 更接近实际 verifier 输入；`num_invalid_spec_tokens` 只在结构化输出等路径生成无效占位时非零。这里的 `num_accepted` 是 vLLM 调度器已有的**连续草稿接受数**，不包含拒绝后的修正或全接受后的 bonus token。调度器拿到的 `generated_token_ids` 已是 CPU 列表，所以此处日志不会为了测量而额外同步 NPU。`draft_source` 和 `boundary` 不在引擎里猜：分析脚本按同一个 `request_id` 连接服务端 `ASR_FORMAL_STATS`。
+`scheduled_spec_token_ids` 来自当轮 `scheduler_output.scheduled_spec_decode_tokens.get(req_id)`，比服务提交的 `submitted_draft_tokens` 更接近实际 verifier 输入；`num_invalid_spec_tokens` 只在结构化输出等路径生成无效占位时非零。这里的 `num_accepted` 是 vLLM 调度器已有的**连续草稿接受数**，不包含拒绝后的修正或全接受后的 bonus token。调度器拿到的 `generated_token_ids` 已是 CPU 列表，所以此处日志不会为了测量而额外同步 NPU。`draft_source` 和 `boundary` 不在引擎里猜：分析脚本先将内部 `req_id` 有条件关联到服务端外部 `request_id`，再读取对应的 `ASR_FORMAL_STATS`。
 
 上述 `round_index=0`、`verifier_complete=True` 依据目前 external proposer 的 `external_drafts.pop(req_id, [])` 一次性消费语义。若 910B 的 fork 能对同一正式请求再次提供 external draft，需要按 `req_id` 维护轮次和有效草稿累计数，只在最后一轮写 `verifier_complete=True` 及累计的 `actual_effective_draft_tokens`；不能把每轮都标为完成。分析脚本要求各轮有效数之和等于末轮给出的总数，否则判为不完整。
 
@@ -601,7 +603,7 @@ python streaming_prespec_gain.py \
   --out gain-c20.json
 ```
 
-`gain-c20.json` 的 `runs.rollback`、`runs.consume` 分别有每请求 `records` 与 `all`、`by_boundary`、`by_draft_source` 汇总；`comparison.rollback_to_consume` 给出 consume 减 rollback 的均值/P95 差值。先看 `missing_verifier_count`、`incomplete_verifier_count` 和 `explicit_zero_effective_count`，再按 `boundary=chunk/finish` 与 `draft_source` 看每请求输出 token、轮次、`tokens_per_round`、实际接受数/有效草稿数及 `observed_acceptance_rate`。无草稿请求的接受数记 0，但不进入接受率分母；有草稿却缺验证/阻断事件记缺失。可加 `--shadow-log shadow-server.log shadow-engine.log` 输出 B 组及 A→B、B→C 差值。脚本只报告 `case_id_count`（带此字段的请求数），**不自动配对**；相同音频回放能提供稳定 `case_id` 时可用 `records` 另做逐条配对或按输出长度分组。不同音频或不同 finish 跳过比例下，均值只能作描述。最终仍以同负载的**全部非空 commit** P50/P95/P99 为收益判据，并同时报告段级音频队列等待与 vLLM waiting/running。
+`gain-c20.json` 的 `runs.rollback`、`runs.consume` 分别有每请求 `records` 与 `all`、`by_boundary`、`by_draft_source` 汇总；每条 record 的 `request_id` 是服务端外部 ID，`verifier_request_ids` 保留关联到的引擎内部 ID，供核查后缀映射。`comparison.rollback_to_consume` 给出 consume 减 rollback 的均值/P95 差值。先看 `missing_verifier_count`、`incomplete_verifier_count` 和 `explicit_zero_effective_count`，再按 `boundary=chunk/finish` 与 `draft_source` 看每请求输出 token、轮次、`tokens_per_round`、实际接受数/有效草稿数及 `observed_acceptance_rate`。无草稿请求的接受数记 0，但不进入接受率分母；有草稿却缺验证/阻断事件记缺失。可加 `--shadow-log shadow-server.log shadow-engine.log` 输出 B 组及 A→B、B→C 差值。脚本只报告 `case_id_count`（带此字段的请求数），**不自动配对**；相同音频回放能提供稳定 `case_id` 时可用 `records` 另做逐条配对或按输出长度分组。不同音频或不同 finish 跳过比例下，均值只能作描述。最终仍以同负载的**全部非空 commit** P50/P95/P99 为收益判据，并同时报告段级音频队列等待与 vLLM waiting/running。
 
 判定表：
 

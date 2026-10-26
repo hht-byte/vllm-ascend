@@ -55,9 +55,23 @@ class GainAnalyzerTest(unittest.TestCase):
                 rendered = []
                 for item in rows:
                     kind, row, *timestamp = item
-                    rendered.append(line("ASR_FORMAL_STATS" if kind == "formal"
-                                         else "ASR_VERIFY_STEP", row,
-                                         *(timestamp or [])))
+                    if kind == "target":
+                        boundary = ("window=1 boundary=formal" if row.get("boundary") == "finish"
+                                    else "chunk=1 event=submit")
+                        rendered.append(
+                            f"{timestamp[0] if timestamp else '2026-10-26 07:05:04.279'}"
+                            f" - INFO - PRESPEC_TARGET ws_id={row['ws_id']}"
+                            f" seg={row['seg']} {boundary}"
+                            f" formal_request_id={row['request_id']}\n")
+                    elif kind == "verify_engine":
+                        rendered.append(
+                            "(EngineCore pid=215074) INFO 10-26 07:05:04 "
+                            "[scheduler.py:1437] ASR_VERIFY_STEP "
+                            + json.dumps(row) + "\n")
+                    else:
+                        rendered.append(line("ASR_FORMAL_STATS" if kind == "formal"
+                                             else "ASR_VERIFY_STEP", row,
+                                             *(timestamp or [])))
                 paths[name].write_text("noise unrelated\n" + "".join(rendered),
                                        encoding="utf-8")
             output = root / "gain.json"
@@ -171,6 +185,96 @@ class GainAnalyzerTest(unittest.TestCase):
                          {("ws-71ab1850", 1), ("ws-1cf924ed", 6)})
         self.assertEqual(data["runs"]["rollback"]["all"]
                          ["output_token_count"]["mean"], 10.5)
+
+    def test_vllm_internal_id_suffix_joins_unique_formal(self):
+        external_id = "stream_281469921403504_1"
+        rollback = [
+            ("verify_engine", verify(external_id + "-8934184b", 0,
+                                     source=None, effective=10, accepted=9)),
+            ("formal", formal(external_id, ws_id="ws-dd43573e", seg=0,
+                              source="rollback", draft=10)),
+        ]
+        result, data = self.run_cli(rollback, [("formal", formal("consume"))])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = data["runs"]["rollback"]["records"][0]
+        self.assertEqual(record["verifier_status"], "observed")
+        self.assertEqual(record["accepted_draft_tokens"], 9)
+        self.assertEqual(record["effective_draft_tokens"], 10)
+
+    def test_reused_external_id_joins_engine_steps_by_submit_lifetime(self):
+        external_id = "stream_281470479549744_0"
+        rollback = [
+            ("target", {"request_id": external_id, "ws_id": "ws-first", "seg": 1},
+             "2026-10-26 07:05:17.475"),
+            ("verify_engine", verify(external_id + "-8934184b", 0,
+                                     source=None, effective=3, accepted=2)),
+            ("formal", formal(external_id, ws_id="ws-first", seg=1,
+                              source="rollback", draft=3),
+             "2026-10-26 07:05:17.670"),
+            ("target", {"request_id": external_id, "ws_id": "ws-second", "seg": 6},
+             "2026-10-26 07:05:25.061"),
+            ("verify_engine", verify(external_id + "-5a6b7c8d", 0,
+                                     source=None, effective=4, accepted=1)),
+            ("formal", formal(external_id, ws_id="ws-second", seg=6,
+                              source="rollback", draft=4),
+             "2026-10-26 07:05:25.326"),
+        ]
+        result, data = self.run_cli(rollback, [("formal", formal("consume"))])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        by_ws = {row["ws_id"]: row for row in data["runs"]["rollback"]["records"]}
+        self.assertEqual(by_ws["ws-first"]["accepted_draft_tokens"], 2)
+        self.assertEqual(by_ws["ws-second"]["accepted_draft_tokens"], 1)
+
+    def test_non_vllm_suffix_is_not_stripped(self):
+        external_id = "stream_281469921403504_1"
+        rollback = [
+            ("verify_engine", verify(external_id + "-nothex12", 0,
+                                     source=None, effective=10, accepted=9)),
+            ("formal", formal(external_id, source="rollback", draft=10)),
+        ]
+        result, data = self.run_cli(rollback, [("formal", formal("consume"))])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("orphan verifier", result.stderr)
+        self.assertIsNone(data)
+
+    def test_reused_finish_id_uses_formal_boundary_submit_marker(self):
+        external_id = "finish_281470479549744"
+        rollback = [
+            ("target", {"request_id": external_id, "ws_id": "ws-first",
+                        "seg": 1, "boundary": "finish"}),
+            ("verify_engine", verify(external_id + "-8934184b", 0,
+                                     source=None, effective=3, accepted=2)),
+            ("formal", formal(external_id, ws_id="ws-first", seg=1,
+                              boundary="finish", source="rollback", draft=3)),
+            ("target", {"request_id": external_id, "ws_id": "ws-second",
+                        "seg": 6, "boundary": "finish"}),
+            ("verify_engine", verify(external_id + "-5a6b7c8d", 0,
+                                     source=None, effective=4, accepted=1)),
+            ("formal", formal(external_id, ws_id="ws-second", seg=6,
+                              boundary="finish", source="rollback", draft=4)),
+        ]
+        result, data = self.run_cli(rollback, [("formal", formal("consume"))])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        by_ws = {row["ws_id"]: row for row in data["runs"]["rollback"]["records"]}
+        self.assertEqual(by_ws["ws-first"]["accepted_draft_tokens"], 2)
+        self.assertEqual(by_ws["ws-second"]["accepted_draft_tokens"], 1)
+
+    def test_overlapping_reused_id_lifetimes_are_rejected(self):
+        external_id = "stream_281470479549744_0"
+        rollback = [
+            ("target", {"request_id": external_id, "ws_id": "ws-first", "seg": 1}),
+            ("target", {"request_id": external_id, "ws_id": "ws-second", "seg": 6}),
+            ("verify_engine", verify(external_id + "-8934184b", 0,
+                                     source=None, effective=3, accepted=2)),
+            ("formal", formal(external_id, ws_id="ws-first", seg=1,
+                              source="rollback", draft=3)),
+            ("formal", formal(external_id, ws_id="ws-second", seg=6,
+                              source="rollback", draft=3)),
+        ]
+        result, data = self.run_cli(rollback, [("formal", formal("consume"))])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no unique submit/completion bracket", result.stderr)
+        self.assertIsNone(data)
 
     def test_reused_request_id_joins_verifier_to_its_later_formal_completion(self):
         rollback = [("formal", formal("base"))]
