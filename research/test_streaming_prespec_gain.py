@@ -36,12 +36,13 @@ def verify(request_id, round_index, *, source="prespec", effective=5,
     return row
 
 
-def line(marker, row):
-    return f"2026-10-23 06:37:56.231 - INFO - {marker} {json.dumps(row)}\n"
+def line(marker, row, at="2026-10-23 06:37:56.231"):
+    return f"{at} - INFO - {marker} {json.dumps(row)}\n"
 
 
 class GainAnalyzerTest(unittest.TestCase):
-    def run_cli(self, rollback_rows, consume_rows, *, shadow_rows=None):
+    def run_cli(self, rollback_rows, consume_rows, *, shadow_rows=None,
+                allow_legacy_time_join=False):
         with tempfile.TemporaryDirectory(dir=SCRIPT.parent) as temp:
             root = Path(temp)
             paths = {}
@@ -51,10 +52,14 @@ class GainAnalyzerTest(unittest.TestCase):
                 if rows is None:
                     continue
                 paths[name] = root / f"{name}.log"
-                paths[name].write_text("noise unrelated\n" + "".join(
-                    line("ASR_FORMAL_STATS" if kind == "formal"
-                         else "ASR_VERIFY_STEP", row) for kind, row in rows),
-                    encoding="utf-8")
+                rendered = []
+                for item in rows:
+                    kind, row, *timestamp = item
+                    rendered.append(line("ASR_FORMAL_STATS" if kind == "formal"
+                                         else "ASR_VERIFY_STEP", row,
+                                         *(timestamp or [])))
+                paths[name].write_text("noise unrelated\n" + "".join(rendered),
+                                       encoding="utf-8")
             output = root / "gain.json"
             cmd = [sys.executable, str(SCRIPT),
                    "--rollback-log", str(paths["rollback"]),
@@ -62,6 +67,8 @@ class GainAnalyzerTest(unittest.TestCase):
                    "--out", str(output)]
             if shadow_rows is not None:
                 cmd.extend(["--shadow-log", str(paths["shadow"])])
+            if allow_legacy_time_join:
+                cmd.append("--allow-legacy-time-join")
             result = subprocess.run(cmd, capture_output=True, text=True)
             data = json.loads(output.read_text(encoding="utf-8")) if output.exists() else None
             return result, data
@@ -147,6 +154,67 @@ class GainAnalyzerTest(unittest.TestCase):
             self.assertEqual(data["runs"]["shadow"]["all"]["formal_request_count"], 1)
             self.assertIn("rollback_to_shadow", data["comparison"])
             self.assertIn("shadow_to_consume", data["comparison"])
+
+    def test_reused_python_state_id_counts_distinct_connections(self):
+        rollback = [
+            ("formal", formal("stream_281470479549744_0", ws_id="ws-71ab1850",
+                              seg=1, output=9)),
+            ("formal", formal("stream_281470479549744_0", ws_id="ws-1cf924ed",
+                              seg=6, output=12)),
+        ]
+        consume = [("formal", formal("consume"))]
+        result, data = self.run_cli(rollback, consume)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = data["runs"]["rollback"]["records"]
+        self.assertEqual(len(records), 2)
+        self.assertEqual({(row["ws_id"], row["seg"]) for row in records},
+                         {("ws-71ab1850", 1), ("ws-1cf924ed", 6)})
+        self.assertEqual(data["runs"]["rollback"]["all"]
+                         ["output_token_count"]["mean"], 10.5)
+
+    def test_reused_request_id_joins_verifier_to_its_later_formal_completion(self):
+        rollback = [("formal", formal("base"))]
+        reused = "stream_281470479549744_0"
+        consume = [
+            ("verify", verify(reused, 0, source=None, effective=3, accepted=2),
+             "2026-10-26 07:05:17.600"),
+            ("formal", formal(reused, ws_id="ws-first", seg=1,
+                              source="prespec", draft=3),
+             "2026-10-26 07:05:17.670"),
+            ("verify", verify(reused, 0, source=None, effective=4, accepted=1),
+             "2026-10-26 07:05:25.200"),
+            ("formal", formal(reused, ws_id="ws-second", seg=6,
+                              source="rollback", draft=4),
+             "2026-10-26 07:05:25.326"),
+        ]
+        result, data = self.run_cli(rollback, consume,
+                                    allow_legacy_time_join=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = data["runs"]["consume"]["records"]
+        self.assertEqual(len(records), 2)
+        by_ws = {row["ws_id"]: row for row in records}
+        self.assertEqual(by_ws["ws-first"]["accepted_draft_tokens"], 2)
+        self.assertEqual(by_ws["ws-second"]["accepted_draft_tokens"], 1)
+        self.assertEqual(data["runs"]["consume"]["all"]
+                         ["observed_acceptance_rate"], 3 / 7)
+
+    def test_reused_id_with_verifier_requires_explicit_legacy_join(self):
+        reused = "stream_281470479549744_0"
+        rollback = [("formal", formal("base"))]
+        consume = [
+            ("verify", verify(reused, 0, source=None, effective=3, accepted=2),
+             "2026-10-26 07:05:17.600"),
+            ("formal", formal(reused, ws_id="ws-first", seg=1,
+                              source="prespec", draft=3),
+             "2026-10-26 07:05:17.670"),
+            ("formal", formal(reused, ws_id="ws-second", seg=6,
+                              source="prespec", draft=3),
+             "2026-10-26 07:05:25.326"),
+        ]
+        result, data = self.run_cli(rollback, consume)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("allow-legacy-time-join", result.stderr)
+        self.assertIsNone(data)
 
     def test_verifier_source_can_be_inherited_after_formal_event(self):
         rollback = [("formal", formal("base"))]

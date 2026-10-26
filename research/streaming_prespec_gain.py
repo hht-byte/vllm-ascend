@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from bisect import bisect_left
+from datetime import datetime
 from pathlib import Path
 
 
@@ -111,11 +113,19 @@ def _validated_verify(row: dict, where: str) -> dict:
     return result
 
 
-def parse_run(paths: list[str]) -> list[dict]:
-    """Join formal and verifier events by request ID, validating both streams."""
-    formals: dict[str, dict] = {}
-    verifiers: dict[str, list[dict]] = {}
-    seen_rounds: set[tuple[str, int]] = set()
+def _log_time(line: str) -> datetime | None:
+    """Read the millisecond timestamp used by the ASR server log, if present."""
+    try:
+        return datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S.%f")
+    except ValueError:
+        return None
+
+
+def parse_run(paths: list[str], *, allow_legacy_time_join: bool = False) -> list[dict]:
+    """Join events, retaining distinct requests after a legacy ID collision."""
+    formals: list[tuple[dict, datetime | None, Path]] = []
+    formal_by_id: dict[str, list[int]] = {}
+    verifiers: dict[str, list[tuple[dict, datetime | None, Path]]] = {}
     for path_text in paths:
         path = Path(path_text)
         with path.open(encoding="utf-8") as stream:
@@ -134,26 +144,66 @@ def parse_run(paths: list[str]) -> list[dict]:
                     if kind == "formal":
                         row = _validated_formal(event, where)
                         request_id = row["request_id"]
-                        if request_id in formals:
+                        siblings = formal_by_id.setdefault(request_id, [])
+                        if any((formals[index][0]["ws_id"], formals[index][0]["seg"],
+                                formals[index][0]["boundary"]) ==
+                               (row["ws_id"], row["seg"], row["boundary"])
+                               for index in siblings):
                             raise ValueError(f"{where}: duplicate formal request_id {request_id}")
-                        formals[request_id] = row
+                        siblings.append(len(formals))
+                        formals.append((row, _log_time(line), path))
                     else:
                         row = _validated_verify(event, where)
-                        request_id = row["request_id"]
-                        key = (request_id, row["round_index"])
-                        if key in seen_rounds:
-                            raise ValueError(f"{where}: duplicate verifier round {key}")
-                        seen_rounds.add(key)
-                        verifiers.setdefault(request_id, []).append(row)
+                        verifiers.setdefault(row["request_id"], []).append(
+                            (row, _log_time(line), path))
                     break
-    for request_id, steps in verifiers.items():
-        formal = formals.get(request_id)
-        if formal is None:
+    steps_by_formal: list[list[dict]] = [[] for _ in formals]
+    for request_id, events in verifiers.items():
+        indices = formal_by_id.get(request_id, [])
+        if not indices:
             raise ValueError(f"orphan verifier request_id {request_id}")
+        if len(indices) == 1:
+            steps_by_formal[indices[0]] = [row for row, _, _ in events]
+            continue
+        if not allow_legacy_time_join:
+            raise ValueError(f"ambiguous reused request_id {request_id} has verifier "
+                             "events; use unique IDs in new runs, or "
+                             "--allow-legacy-time-join for a complete single-file log")
+        # The verifier event has no ws/seg. For reused IDs, only a single
+        # timestamped log file provides a defensible lifetime boundary.
+        sources = {formals[index][2] for index in indices}
+        sources.update(path for _, _, path in events)
+        if len(sources) != 1 or any(formals[index][1] is None for index in indices) or \
+                any(timestamp is None for _, timestamp, _ in events):
+            raise ValueError(f"ambiguous reused request_id {request_id}: "
+                             "verifier events need timestamps in one log file")
+        ordered = sorted(indices, key=lambda index: formals[index][1])
+        completion_times = [formals[index][1] for index in ordered]
+        if len(set(completion_times)) != len(completion_times):
+            raise ValueError(f"ambiguous reused request_id {request_id}: "
+                             "formal completions have the same timestamp")
+        for row, timestamp, _ in events:
+            if timestamp in completion_times:
+                raise ValueError(f"ambiguous reused request_id {request_id}: "
+                                 "verifier and formal have the same timestamp")
+            position = bisect_left(completion_times, timestamp)
+            if position == len(ordered):
+                raise ValueError(f"ambiguous reused request_id {request_id}: "
+                                 "verifier occurs after the last formal completion")
+            steps_by_formal[ordered[position]].append(row)
+    for index, (formal, _, _) in enumerate(formals):
+        request_id = formal["request_id"]
+        steps = steps_by_formal[index]
+        seen_rounds: set[int] = set()
+        for step in steps:
+            round_index = step["round_index"]
+            if round_index in seen_rounds:
+                raise ValueError(f"duplicate verifier round ({request_id!r}, {round_index})")
+            seen_rounds.add(round_index)
         if any(step["draft_source"] is not None and
                step["draft_source"] != formal["draft_source"] for step in steps):
             raise ValueError(f"verifier draft_source differs from formal for {request_id}")
-        if formal["draft_source"] == "none":
+        if steps and formal["draft_source"] == "none":
             raise ValueError(f"verifier emitted for request without draft {request_id}")
         if sum(step["verifier_complete"] for step in steps) > 1:
             raise ValueError(f"duplicate verifier_complete for {request_id}")
@@ -170,8 +220,9 @@ def parse_run(paths: list[str]) -> list[dict]:
     if not formals:
         raise ValueError("no ASR_FORMAL_STATS events found in the supplied logs")
     records = []
-    for request_id, formal in formals.items():
-        steps = verifiers.get(request_id, [])
+    for index, (formal, _, _) in enumerate(formals):
+        request_id = formal["request_id"]
+        steps = steps_by_formal[index]
         missing = formal["submitted_draft_tokens"] > 0 and not steps
         logged_effective = sum(step["effective_draft_tokens"] for step in steps)
         logged_accepted = sum(step["accepted_draft_tokens"] for step in steps)
@@ -321,18 +372,29 @@ def main() -> None:
     parser.add_argument("--consume-log", nargs="+", required=True, metavar="PATH")
     parser.add_argument("--shadow-log", nargs="+", metavar="PATH")
     parser.add_argument("--out", required=True, metavar="PATH")
+    parser.add_argument(
+        "--allow-legacy-time-join", action="store_true",
+        help="infer colliding legacy request IDs from timestamps in one complete log file",
+    )
     args = parser.parse_args()
     try:
-        runs = {"rollback": summarize_run(parse_run(args.rollback_log)),
-                "consume": summarize_run(parse_run(args.consume_log))}
+        runs = {"rollback": summarize_run(parse_run(
+                    args.rollback_log,
+                    allow_legacy_time_join=args.allow_legacy_time_join)),
+                "consume": summarize_run(parse_run(
+                    args.consume_log,
+                    allow_legacy_time_join=args.allow_legacy_time_join))}
         if args.shadow_log:
-            runs["shadow"] = summarize_run(parse_run(args.shadow_log))
+            runs["shadow"] = summarize_run(parse_run(
+                args.shadow_log,
+                allow_legacy_time_join=args.allow_legacy_time_join))
         comparisons = {"rollback_to_consume": compare(runs["rollback"], runs["consume"])}
         if "shadow" in runs:
             comparisons["rollback_to_shadow"] = compare(runs["rollback"], runs["shadow"])
             comparisons["shadow_to_consume"] = compare(runs["shadow"], runs["consume"])
         output = {
-            "methodology": "Request-level descriptive statistics. Runs are not paired by audio/case; differences are not causal. Output tokens are raw formal DELTA token IDs (including special tokens), decode_rounds are decode iterations, and accepted_draft_tokens are verifier-confirmed external draft tokens only. Missing and incomplete verifier logs are excluded from acceptance statistics; a completed 0/0 skip is distinct from both and is not an actual acceptance-rate observation.",
+            "methodology": "Request-level descriptive statistics. Runs are not paired by audio/case; differences are not causal. Output tokens are raw formal DELTA token IDs (including special tokens), decode_rounds are decode iterations, and accepted_draft_tokens are verifier-confirmed external draft tokens only. Missing and incomplete verifier logs are excluded from acceptance statistics; a completed 0/0 skip is distinct from both and is not an actual acceptance-rate observation. Time-based joins of reused legacy request IDs are opt-in heuristics for complete single-file logs; ambiguous collisions fail.",
+            "legacy_time_join_enabled": args.allow_legacy_time_join,
             "runs": runs,
             "comparison": comparisons,
         }
