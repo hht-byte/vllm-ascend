@@ -542,28 +542,50 @@ if formal_output_finished and draft_stats_valid:
 
 `PRESPEC_REQUEST event=done tokens=...` 是后台候选的输出长度，不可填到 `output_token_count`。若服务不能从 `_yield_delta_text()` 取得真实轮次，就先修通 `formal_metrics`，不要用输出 token 数或耗时反推。`on_output` 对 DELTA 的 `token_ids` 只累计一次；finish 若不是 DELTA，先改成与 chunk 一致的输出语义或按其实际输出类型去重。
 
-在 **vLLM-Ascend 引擎真正完成 verifier 判定之后**，对每个正式请求的每个验证轮次记录一行；不要用 `propose()` 的提议长度或服务端 `PRESPEC_MATCH` 推测接受数。下面是日志格式，等号右侧需要接入该引擎 verifier 的实际变量：
+在 **vLLM-Ascend 完成 rejection sampling、调度器收到本轮输出之后**，对每个正式请求的每个验证轮次记录一行。不要用 `propose()` 的提议长度、服务端 `PRESPEC_MATCH` 或 Ascend sampler 的整批非占位输出数推测接受数。参考本地源码快照，实际判定在 `vllm_ascend/sample/rejection_sampler.py` 的 `rejection_sample(...)`；推荐打点放在 **vLLM 包**的 `vllm/v1/core/sched/scheduler.py::Scheduler.update_from_output()`，现有 `if scheduled_spec_token_ids and generated_token_ids:` 分支内，紧跟 `num_accepted = len(generated_token_ids) - 1`，且在 `_update_request_with_output()` 处理 stop token 之前。若 910B 配置了 Ascend `RecomputeScheduler`，则改其覆盖的 `vllm_ascend/core/recompute_scheduler.py::RecomputeScheduler.update_from_output()` 同一分支；只修改实际被加载的调度器。源码快照的对应行分别约为 1369 和 923，部署版须按函数名定位。
+
+这里已有的变量可以直接映射，不需要构造原示例中的 `formal_request_id` 等占位变量：
+
+| 日志字段 | 当前代码中的来源 |
+|---|---|
+| `request_id` | 循环变量 `req_id`，即服务提交的 `stream_...` / `finish_...` |
+| `effective_draft_tokens` | `len(scheduled_spec_token_ids) - (scheduler_output.num_invalid_spec_tokens or {}).get(req_id, 0)`；调度器可能截短草稿，结构化输出还可能补无效占位 |
+| `accepted_draft_tokens` | 已有 `num_accepted = len(generated_token_ids) - 1`；生成列表在这里尚未被 stop 逻辑截断，最后一个是修正或 bonus token |
+| `round_index` | 原代码没有；当前一次性 external proposer 的唯一验证轮为 `0` |
+| `verifier_complete`、`actual_effective_draft_tokens` | 原代码没有；确认一个请求至多一次 external draft 验证后，本轮可分别设 `True`、本轮 `effective_draft_tokens` |
+
+最小插桩如下。先在调度器模块顶部 `import json`；以下代码**直接插在现有 `num_accepted = len(generated_token_ids) - 1` 之后**，其后的原有 `num_rejected`、KV 回退与统计代码照常执行。`logger` 是调度器已有的模块 logger。以 `stream_` / `finish_` 过滤仅适用于当前 ASR 请求命名及“只使用一次性 external proposer”的配置；如果还有其他 proposer，会需要额外的请求来源标记，不能把它们的验证算作 external draft。
 
 ```python
-import json
-
-logger.info("ASR_VERIFY_STEP %s", json.dumps({
-    "request_id": formal_request_id,  # 与 ASR_FORMAL_STATS 完全一致
-    "round_index": request_local_verify_round_index,
-    "effective_draft_tokens": len(draft_tokens_given_to_verifier),
-    "accepted_draft_tokens": accepted_contiguous_draft_prefix_len,
-    "verifier_complete": is_last_external_draft_step,
-    # 仅最后一轮填写：proposer 实际交给 verifier 的总草稿数。
-    "actual_effective_draft_tokens": (
-        request_total_effective_draft_tokens
-        if is_last_external_draft_step else None
-    ),
-}, separators=(",", ":")))
+# 此代码与上一行现有的 num_accepted 处于同一缩进层级。
+if req_id.startswith(("stream_", "finish_")):
+    invalid = (scheduler_output.num_invalid_spec_tokens or {}).get(req_id, 0)
+    effective = num_draft_tokens - invalid
+    if 0 <= num_accepted <= effective:
+        event = {
+            "request_id": req_id,
+            "round_index": 0,  # 一次性 external proposer：该请求唯一验证轮
+            "effective_draft_tokens": effective,
+            "accepted_draft_tokens": num_accepted,
+            "verifier_complete": True,
+            "actual_effective_draft_tokens": effective,
+        }
+        if effective == 0:
+            event["reason"] = "grammar_rejected_all"
+        logger.info("ASR_VERIFY_STEP %s", json.dumps(event, separators=(",", ":")))
+    else:
+        # 保留原推理流程；不要把异常数据截断成貌似有效的接受数。
+        logger.error(
+            "ASR_VERIFY_INVARIANT request_id=%s effective=%s accepted=%s",
+            req_id, effective, num_accepted,
+        )
 ```
 
-`accepted_draft_tokens` 只计 verifier 实际接受的**连续 external draft 前缀**，不含 proposer 之前已采样的首个 target token、拒绝后修正 token、bonus token。`effective_draft_tokens` 是该轮真正参与验证的长度；末轮的 `actual_effective_draft_tokens` 是这个正式请求在 proposer 运行时裁剪后**所有轮次的总长度**，可能小于服务提交的 `submitted_draft_tokens`。它必须来自引擎实际提议结果，不能直接复制服务端提交长度。现有 external proposer 使用 `pop(req_id, [])` 一次性取走草稿，正常情况下只需一条完成事件，此时 `verifier_complete=true` 且 `actual_effective_draft_tokens=effective_draft_tokens`。只有观察到完成事件且各轮有效长度之和等于该总长度，分析脚本才计算接受率；部分丢失的轮次标为不完整。引擎日志可省略 `draft_source`：分析脚本按相同正式 `request_id` 从服务日志关联来源；若引擎也记录来源，两者必须一致。
+`scheduled_spec_token_ids` 来自当轮 `scheduler_output.scheduled_spec_decode_tokens.get(req_id)`，比服务提交的 `submitted_draft_tokens` 更接近实际 verifier 输入；`num_invalid_spec_tokens` 只在结构化输出等路径生成无效占位时非零。这里的 `num_accepted` 是 vLLM 调度器已有的**连续草稿接受数**，不包含拒绝后的修正或全接受后的 bonus token。调度器拿到的 `generated_token_ids` 已是 CPU 列表，所以此处日志不会为了测量而额外同步 NPU。`draft_source` 和 `boundary` 不在引擎里猜：分析脚本按同一个 `request_id` 连接服务端 `ASR_FORMAL_STATS`。
 
-运行时若因 `spec_decode_unsupported_reqs`、上下文空间不足等原因把草稿阻断在 verifier 之前，需在**实际阻断路径**补一条同格式事件，`effective_draft_tokens=0`、`accepted_draft_tokens=0`、`verifier_complete=true`、`actual_effective_draft_tokens=0`，并加 `reason="spec_unsupported"` 或具体原因。它表示明确未验证，不计入接受率。服务提交了草稿却既无验证事件、也无明确阻断事件时，分析脚本标为 `missing_verifier`；不能据此推断实际接受数为 0。
+上述 `round_index=0`、`verifier_complete=True` 依据目前 external proposer 的 `external_drafts.pop(req_id, [])` 一次性消费语义。若 910B 的 fork 能对同一正式请求再次提供 external draft，需要按 `req_id` 维护轮次和有效草稿累计数，只在最后一轮写 `verifier_complete=True` 及累计的 `actual_effective_draft_tokens`；不能把每轮都标为完成。分析脚本要求各轮有效数之和等于末轮给出的总数，否则判为不完整。
+
+**未进入 verifier 的草稿要在阻断处另记 0/0。**在 external proposer 中，只有确认该正式 `req_id` 存在非空草稿且此轮确定不会验证时才记录 `effective_draft_tokens=0`、`accepted_draft_tokens=0`、`round_index=0`、`verifier_complete=True`、`actual_effective_draft_tokens=0` 和具体 `reason`。例如 `pop(req_id, [])` 后 `max_draft_len <= 0` 是明确阻断；`sampled_ids` 暂时为空并不代表阻断，而 `spec_decode_unsupported_reqs` 或上下文不足只有在确定请求终止或草稿被丢弃时才可记完成。服务提交了草稿却既无验证事件、也无明确阻断事件时，分析脚本标为 `missing_verifier`，不能据此推断接受数为 0。
 
 部署两处打点后，将本仓库分析脚本复制到 910B 服务项目根目录，再用每轮完整日志（含服务和引擎日志）运行；若两者本来写在同一个文件，每组只传该文件一次：
 
