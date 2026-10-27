@@ -303,7 +303,7 @@ rg 'PRESPEC_(PROBE|TARGET|MATCH)' /path/to/server.log | rg 'ws_id=ws-实际ID se
 
 shadow 模式应看到 `PRESPEC_PROBE ... boundary=formal status=ready_shadow_only`（取消前已有可用快照则为 `partial_ready_shadow_only`）、`PRESPEC_MATCH_TOKENS` 和 `PRESPEC_MATCH ... boundary=formal`；consume 模式相应为 `ready_consumed` / `partial_ready_consumed`，并在 `PRESPEC_TARGET ... boundary=formal` 看到候选 request ID。`PRESPEC_MATCH` 同时给出 `raw_matched_prefix_tokens` 和 `draft_matched_prefix_tokens`。若 finish 被短尾规则跳过、候选没有可用输出或窗口变更，不会有该轮匹配统计；若正式输出未完成，也不能把部分输出作为 0 匹配。
 
-协调器收到完整的 `target_continuation_tokens` 且已选中候选时，会另外打印 `PRESPEC_MATCH_TOKENS`。`candidate_token_ids` 是正式边界选中的候选原始 token IDs；`candidate_partial=True` 表示 shadow 被取消前最后一个已输出快照，`False` 表示完整结束的候选。`target_token_ids` 是从正式原始输出开头截取的**相同长度**序列，`target_len` 是正式输出的实际总长度。按位置对照两列即可看到 `raw_matched_prefix_tokens` 个相同 token 后的首个差异。例如 `candidate_token_ids=(19, 20, 21, 22)`、`target_token_ids=(19, 20, 99, 77)`、`target_len=5`、`raw_matched_prefix_tokens=2`，表示前两项相同，第三项 `21` 与 `99` 不同，正式输出还有一个未显示的 token。日志的 `mode=shadow/consume` 标明正式请求是否使用候选；consume 模式下两组序列的匹配不代表无候选的 baseline 结果。若未采集正式 token、正式生成中断，或没有可用候选，就不会出现该日志。它同样不是 verifier 接受数。
+协调器收到完整的 `target_continuation_tokens` 且已选中候选时，会另外打印 `PRESPEC_MATCH_TOKENS`。`candidate_token_ids` 是正式边界选中的候选原始 token IDs；`candidate_partial=True` 表示 shadow 被取消前最后一个已输出快照，`False` 表示完整结束的候选。更新后的 `target_token_ids` 是**完整**正式原始输出 token IDs，`target_len` 应等于其长度；旧版日志只打印到候选长度，不能从旧日志恢复尾部。例如 `candidate_token_ids=(19, 20, 21, 22)`、`target_token_ids=(19, 20, 99, 77, 55)`、`target_len=5`、`raw_matched_prefix_tokens=2`，表示前两项相同，第三项 `21` 与 `99` 不同，后面的正式 token 也已保留。日志的 `mode=shadow/consume` 标明正式请求是否使用候选；consume 模式下两组序列的匹配不代表无候选的 baseline 结果。若未采集正式 token、正式生成中断，或没有可用候选，就不会出现该日志。它同样不是 verifier 接受数。
 
 日志关联以 `ws_id + seg + chunk` 为正式键，以 `prespec-...` 为 shadow 引擎请求键；不要把不同 request 的 prefill/decode 打点混在一起。`PRESPEC_PROBE status=ready_consumed` 发生在正式验证**之前**，不能代替 verifier 日志。
 
@@ -632,9 +632,49 @@ python streaming_prespec_rejoin.py --log consume-server.log \
 
 脚本先按正式请求已采样首 token、验证 `candidate[1:]` 的现有顺序定位首次失配；它只用截至当前已经确认的正式 token 选择下一份草稿。`aligned` 按原 token 位置尝试候选余段；`ngram_1/2/3` 用正式输出的末尾 1/2/3 个 token 在候选中找锚点，提出锚点后的最多 `kmax` 个 token。两者都逐轮与日志中的正式 token 比较，输出 `attempts`、`zero_accept_attempts`、`accepted_tokens`、`accepted_nonterminal_tokens`、`estimated_saved_steps`。提案选择不读取未来正式 token；未来 token 只用于离线评分。这里每次验证理想化为一个模型步，**不是实测 verifier 接受数或时延**。
 
-当前协调器的 `PRESPEC_MATCH_TOKENS.target_token_ids` 只打印到候选长度。若 `target_len` 更长，脚本标为 `censored_target`。只要所有候选位置都已打印且首次失配可见，`aligned` 仍可计算：候选耗尽后，剩余正式 token 只能逐步生成；`ngram_1/2/3` 保持 `null`，因为后续正式 token 可能与候选更早的位置形成新锚点。`replayed_count` 只统计四种策略都能回放的样例，各策略的 `evaluated_request_count` 是各自的分母；`excluded_replay_reasons` 表示未进入完整四策略回放的原因，因此 `censored_target` 中仍可能有 `aligned` 结果。报告还列出 `no_post_first_draft_mismatch`、`candidate_draft_exceeds_kmax` 等原因，并按 shadow/consume 及 `candidate_partial=true/false/unknown` 分组；旧日志没有此字段时归入 `unknown`。它的总体分母仅为出现这条匹配日志的候选，不是全部正式请求或 commit。你给出的 `ws-191306f2/seg-3/window-2` 例子中，首次失配后的同位置相同 token 只有末尾 EOS；按位置续接理想化后节省 0 步，三个 ngram 长度都找不到可用锚点。
+旧版协调器的 `PRESPEC_MATCH_TOKENS.target_token_ids` 只打印到候选长度。若 `target_len` 更长，脚本标为 `censored_target`。只要所有候选位置都已打印且首次失配可见，`aligned` 仍可计算：候选耗尽后，剩余正式 token 只能逐步生成；`ngram_1/2/3` 保持 `null`，因为后续正式 token 可能与候选更早的位置形成新锚点。更新后的协调器打印完整正式 token，回放脚本允许 `target_token_ids` 比候选更长；新日志应有 `target_len == len(target_token_ids)`。`replayed_count` 只统计四种策略都能回放的样例，各策略的 `evaluated_request_count` 是各自的分母；`excluded_replay_reasons` 表示未进入完整四策略回放的原因，因此旧日志的 `censored_target` 中仍可能有 `aligned` 结果。报告还列出 `no_post_first_draft_mismatch`、`candidate_draft_exceeds_kmax` 等原因，并按 shadow/consume 及 `candidate_partial=true/false/unknown` 分组；旧日志没有此字段时归入 `unknown`。它的总体分母仅为出现这条匹配日志的候选，不是全部正式请求或 commit。你给出的 `ws-191306f2/seg-3/window-2` 例子中，首次失配后按位置续接的理想节省为 0 步；旧截断日志无法判断后续正式 token 是否会形成 ngram 锚点。
 
-若初筛发现较多非终止 token 可重接，再在同一正式请求上记录**完整**正式输出 token IDs、实际就绪的预投机及回滚候选 token IDs，以及候选就绪时刻和请求／窗口键，重跑全长回放。现有 `ASR_FORMAL_STATS` 只有 token 数量，`Segment done` 的文本重新 tokenize 会改变 ID 边界，不能代替这份记录。在线实现还需让 proposer 保留候选池并在每次正式采样后重新选草稿；当前 `external_drafts.pop(req_id, [])` 只消费一次。随后用相同音频和并发负载比较实际 verifier 轮次、全部非空 commit 的 P95/P99、队列与 NPU 成本。
+在已接入预投机的 910B 环境补采时，服务端协调器只需把 `tuple(target_continuation_tokens[:len(candidate.token_ids)])` 改成 `tuple(target_continuation_tokens)`，并使用更新后的回放脚本。下面的绝对路径换成 910B 上实际检出路径；服务启动命令和 `test_v2.py` 的参数以现有环境为准，本仓库没有这两个入口：
+
+```bash
+# 在 910B 上更新包含回放脚本的仓库
+cd /path/to/vllm-ascend
+git switch codex/streaming-prespec-monitor
+git pull --ff-only origin codex/streaming-prespec-monitor
+
+# 在 910B 服务仓库根目录修改已适配的协调器，并检查语法
+cd /path/to/Qwen3-ASR-910B
+python - <<'PY'
+from pathlib import Path
+p = Path('qwen_asr/inference/streaming_prespec.py')
+s = p.read_text(encoding='utf-8')
+old = 'tuple(target_continuation_tokens[:len(candidate.token_ids)])'
+new = 'tuple(target_continuation_tokens)'
+if old in s:
+    assert s.count(old) == 1
+    p.write_text(s.replace(old, new), encoding='utf-8')
+else:
+    assert new in s, '未找到预期日志表达式，请检查服务端协调器版本'
+PY
+python -m py_compile qwen_asr/inference/streaming_prespec.py qwen_asr/inference/qwen3_asr_async.py qwen_asr/cli/realtime_connection.py
+
+# 按原有方式重启服务，并传入已有的 parser 参数
+<现有服务启动命令> --prespec-mode consume --prespec-admission force
+
+# 使用原有固定并发 c20 的 sustained_test 命令重跑；保留这一轮独立的服务日志
+python /path/to/test_v2.py --help
+<现有 c20 测试命令>
+rg -m 1 'PRESPEC_MATCH_TOKENS' /path/to/consume-c20-new.log
+
+# 在包含新回放脚本的 vllm-ascend 检出目录执行
+cd /path/to/vllm-ascend
+python research/streaming_prespec_rejoin.py --log /path/to/consume-c20-new.log \
+  --kmax 15 --eos-token-id 151645 \
+  --out rejoin-summary-full.json --cases-out rejoin-cases-full.jsonl
+python -c 'import json; d=json.load(open("rejoin-summary-full.json")); print("match_events", d["match_events"], "censored_target_count", d["censored_target_count"], "partial_unknown", d["by_candidate_partial"]["unknown"]["match_events"])'
+```
+
+只把**这一轮**日志传给回放脚本；正常新日志的 `censored_target_count` 与 `partial_unknown` 应为 0。若前者仍大于 0，先核对服务实际加载的 `streaming_prespec.py` 是否已更新；若后者仍大于 0，检查 `PRESPEC_MATCH_TOKENS` 是否带 `candidate_partial=`。旧日志里被截掉的 token 无法从 `ASR_FORMAL_STATS` 的数量或 `Segment done` 文本恢复。在线实现还需让 proposer 保留候选池并在每次正式采样后重新选草稿；当前 `external_drafts.pop(req_id, [])` 只消费一次。随后用相同音频和并发负载比较实际 verifier 轮次、全部非空 commit 的 P95/P99、队列与 NPU 成本。
 
 ## 5. 门控空档验证：在 force 对比后接入实时负载
 

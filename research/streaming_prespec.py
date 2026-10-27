@@ -650,7 +650,7 @@ class PreSpecCoordinator:
             key[0], key[1], key[2],
             "shadow" if self.shadow_only else "consume",
             candidate.token_ids,
-            tuple(target_continuation_tokens[:len(candidate.token_ids)]),
+            tuple(target_continuation_tokens),
             len(target_continuation_tokens), raw_match, candidate.is_partial,
         )
         return Evaluation(

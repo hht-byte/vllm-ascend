@@ -241,7 +241,7 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evaluation.draft_matched_prefix_tokens, 2)
         await coordinator.close_session("ws-1")
 
-    async def test_match_log_shows_both_token_sequences_through_first_difference(self):
+    async def test_match_log_shows_full_target_sequence(self):
         async def producer(request, budget):
             return (19, 20, 21, 22)
 
@@ -260,7 +260,7 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 target_continuation_tokens=(19, 20, 99, 77, 55))
         self.assertEqual(len(captured.output), 1)
         self.assertIn("candidate_token_ids=(19, 20, 21, 22)", captured.output[0])
-        self.assertIn("target_token_ids=(19, 20, 99, 77)", captured.output[0])
+        self.assertIn("target_token_ids=(19, 20, 99, 77, 55)", captured.output[0])
         self.assertIn("target_len=5", captured.output[0])
         self.assertIn("raw_matched_prefix_tokens=2", captured.output[0])
         await coordinator.close_session("ws-1")

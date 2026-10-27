@@ -70,7 +70,7 @@ def parse_match_line(line: str) -> dict | None:
     candidate = _token_tuple(row["candidate"], "candidate_token_ids")
     target = _token_tuple(row["target"], "target_token_ids")
     target_len = int(row["target_len"])
-    if target_len < len(target) or len(target) > len(candidate):
+    if target_len < len(target):
         raise ValueError("target_token_ids length disagrees with log lengths")
     raw_match = int(row["raw_match"])
     if raw_match != _matched_prefix(candidate, target):
@@ -193,7 +193,7 @@ def analyze_record(record: dict, *, kmax: int,
     # all candidate positions are visible; later n-gram anchors are unknown.
     if skip_reason not in (None, "censored_target"):
         return result
-    if censored and len(target) != len(candidate):
+    if censored and len(target) < len(candidate):
         return result
     start = first_mismatch_index + 1  # verifier's correction is confirmed
     result["policies"] = {

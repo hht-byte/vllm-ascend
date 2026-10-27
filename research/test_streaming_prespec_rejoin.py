@@ -66,6 +66,15 @@ class RejoinTest(unittest.TestCase):
         self.assertEqual(result["policies"]["ngram_2"]["accepted_tokens"], 1)
         self.assertEqual(result["policies"]["ngram_3"]["attempts"], 0)
 
+    def test_full_target_can_rejoin_after_candidate_end(self):
+        candidate = (1, 2, 3, 4, 5, 6)
+        target = (1, 2, 3, 4, 9, 8, 1, 2, 3, 4, 5, 6)
+        record = parse_match_line(log_line(candidate, target))
+        result = analyze_record(record, kmax=15, eos_token_id=151645)
+        self.assertFalse(result["censored"])
+        self.assertEqual(result["policies"]["aligned"]["estimated_saved_steps"], 0)
+        self.assertEqual(result["policies"]["ngram_1"]["estimated_saved_steps"], 4)
+
     def test_first_token_difference_is_already_handled_by_initial_draft(self):
         result = analyze_record(
             parse_match_line(log_line((101, 2, 3, 4), (102, 2, 3, 4))),
@@ -84,6 +93,14 @@ class RejoinTest(unittest.TestCase):
         self.assertIsNone(result["policies"]["ngram_1"])
         self.assertIsNone(result["policies"]["ngram_2"])
         self.assertIsNone(result["policies"]["ngram_3"])
+
+    def test_longer_visible_prefix_still_supports_censored_aligned_replay(self):
+        result = analyze_record(
+            parse_match_line(log_line((1, 2, 3), (1, 9, 3, 4), target_len=6)),
+            kmax=15, eos_token_id=151645)
+        self.assertTrue(result["censored"])
+        self.assertEqual(result["policies"]["aligned"]["estimated_saved_steps"], 1)
+        self.assertIsNone(result["policies"]["ngram_1"])
 
     def test_user_censored_case_has_zero_incremental_aligned_gain(self):
         result = analyze_record(
