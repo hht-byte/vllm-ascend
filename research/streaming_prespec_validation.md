@@ -183,7 +183,7 @@ async def _logged_prespec_producer(self, request, budget):
     return token_ids
 ```
 
-这里的 `done` 只表示 shadow 引擎生成结束，尚不表示正式请求采纳。若 `cancel` 后底层 NPU 工作仍持续，另看 vLLM 请求结束/abort 日志和资源占用。
+这里的 `done` 只表示 shadow 引擎生成结束，尚不表示正式请求采纳。**本节日志包装器本身不会收集部分 token**；还必须按[主接入文档 `_run_prespec()` 代码](streaming_prespec.md)在每个 CUMULATIVE `RequestOutput` 到达时调用 `self.prespec.publish_partial(request, candidate_token_ids)`。不要在 `except CancelledError` 才去读取局部变量：协调器在 commit 同步路径里要先保存已输出快照、再取消 shadow，正式请求不能等待取消处理。`cancel` 时若只有首 token 或尚无输出，仍回退到 rollback。若 `cancel` 后底层 NPU 工作仍持续，另看 vLLM 请求结束/abort 日志和资源占用。
 
 ### 1.3 `realtime_connection.py`：记录中点准入决定
 
@@ -201,7 +201,7 @@ if decision is not None and decision.launched:
     segment.prespec_started_window = window_id
 ```
 
-`try_start_prespec_for_state()` 在未达中点、已 commit 或音频队列非空时返回 `None`，因此这些路径**不会**出现 `PRESPEC_LAUNCH`。`chunk-0` 没有旧回滚草稿，空草稿有效；在 consume 模式下，正式请求可验证它在 1 s 音频下生成的候选。真正进入 `try_start_prespec()` 后，旧草稿超出引擎 `kmax` 或输出预算放不下 `1 + 旧草稿长度 + 1` 时，分别返回 `rollback_draft_exceeds_kmax` / `candidate_budget_insufficient`，不会给引擎发缩短后的草稿。这两项准入检查在 shadow 和 consume 模式都执行；两者只在正式请求是否使用已完成候选上不同。helper 对每个 `(ws_id, seg_id, window_id, reason)` 只输出一次 `PRESPEC_SKIP` INFO，避免同一窗口的后续 80 ms chunk 重复刷屏。若预期到达中点却没有 launch，请在包装函数这些 `return None` 前临时加一条 `DEBUG` 日志，包含 `ws_id/seg/window_id/len(state.buffer)/reason`；不要据“无 launch 日志”直接判断负载门控拒绝。
+`try_start_prespec_for_state()` 在未达中点、已 commit 或音频队列非空时返回 `None`，因此这些路径**不会**出现 `PRESPEC_LAUNCH`。`chunk-0` 没有旧回滚草稿，空草稿有效；在 consume 模式下，正式请求可验证它在 1 s 音频下生成的候选。真正进入 `try_start_prespec()` 后，旧草稿超出引擎 `kmax` 或输出预算放不下 `1 + 旧草稿长度 + 1` 时，分别返回 `rollback_draft_exceeds_kmax` / `candidate_budget_insufficient`，不会给引擎发缩短后的草稿。这两项准入检查在 shadow 和 consume 模式都执行；两者只在正式请求是否使用已完成候选或已输出部分快照上不同。helper 对每个 `(ws_id, seg_id, window_id, reason)` 只输出一次 `PRESPEC_SKIP` INFO，避免同一窗口的后续 80 ms chunk 重复刷屏。若预期到达中点却没有 launch，请在包装函数这些 `return None` 前临时加一条 `DEBUG` 日志，包含 `ws_id/seg/window_id/len(state.buffer)/reason`；不要据“无 launch 日志”直接判断负载门控拒绝。
 
 ### 1.4 `qwen3_asr_async.py`：关联正式请求与候选
 
@@ -211,10 +211,11 @@ if decision is not None and decision.launched:
 logger.info(
     "PRESPEC_TARGET ws_id=%s seg=%s chunk=%s event=submit "
     "formal_request_id=%s candidate_request_id=%s "
-    "candidate_raw_tokens=%s submitted_draft_tokens=%s",
+    "candidate_raw_tokens=%s candidate_partial=%s submitted_draft_tokens=%s",
     ws_id, seg_id, this_chunk_id, formal_request_id,
     candidate.request_id if candidate is not None else None,
     len(candidate.token_ids) if candidate is not None else None,
+    candidate.is_partial if candidate is not None else None,
     len(draft_token_ids),
 )
 ```
@@ -300,9 +301,9 @@ finish 复用 `_split_stream_rollback()` 处理 `\ufffd` 时，`on_output` 本�
 rg 'PRESPEC_(PROBE|TARGET|MATCH)' /path/to/server.log | rg 'ws_id=ws-实际ID seg=实际段号'
 ```
 
-shadow 模式应看到 `PRESPEC_PROBE ... boundary=formal status=ready_shadow_only`、`PRESPEC_MATCH_TOKENS` 和 `PRESPEC_MATCH ... boundary=formal`；consume 模式把状态改为 `ready_consumed`，并在 `PRESPEC_TARGET ... boundary=formal` 看到候选 request ID。`PRESPEC_MATCH` 同时给出 `raw_matched_prefix_tokens` 和 `draft_matched_prefix_tokens`。若 finish 被短尾规则跳过、候选未完成或窗口变更，不会有该轮匹配统计；若正式输出未完成，也不能把部分输出作为 0 匹配。
+shadow 模式应看到 `PRESPEC_PROBE ... boundary=formal status=ready_shadow_only`（取消前已有可用快照则为 `partial_ready_shadow_only`）、`PRESPEC_MATCH_TOKENS` 和 `PRESPEC_MATCH ... boundary=formal`；consume 模式相应为 `ready_consumed` / `partial_ready_consumed`，并在 `PRESPEC_TARGET ... boundary=formal` 看到候选 request ID。`PRESPEC_MATCH` 同时给出 `raw_matched_prefix_tokens` 和 `draft_matched_prefix_tokens`。若 finish 被短尾规则跳过、候选没有可用输出或窗口变更，不会有该轮匹配统计；若正式输出未完成，也不能把部分输出作为 0 匹配。
 
-协调器收到完整的 `target_continuation_tokens` 且已选中候选时，会另外打印 `PRESPEC_MATCH_TOKENS`。`candidate_token_ids` 是候选完整原始输出；`target_token_ids` 是从正式原始输出开头截取的**相同长度**序列，`target_len` 是正式输出的实际总长度。按位置对照两列即可看到 `raw_matched_prefix_tokens` 个相同 token 后的首个差异。例如 `candidate_token_ids=(19, 20, 21, 22)`、`target_token_ids=(19, 20, 99, 77)`、`target_len=5`、`raw_matched_prefix_tokens=2`，表示前两项相同，第三项 `21` 与 `99` 不同，正式输出还有一个未显示的 token。日志的 `mode=shadow/consume` 标明正式请求是否使用候选；consume 模式下两组序列的匹配不代表无候选的 baseline 结果。若未采集正式 token、正式生成中断，或没有就绪候选，就不会出现该日志。它同样不是 verifier 接受数。
+协调器收到完整的 `target_continuation_tokens` 且已选中候选时，会另外打印 `PRESPEC_MATCH_TOKENS`。`candidate_token_ids` 是正式边界选中的候选原始 token IDs；`candidate_partial=True` 表示 shadow 被取消前最后一个已输出快照，`False` 表示完整结束的候选。`target_token_ids` 是从正式原始输出开头截取的**相同长度**序列，`target_len` 是正式输出的实际总长度。按位置对照两列即可看到 `raw_matched_prefix_tokens` 个相同 token 后的首个差异。例如 `candidate_token_ids=(19, 20, 21, 22)`、`target_token_ids=(19, 20, 99, 77)`、`target_len=5`、`raw_matched_prefix_tokens=2`，表示前两项相同，第三项 `21` 与 `99` 不同，正式输出还有一个未显示的 token。日志的 `mode=shadow/consume` 标明正式请求是否使用候选；consume 模式下两组序列的匹配不代表无候选的 baseline 结果。若未采集正式 token、正式生成中断，或没有可用候选，就不会出现该日志。它同样不是 verifier 接受数。
 
 日志关联以 `ws_id + seg + chunk` 为正式键，以 `prespec-...` 为 shadow 引擎请求键；不要把不同 request 的 prefill/decode 打点混在一起。`PRESPEC_PROBE status=ready_consumed` 发生在正式验证**之前**，不能代替 verifier 日志。
 
@@ -340,7 +341,9 @@ rg -n 'PRESPEC_CONFIG|PRESPEC_LAUNCH|PRESPEC_SKIP|PRESPEC_REQUEST|PRESPEC_PROBE|
 tail -F /path/to/server.log | rg --line-buffered 'PRESPEC_|inference submit|Commit received|Segment done'
 ```
 
-若服务由 systemd 管理，改用 `journalctl -u <实际服务单元名> -f -o cat` 作为管道左侧。先用**连续超过 6 秒且 6 秒前不 commit 的单段音频**核对三个窗口：约 1、3、5 秒分别看到 `window=0/1/2` 的 `PRESPEC_LAUNCH/REQUEST`，约 2、4、6 秒分别看到对应 `window=0/1/2 boundary=chunk status=ready_shadow_only`。三个窗口的 `request_id` 应不同，正式 `chunk=0/1/2` 分别只关联同号窗口；任一窗口跳过时不应误领前一窗口候选。`ready_lead_ms > 0` 表示候选早于对应正式请求提交完成；若为 `pending`，候选被取消，不应等待它。若是 `candidate_exceeds_kmax`，shadow 的输出超过正式 proposer 可接收长度，协调器不会把它交给正式请求。随后分别重放提前 commit、≤0.4 秒短尾和断连，确认无遗留 `prespec-...` 请求、重复 begin 或未结束的 session。约 5.95 秒就 commit 的段在 5 秒启动 `window=2`，若未凑足 6 秒正式 chunk，应在实际 `finish_...` 请求提交时看到 `PRESPEC_PROBE window=2 boundary=formal status=ready_shadow_only`；consume 模式则应为 `ready_consumed`，且 `PRESPEC_TARGET boundary=formal` 的 `candidate_request_id` 对应先前的 `prespec-...`。commit 到达时只保留已完成候选，不立即打印 formal probe；若后续完整 chunk 先领取了它，finish 不得重复领取。短尾跳过 finish 时也不会出现 formal probe，外层清理会丢弃候选。
+若服务由 systemd 管理，改用 `journalctl -u <实际服务单元名> -f -o cat` 作为管道左侧。先用**连续超过 6 秒且 6 秒前不 commit 的单段音频**核对三个窗口：约 1、3、5 秒分别看到 `window=0/1/2` 的 `PRESPEC_LAUNCH/REQUEST`，约 2、4、6 秒分别看到对应 `window=0/1/2 boundary=chunk status=ready_shadow_only`，或候选仍在运行但已输出快照时的 `partial_ready_shadow_only`。三个窗口的 `request_id` 应不同，正式 `chunk=0/1/2` 分别只关联同号窗口；任一窗口跳过时不应误领前一窗口候选。`ready_lead_ms > 0` 表示候选早于对应正式请求提交完成；若为 `pending`，候选被取消，不应等待它。若是 `candidate_exceeds_kmax`，shadow 的输出超过正式 proposer 可接收长度，协调器不会把它交给正式请求。随后分别重放提前 commit、≤0.4 秒短尾和断连，确认无遗留 `prespec-...` 请求、重复 begin 或未结束的 session。约 5.95 秒就 commit 的段在 5 秒启动 `window=2`，若未凑足 6 秒正式 chunk，应在实际 `finish_...` 请求提交时看到 `PRESPEC_PROBE window=2 boundary=formal status=ready_shadow_only` 或 `partial_ready_shadow_only`；consume 模式则应为 `ready_consumed` 或 `partial_ready_consumed`，且 `PRESPEC_TARGET boundary=formal` 的 `candidate_request_id` 对应先前的 `prespec-...`。commit 到达时保留已完成候选或取消前已输出的部分快照，不立即打印 formal probe；若后续完整 chunk 先领取了它，finish 不得重复领取。短尾跳过 finish 时也不会出现 formal probe，外层清理会丢弃候选。
+
+上段的 `pending` 只表示取消时没有可提交的部分草稿。接入 `publish_partial()` 后，运行中的候选若已输出足够长的快照，finish 的 probe 会改为 `partial_ready_shadow_only` 或 `partial_ready_consumed`；部分草稿不长于原回滚草稿时为 `partial_not_longer_than_rollback`，继续回滚。consume 模式下，服务端 `PRESPEC_TARGET candidate_partial=True` 及同一正式请求的 `ASR_VERIFY_STEP effective_draft_tokens>0` 要同时出现，才可判断该部分候选进入了实际 verifier。`PRESPEC_REQUEST event=cancel` 本身只表示后台请求被取消，不能据此断定它没有已输出 token。
 
 如果链路没有 launch，打开 DEBUG 日志后先看 `return None` 的跳过原因和 `PRESPEC_LAUNCH reason`；`force` 仅绕过实时负载门控，不绕过中点、草稿、本连接的在途正式请求和显式开启的容量检查。`discarded_before_boundary` 表示本窗口启动过、但候选在边界前已被丢弃；它替代含义模糊的 `previously_used`，不表示正式请求已使用或接受候选。
 
@@ -610,11 +613,28 @@ python streaming_prespec_gain.py \
 | 顺序 | 必查指标 | 通过条件 |
 |---|---|---|
 | 1 正确性 | 原始 token、delta/done、最终文本、commit 边界 | B 与 A 等价；C 经 verifier 后与 A 等价，无候选直通 |
-| 2 可用性 | launch/拒绝原因、`ready_*` 比例、`ready_lead_ms`、实际 verifier 接受数 | 候选确实提前完成且被验证；若 gated 几乎零 launch，只能报告策略下覆盖不足 |
+| 2 可用性 | launch/拒绝原因、`ready_*` 比例、`ready_lead_ms`、实际 verifier 接受数 | 完整候选或已输出部分快照先于正式请求可用，并经 verifier 验证；若 gated 几乎零 launch，只能报告策略下覆盖不足 |
 | 3 正式时延 | 全部非空 commit 及正式 chunk 的 P50/P95/P99、首 delta、后续请求时延 | B 相比 A 的额外开销低于**测试前约定**的退化界限；C 相比 A 有稳定净收益 |
 | 4 排队与成本 | `service_queue_wait_ms`、`audio_blocks_pending_at_commit`、vLLM waiting/running、NPU 利用率、shadow 请求数/计算量 | 无关键路径排队恶化；不能只用 NPU 利用率上升宣称收益 |
 
 `queue_size` 是段级音频队列，含 commit 的 `None` 哨兵；`queue_waiting` 才是 vLLM 等待请求数。至少按轮次报告 A/B/C 的差值和波动，P99 样本太少时标注不确定，不能用候选命中子集的改善代替全部请求的结果。历史 `baseline-c20` 仅作参考；最终比较需要在同一代码和负载条件下重跑 rollback baseline。
+
+### 4.2 首次失配后的候选重接：离线初筛
+
+`raw_matched_prefix_tokens=0` 但 `draft_matched_prefix_tokens>0` 的首 token 差异已由当前 `candidate.token_ids[1:]` 方案利用。新增空间是**正式 verifier 中途拒绝后**，下一轮能否再从同一候选取到可验证的后续 token。先对现有 `PRESPEC_MATCH_TOKENS` 日志运行只读回放：
+
+```bash
+cp /path/to/vllm-ascend/research/streaming_prespec_rejoin.py ./
+python streaming_prespec_rejoin.py --log consume-server.log \
+  --kmax 15 --eos-token-id 151645 \
+  --out rejoin-summary.json --cases-out rejoin-cases.jsonl
+```
+
+脚本先按正式请求已采样首 token、验证 `candidate[1:]` 的现有顺序定位首次失配；它只用截至当前已经确认的正式 token 选择下一份草稿。`aligned` 按原 token 位置尝试候选余段；`ngram_1/2/3` 用正式输出的末尾 1/2/3 个 token 在候选中找锚点，提出锚点后的最多 `kmax` 个 token。两者都逐轮与日志中的正式 token 比较，输出 `attempts`、`zero_accept_attempts`、`accepted_tokens`、`accepted_nonterminal_tokens`、`estimated_saved_steps`。提案选择不读取未来正式 token；未来 token 只用于离线评分。这里每次验证理想化为一个模型步，**不是实测 verifier 接受数或时延**。
+
+当前协调器的 `PRESPEC_MATCH_TOKENS.target_token_ids` 只打印到候选长度。若 `target_len` 更长，脚本标为 `censored_target`，不把截断后的尾部当成正式结束。报告还列出 `no_post_first_draft_mismatch`、`candidate_draft_exceeds_kmax` 等排除原因，并按 shadow/consume 及 `candidate_partial=true/false/unknown` 分组；旧日志没有此字段时归入 `unknown`。它的分母仅为出现这条匹配日志的候选，不是全部正式请求或 commit。你给出的 `ws-191306f2/seg-3/window-2` 例子中，首次失配后的同位置相同 token 只有末尾 EOS；按位置续接理想化后节省 0 步，三个 ngram 长度都找不到可用锚点。
+
+若初筛发现较多非终止 token 可重接，再在同一正式请求上记录**完整**正式输出 token IDs、实际就绪的预投机及回滚候选 token IDs，以及候选就绪时刻和请求／窗口键，重跑全长回放。现有 `ASR_FORMAL_STATS` 只有 token 数量，`Segment done` 的文本重新 tokenize 会改变 ID 边界，不能代替这份记录。在线实现还需让 proposer 保留候选池并在每次正式采样后重新选草稿；当前 `external_drafts.pop(req_id, [])` 只消费一次。随后用相同音频和并发负载比较实际 verifier 轮次、全部非空 commit 的 P95/P99、队列与 NPU 成本。
 
 ## 5. 门控空档验证：在 force 对比后接入实时负载
 

@@ -412,6 +412,192 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         coordinator.finish_formal("ws-1", 1, window_id=1)
         await coordinator.close_session("ws-1")
 
+    async def test_commit_claims_published_partial_before_cancel_completes(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        probes = []
+        coordinator = None
+
+        async def producer(request, budget):
+            started.set()
+            self.assertFalse(coordinator.publish_partial(request, (19,)))
+            self.assertTrue(coordinator.publish_partial(request, (19, 20, 21, 30)))
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        coordinator = PreSpecCoordinator(
+            producer, self.policy, clock=lambda: self.now,
+            shadow_only=False, on_probe=probes.append)
+        coordinator.maybe_start(self.request(window_id=1), self.load(), 200)
+        await started.wait()
+        self.assertIsNone(coordinator.begin_formal(
+            "ws-1", 1, 2, 64_000, window_id=1, defer_candidate=True))
+        candidate = coordinator.claim_formal_candidate(
+            "ws-1", 1, window_id=1, prefix_version=2,
+            full_audio_end_samples=64_000)
+        self.assertEqual(candidate.formal_draft_token_ids, (20, 21, 30))
+        self.assertTrue(candidate.is_partial)
+        self.assertEqual(probes[-1].status, "partial_ready_consumed")
+        await asyncio.wait_for(cancelled.wait(), 0.2)
+        coordinator.finish_formal("ws-1", 1, window_id=1)
+        await coordinator.close_session("ws-1")
+
+    async def test_pending_chunk_uses_partial_only_when_longer_than_rollback(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        probes = []
+        coordinator = None
+
+        async def producer(request, budget):
+            started.set()
+            coordinator.publish_partial(request, (19, 20, 21))
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        coordinator = PreSpecCoordinator(
+            producer, self.policy, clock=lambda: self.now,
+            shadow_only=False, on_probe=probes.append)
+        coordinator.maybe_start(self.request(), self.load(), 200)
+        await started.wait()
+        candidate = coordinator.begin_authoritative_chunk(
+            "ws-1", audio_epoch=1, window_id=0, prefix_version=2,
+            full_audio_end_samples=64_000)
+        self.assertIsNone(candidate)
+        self.assertEqual(probes[-1].status, "partial_not_longer_than_rollback")
+        await asyncio.wait_for(cancelled.wait(), 0.2)
+        coordinator.end_authoritative_chunk("ws-1", audio_epoch=1, window_id=0)
+        await coordinator.close_session("ws-1")
+
+    async def test_pending_chunk_can_consume_a_longer_partial(self):
+        started = asyncio.Event()
+        coordinator = None
+
+        async def producer(request, budget):
+            coordinator.publish_partial(request, (19, 20, 21, 30))
+            started.set()
+            await asyncio.Future()
+
+        coordinator = PreSpecCoordinator(
+            producer, self.policy, clock=lambda: self.now, shadow_only=False)
+        coordinator.maybe_start(self.request(), self.load(), 200)
+        await started.wait()
+        candidate = coordinator.begin_authoritative_chunk(
+            "ws-1", audio_epoch=1, window_id=0, prefix_version=2,
+            full_audio_end_samples=64_000)
+        self.assertEqual(candidate.formal_draft_token_ids, (20, 21, 30))
+        self.assertTrue(candidate.is_partial)
+        coordinator.end_authoritative_chunk("ws-1", audio_epoch=1, window_id=0)
+        await coordinator.close_session("ws-1")
+
+    async def test_partial_rejects_stale_prefix_and_is_cleared_after_finish(self):
+        started = asyncio.Event()
+        probes = []
+        coordinator = None
+
+        async def producer(request, budget):
+            coordinator.publish_partial(request, (19, 20, 21, 30))
+            started.set()
+            await asyncio.Future()
+
+        coordinator = PreSpecCoordinator(
+            producer, self.policy, clock=lambda: self.now,
+            shadow_only=False, on_probe=probes.append)
+        coordinator.maybe_start(self.request(window_id=1), self.load(), 200)
+        await started.wait()
+        coordinator.begin_formal("ws-1", 1, 2, 64_000,
+                                 window_id=1, defer_candidate=True)
+        self.assertIsNone(coordinator.claim_formal_candidate(
+            "ws-1", 1, window_id=1, prefix_version=3,
+            full_audio_end_samples=64_000))
+        self.assertEqual(probes[-1].status, "version_mismatch")
+        coordinator.finish_formal("ws-1", 1, window_id=1)
+        self.assertFalse(coordinator._partials)
+        self.assertFalse(coordinator._launch_info)
+        await coordinator.close_session("ws-1")
+
+    async def test_failed_producer_does_not_publish_partial_as_ready(self):
+        probes = []
+        coordinator = None
+
+        async def producer(request, budget):
+            coordinator.publish_partial(request, (19, 20, 21, 30))
+            raise RuntimeError("backend failed after partial output")
+
+        coordinator = PreSpecCoordinator(
+            producer, self.policy, clock=lambda: self.now,
+            shadow_only=False, on_probe=probes.append)
+        coordinator.maybe_start(self.request(window_id=1), self.load(), 200)
+        with self.assertRaisesRegex(RuntimeError, "backend failed after partial output"):
+            await coordinator._tasks[("ws-1", 1, 1)]
+        coordinator.begin_formal("ws-1", 1, 2, 64_000,
+                                 window_id=1, defer_candidate=True)
+        self.assertIsNone(coordinator.claim_formal_candidate(
+            "ws-1", 1, window_id=1, prefix_version=2,
+            full_audio_end_samples=64_000))
+        self.assertEqual(probes[-1].status, "failed")
+        coordinator.finish_formal("ws-1", 1, window_id=1)
+        await coordinator.close_session("ws-1")
+
+    async def test_partial_publication_requires_live_matching_request(self):
+        started = asyncio.Event()
+        coordinator = None
+        original = self.request(window_id=1)
+
+        async def producer(request, budget):
+            self.assertFalse(coordinator.publish_partial(
+                replace(request, window_id=2), (19, 20, 21, 30)))
+            self.assertFalse(coordinator.publish_partial(
+                replace(request, request_id="wrong"), (19, 20, 21, 30)))
+            with self.assertRaises(ValueError):
+                coordinator.publish_partial(request, (19, True))
+            self.assertTrue(coordinator.publish_partial(request, (19, 20, 21, 30)))
+            started.set()
+            await asyncio.Future()
+
+        coordinator = PreSpecCoordinator(
+            producer, self.policy, clock=lambda: self.now, shadow_only=False)
+        coordinator.maybe_start(original, self.load(), 200)
+        await started.wait()
+        self.assertFalse(coordinator.publish_partial(original, (19, 20, 21, 30, 31)))
+        coordinator.begin_formal("ws-1", 1, 2, 64_000,
+                                 window_id=1, defer_candidate=True)
+        candidate = coordinator.claim_formal_candidate(
+            "ws-1", 1, window_id=1, prefix_version=2,
+            full_audio_end_samples=64_000)
+        self.assertEqual(candidate.token_ids, (19, 20, 21, 30))
+        coordinator.finish_formal("ws-1", 1, window_id=1)
+        await coordinator.close_session("ws-1")
+
+    async def test_duplicate_partial_snapshot_keeps_first_ready_time(self):
+        started = asyncio.Event()
+        probes = []
+        coordinator = None
+
+        async def producer(request, budget):
+            coordinator.publish_partial(request, (19, 20, 21, 30))
+            self.now += 20_000_000
+            coordinator.publish_partial(request, (19, 20, 21, 30))
+            started.set()
+            await asyncio.Future()
+
+        coordinator = PreSpecCoordinator(
+            producer, self.policy, clock=lambda: self.now,
+            shadow_only=False, on_probe=probes.append)
+        coordinator.maybe_start(self.request(window_id=1), self.load(), 200)
+        await started.wait()
+        coordinator.begin_formal("ws-1", 1, 2, 64_000,
+                                 window_id=1, defer_candidate=True)
+        coordinator.claim_formal_candidate("ws-1", 1, window_id=1,
+                                            prefix_version=2,
+                                            full_audio_end_samples=64_000)
+        self.assertEqual(probes[-1].ready_lead_ms, 20)
+        coordinator.finish_formal("ws-1", 1, window_id=1)
+        await coordinator.close_session("ws-1")
+
     async def test_commit_short_tail_discards_unclaimed_ready_candidate(self):
         async def producer(request, budget):
             return (19, 20)

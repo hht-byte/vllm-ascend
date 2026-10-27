@@ -81,6 +81,8 @@ class Candidate:
     visible_audio_end_samples: int
     token_ids: tuple[int, ...]
     ready_ns: int
+    is_partial: bool = False
+    rollback_draft_length: int = 0
 
     @property
     def formal_draft_token_ids(self) -> tuple[int, ...]:
@@ -101,6 +103,7 @@ class Evaluation:
     target_token_count: int
     ready_before_formal: bool
     ready_lead_ms: float
+    candidate_is_partial: bool = False
 
     @property
     def continuous_accepted_tokens(self) -> int:
@@ -227,6 +230,8 @@ class PreSpecCoordinator:
         self.on_probe = on_probe
         self.probe_error_count = 0
         self._tasks: dict[WindowKey, asyncio.Task[Candidate]] = {}
+        self._partials: dict[WindowKey, Candidate] = {}
+        self._launch_info: dict[WindowKey, tuple[str, int, int]] = {}
         self._reserved: set[asyncio.Task[Candidate]] = set()
         self._task_sessions: dict[asyncio.Task[Candidate], str] = {}
         self._launched: set[WindowKey] = set()
@@ -298,22 +303,57 @@ class PreSpecCoordinator:
             return LaunchDecision(False, "insufficient_slack", slack_ms)
         task = asyncio.get_running_loop().create_task(self._produce(request))
         self._tasks[key] = task
+        self._launch_info[key] = (request.request_id, request.base_prefix_version,
+                                  request.visible_audio_end_samples)
         self._reserved.add(task)
         self._task_sessions[task] = request.session_id
         self._launched.add(key)
         task.add_done_callback(self._release)
         return LaunchDecision(True, "launched", slack_ms)
 
+    def publish_partial(self, request: ShadowRequest,
+                        cumulative_token_ids: Sequence[int]) -> bool:
+        """Save one already-emitted CUMULATIVE snapshot without awaiting shadow work.
+
+        The producer calls this after each usable RequestOutput. The snapshot
+        belongs to the active request/task only; the formal path may later use
+        it after canceling that task. A one-token snapshot has no formal draft.
+        """
+        key = (request.session_id, request.audio_epoch, request.window_id)
+        if (self._tasks.get(key) is not asyncio.current_task()
+                or self._launch_info.get(key) != (
+                    request.request_id, request.base_prefix_version,
+                    request.visible_audio_end_samples)):
+            return False
+        token_ids = tuple(cumulative_token_ids)
+        if (len(token_ids) > self.policy.max_candidate_tokens
+                or any(type(token) is not int or token < 0
+                       for token in token_ids)):
+            raise ValueError("invalid partial candidate token IDs")
+        if len(token_ids) < 2 or len(token_ids) - 1 > self.policy.max_rollback_draft_tokens:
+            return False
+        previous = self._partials.get(key)
+        if previous is not None and token_ids[:len(previous.token_ids)] != previous.token_ids:
+            raise ValueError("CUMULATIVE candidate output changed an emitted token")
+        if previous is not None and token_ids == previous.token_ids:
+            return True
+        self._partials[key] = Candidate(
+            request.request_id, request.session_id, request.audio_epoch,
+            request.window_id, request.base_prefix_version,
+            request.visible_audio_end_samples, token_ids, self.clock(),
+            is_partial=True, rollback_draft_length=len(request.rollback_tokens))
+        return True
+
     async def _produce(self, request: ShadowRequest) -> Candidate:
         token_ids = tuple(await self.producer(request, self.policy.max_candidate_tokens))
         if not token_ids or len(token_ids) > self.policy.max_candidate_tokens:
             raise ValueError("producer must return 1..max_candidate_tokens token IDs")
-        if not all(isinstance(token, int) and token >= 0 for token in token_ids):
+        if not all(type(token) is int and token >= 0 for token in token_ids):
             raise ValueError("producer returned invalid token IDs")
         return Candidate(request.request_id, request.session_id, request.audio_epoch,
                          request.window_id, request.base_prefix_version,
                          request.visible_audio_end_samples, token_ids,
-                         self.clock())
+                         self.clock(), rollback_draft_length=len(request.rollback_tokens))
 
     def _release(self, task: asyncio.Task[Candidate]) -> None:
         self._reserved.discard(task)
@@ -342,7 +382,7 @@ class PreSpecCoordinator:
         previous_active = self._active_chunks.get(session_id, 0)
         self._active_chunks[session_id] = previous_active + 1
         task = self._tasks.pop(key, None) if key is not None else None
-        self._cancel_session_shadows(session_id)
+        self._cancel_session_shadows(session_id, preserve_partial_key=key)
         if key is None:
             return None
         if key in self._selected:
@@ -353,7 +393,8 @@ class PreSpecCoordinator:
                                       allow_candidate and not previous_active)
 
     def _cancel_session_shadows(self, session_id: str, *,
-                                preserve_ready_key: WindowKey | None = None) -> None:
+                                preserve_ready_key: WindowKey | None = None,
+                                preserve_partial_key: WindowKey | None = None) -> None:
         """Retire this connection's shadows without affecting other connections."""
         for key in list(self._tasks):
             if key[0] != session_id:
@@ -366,6 +407,13 @@ class PreSpecCoordinator:
                 self._reserved.discard(task)
             else:
                 task.cancel()
+        for key in list(self._partials):
+            if key[0] == session_id and key != preserve_partial_key:
+                self._partials.pop(key)
+        for key in list(self._launch_info):
+            if (key[0] == session_id and key != preserve_partial_key
+                    and key != preserve_ready_key):
+                self._launch_info.pop(key)
 
     def end_authoritative_chunk(self, session_id: str, *,
                                 audio_epoch: int | None = None,
@@ -401,6 +449,8 @@ class PreSpecCoordinator:
                 self._reserved.discard(task)
             else:
                 task.cancel()
+        self._partials.pop(key, None)
+        self._launch_info.pop(key, None)
         self._launched.discard(key)
         segment_key = key[:2]
         self._last_finished_window[segment_key] = max(
@@ -428,21 +478,32 @@ class PreSpecCoordinator:
                           prefix_version: int,
                           full_audio_end_samples: int,
                           allow_candidate: bool) -> Candidate | None:
+        partial = self._partials.pop(key, None)
         if task is None:
-            self._emit_probe(key, boundary, started_ns,
-                             "discarded_before_boundary" if key in self._launched
-                             else "not_started")
-            return None
-        if not task.done():
+            if partial is None:
+                self._emit_probe(key, boundary, started_ns,
+                                 "discarded_before_boundary" if key in self._launched
+                                 else "not_started")
+                return None
+            candidate = partial
+        elif not task.done():
             task.cancel()
-            self._emit_probe(key, boundary, started_ns, "pending")
-            return None
-        self._reserved.discard(task)
-        try:
-            candidate = task.result()
-        except (asyncio.CancelledError, Exception):
-            self._emit_probe(key, boundary, started_ns, "failed")
-            return None
+            if partial is None:
+                self._emit_probe(key, boundary, started_ns, "pending")
+                return None
+            candidate = partial
+        else:
+            self._reserved.discard(task)
+            try:
+                candidate = task.result()
+            except asyncio.CancelledError:
+                if partial is None:
+                    self._emit_probe(key, boundary, started_ns, "failed")
+                    return None
+                candidate = partial
+            except Exception:
+                self._emit_probe(key, boundary, started_ns, "failed")
+                return None
         if not allow_candidate:
             self._emit_probe(key, boundary, started_ns, "disallowed", candidate)
             return None
@@ -457,15 +518,23 @@ class PreSpecCoordinator:
         if not candidate.formal_draft_token_ids:
             self._emit_probe(key, boundary, started_ns, "candidate_no_draft", candidate)
             return None
+        if (candidate.is_partial and
+                len(candidate.formal_draft_token_ids) <= candidate.rollback_draft_length):
+            self._emit_probe(key, boundary, started_ns,
+                             "partial_not_longer_than_rollback", candidate)
+            return None
         if len(candidate.formal_draft_token_ids) > self.policy.max_rollback_draft_tokens:
             self._emit_probe(key, boundary, started_ns,
                              "candidate_exceeds_kmax", candidate)
             return None
         self._selected[key] = candidate
         self._selected_at_ns[key] = started_ns
-        self._emit_probe(key, boundary, started_ns,
-                         "ready_shadow_only" if self.shadow_only else "ready_consumed",
-                         candidate)
+        if candidate.is_partial:
+            probe_status = ("partial_ready_shadow_only" if self.shadow_only
+                            else "partial_ready_consumed")
+        else:
+            probe_status = "ready_shadow_only" if self.shadow_only else "ready_consumed"
+        self._emit_probe(key, boundary, started_ns, probe_status, candidate)
         return None if self.shadow_only else candidate
 
     def begin_formal(self, session_id: str, audio_epoch: int,
@@ -485,10 +554,11 @@ class PreSpecCoordinator:
         self._begun.add(segment_key)
         self._begun_window_ids[segment_key] = window_id
         if defer_candidate:
-            self._cancel_session_shadows(session_id, preserve_ready_key=key)
+            self._cancel_session_shadows(session_id, preserve_ready_key=key,
+                                         preserve_partial_key=key)
             return None
         task = self._tasks.pop(key, None)
-        self._cancel_session_shadows(session_id)
+        self._cancel_session_shadows(session_id, preserve_partial_key=key)
         if key in self._selected:
             self._emit_probe(key, "formal", started_ns, "already_selected")
             return None
@@ -540,11 +610,12 @@ class PreSpecCoordinator:
                 logger.info(
                     "PRESPEC_MATCH ws_id=%s seg=%s window=%s boundary=formal "
                     "candidate_len=%s target_len=%s raw_matched_prefix_tokens=%s "
-                    "draft_matched_prefix_tokens=%s",
+                    "draft_matched_prefix_tokens=%s candidate_partial=%s",
                     session_id, audio_epoch, window_id,
                     len(evaluation.candidate_tokens), evaluation.target_token_count,
                     evaluation.raw_matched_prefix_tokens,
                     evaluation.draft_matched_prefix_tokens,
+                    evaluation.candidate_is_partial,
                 )
             return evaluation
         finally:
@@ -575,12 +646,12 @@ class PreSpecCoordinator:
         logger.info(
             "PRESPEC_MATCH_TOKENS ws_id=%s seg=%s window=%s mode=%s "
             "candidate_token_ids=%s target_token_ids=%s target_len=%s "
-            "raw_matched_prefix_tokens=%s",
+            "raw_matched_prefix_tokens=%s candidate_partial=%s",
             key[0], key[1], key[2],
             "shadow" if self.shadow_only else "consume",
             candidate.token_ids,
             tuple(target_continuation_tokens[:len(candidate.token_ids)]),
-            len(target_continuation_tokens), raw_match,
+            len(target_continuation_tokens), raw_match, candidate.is_partial,
         )
         return Evaluation(
             key[0], key[1], key[2], candidate.token_ids,
@@ -589,6 +660,7 @@ class PreSpecCoordinator:
             target_token_count=len(target_continuation_tokens),
             ready_before_formal=True,
             ready_lead_ms=ready_lead_ms,
+            candidate_is_partial=candidate.is_partial,
         )
 
     async def close_session(self, session_id: str) -> None:
@@ -602,6 +674,10 @@ class PreSpecCoordinator:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._partials = {key: candidate for key, candidate in self._partials.items()
+                          if key[0] != session_id}
+        self._launch_info = {key: info for key, info in self._launch_info.items()
+                             if key[0] != session_id}
         self._launched = {key for key in self._launched if key[0] != session_id}
         self._begun = {key for key in self._begun if key[0] != session_id}
         self._selected = {key: candidate for key, candidate in self._selected.items()

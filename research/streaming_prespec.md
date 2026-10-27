@@ -484,6 +484,9 @@ class PreSpecModelHelpers:
                         candidate_token_ids = tuple(completion.token_ids)
                         if completion.finish_reason == "abort":
                             raise RuntimeError("prespec engine request aborted")
+                        # 已输出的 token 是 shadow 自己确认过的前缀。同步保存快照；
+                        # commit 即使紧接着取消任务，正式请求也可验证该前缀。
+                        self.prespec.publish_partial(request, candidate_token_ids)
                     finished = output.finished
             if not finished or not candidate_token_ids:
                 raise RuntimeError("prespec stream ended without a completed candidate")
@@ -503,8 +506,8 @@ class PreSpecModelHelpers:
 - `try_start_prespec` 是同步函数，只调用 `maybe_start` 创建后台 task；它不会等待生成，也不会推进上次正式音频截止位置。
 - `ModelShadowRequest` 在通用 `ShadowRequest` 上补了 `model_context/sampling_params`。创建时深拷贝小配置、音频转 bytes、token 转 tuple；它不持有真实 state。
 - `_build_stream_request` 给每次 shadow 建立参数副本，设置累计输出、单序列及总 token 上限；已有回滚草稿完整传入，预算不足时跳过。
-- `_run_prespec` 只取引擎给出的**已验证输出**，累计输出用覆盖赋值，不重复拼接；流异常结束时不发布半截候选。
-- 提前 commit/正式 chunk 只清理同一连接的候选：未完成候选取消，符合本次窗口和版本的已完成候选可领取；其他连接的候选无论运行中还是已完成都保留。到预估下一正式提交时间仍未结束也会取消；正式路径没有 await shadow 的操作。
+- `_run_prespec` 只取引擎给出的**已验证输出**，累计输出用覆盖赋值，不重复拼接。每次输出把累计 token ID 同步交给 `publish_partial()`；这个接口只保存快照，不等待 shadow。正常结束仍返回完整候选；出错的请求不能因有旧快照就当成成功的完整候选。
+- 提前 commit/正式 chunk 只清理同一连接的候选：未完成候选立即取消，但若此前已有可用的累计输出快照，就保留本窗口的快照供正式请求验证；版本／音频截止仍要核对。没有至少一个可提交的草稿 token、或部分草稿不长于原回滚草稿时，继续使用回滚草稿。其他连接的候选不受影响；正式路径没有 await shadow 的操作。
 
 截止时间覆盖剩余生成时间，并扣除快照/打包已经花掉的时间；同步 processor 工作仍会占用事件循环，不能通过 `create_task` 或 timeout 自动抢占，应把这部分 CPU 成本计入实验。
 
@@ -687,7 +690,7 @@ if self.prespec is not None and not segment.prespec_formal_begun:
         ws_id, seg_id, current_prefix_version,
         0,  # 此时队列尚未消费完，不能用它验证完整音频截止
         window_id=window_id,
-        defer_candidate=True,  # 保留已完成候选；未完成候选立即取消
+        defer_candidate=True,  # 取消未完成候选，保留已输出的本窗口快照
     )
     segment.prespec_formal_window_id = window_id
     segment.prespec_formal_begun = True
@@ -759,15 +762,17 @@ sampling_params.extra_args = {
 ```python
 logger.info(
     "PRESPEC_TARGET ws_id=%s seg=%s window=%s boundary=formal "
-    "formal_request_id=%s candidate_request_id=%s submitted_draft_tokens=%s",
+    "formal_request_id=%s candidate_request_id=%s candidate_partial=%s "
+    "submitted_draft_tokens=%s",
     prespec_ws_id, prespec_seg_id, state.chunk_id,
     finish_request_id,  # 换成原 finish 请求实际使用的 request_id 局部变量
     candidate.request_id if candidate is not None else None,
+    candidate.is_partial if candidate is not None else None,
     len(finish_draft_token_ids),
 )
 ```
 
-`claim_formal_candidate()` 不等待候选，只在其完成、版本相同、候选音频截止不晚于完整正式音频、草稿长度不超 `kmax` 且窗口号仍相同时返回候选。shadow 模式下返回 `None`，但记录 `PRESPEC_PROBE boundary=formal status=ready_shadow_only`，正式请求继续使用原 finish 草稿；consume 模式下可返回候选并记录 `ready_consumed`。consume 的候选必须由现有引擎在**完整正式音频**上验证，不能直接把 shadow 文本发给客户端。
+`claim_formal_candidate()` 不等待候选：若 shadow 已完成，读取完整候选；若 commit 取消了运行中的 shadow，读取取消前最后一个已输出的累计快照。两种候选都要经过窗口、版本、音频截止和 `kmax` 校验；部分草稿还须长于原回滚草稿，否则回退并记录 `partial_not_longer_than_rollback`。完整候选的状态仍为 `ready_shadow_only/ready_consumed`，部分候选为 `partial_ready_shadow_only/partial_ready_consumed`。shadow 模式只记录和评估，不提交；consume 模式把候选交给现有引擎在**完整正式音频**上验证，不能直接把 shadow 文本发给客户端。`candidate.is_partial` 可用于 `PRESPEC_TARGET` 日志区分两者。
 
 #### `async_finish_streaming_transcribe()`：复用 `_yield_delta_text()` 消费正式输出
 
@@ -854,7 +859,7 @@ if self.prespec is not None:
 
 #### 异常路径和配对规则
 
-- `handle_event()` 处理真实 commit 时，在注入 None 之前读取当前 `state.chunk_id`，调用 `begin_formal(ws_id, seg_id, version, 0, window_id=window_id, defer_candidate=True)`，并把 `window_id` 存入 `segment.prespec_formal_window_id`。这个 0 是尚未消费队列时的占位参数；保留已经完成的本窗口候选，取消仍在运行的 shadow。重复 commit 不能重复 begin；state 尚未初始化时版本和窗口 ID 均可取 0。
+- `handle_event()` 处理真实 commit 时，在注入 None 之前读取当前 `state.chunk_id`，调用 `begin_formal(ws_id, seg_id, version, 0, window_id=window_id, defer_candidate=True)`，并把 `window_id` 存入 `segment.prespec_formal_window_id`。这个 0 是尚未消费队列时的占位参数；保留已经完成的本窗口候选或取消前的部分输出快照，取消仍在运行的 shadow。重复 commit 不能重复 begin；state 尚未初始化时版本和窗口 ID 均可取 0。
 - `_process_segment()` 最外层 finally 检查上述标志，用保存的 `prespec_formal_window_id` 调用 `finish_formal(ws_id, seg_id, target_continuation_tokens=segment.prespec_finish_target_tokens, window_id=...)` 并清标志。不能在 finish 时重新读取可能已经递增的 `state.chunk_id`。此处包住流式循环与 `_finish_segment()`，所以短尾跳过、正常完成和中途异常都会配对；token IDs 为 `None` 时只清理、不做候选质量评估。正式 finish 完成且候选已选中时，协调器自动输出 `PRESPEC_MATCH_TOKENS` 和 `PRESPEC_MATCH boundary=formal`，无需在服务端再打印同一条摘要。
 - 如果某段已 begin 但入队失败或被取消前根本未进入 `_process_segment()`，由对应异常处理或连接 cleanup 清理；不能期待一个从未进入的 finally 自动执行。
 - `cleanup()` 先取消并等待生成任务及其流式生成器退出，再 `await asr.prespec.close_session(ws_id)`，最后做原有队列/统计清理。不要先删协调器计数再让模型 finally 退出。
@@ -865,7 +870,7 @@ if self.prespec is not None:
 
 910B 上按“回滚投机 baseline → shadow → 消费候选”逐步验证的可执行命令、最小日志接线和判定表见 [streaming_prespec_validation.md](streaming_prespec_validation.md)。launch/probe 仍需要按文档接入日志；正式输出 token 交给协调器后，它会打印匹配 token 和 formal 摘要。只看原有服务日志无法判断预投机是否运行。
 
-当前协调器按 `(session_id, audio_epoch, window_id)` 去重，其中 `audio_epoch=seg_id`、`window_id=state.chunk_id`。**每个尚未提交的正式 chunk 窗口可启动一次**：`chunk-0` 在约 1 s 中点用空旧草稿起草；2 s 正式结果后，3 s 中点为 4 s 的 `chunk-1` 起草；4 s 正式结果写回后，5 s 中点为 6 s 的 `chunk-2` 起草。每次正式 chunk 结束回收该窗口；提前 commit 则保留已完成的本窗口候选，在 residual finish 正式请求提交时核对并领取。后续窗口按原规则验证已有回滚草稿；不能跨 VAD 段借用旧 token，也不能把旧窗口候选交给新窗口。
+当前协调器按 `(session_id, audio_epoch, window_id)` 去重，其中 `audio_epoch=seg_id`、`window_id=state.chunk_id`。**每个尚未提交的正式 chunk 窗口可启动一次**：`chunk-0` 在约 1 s 中点用空旧草稿起草；2 s 正式结果后，3 s 中点为 4 s 的 `chunk-1` 起草；4 s 正式结果写回后，5 s 中点为 6 s 的 `chunk-2` 起草。每次正式 chunk 结束回收该窗口；提前 commit 则保留本窗口已完成候选或已输出的部分快照，在 residual finish 正式请求提交时核对并领取。后续窗口按原规则验证已有回滚草稿；不能跨 VAD 段借用旧 token，也不能把旧窗口候选交给新窗口。
 
 共享的单个协调器按连接管理生命周期：连接 A 的 chunk/commit 不阻止连接 B 启动候选，也不取消或删除 B 的候选；同一连接的正式请求仍保护本连接的状态和候选边界。默认 `max_active_shadows=0`，允许多连接候选并行；正值才启用额外的全局容量限制。`PRESPEC_PROBE status=discarded_before_boundary` 表示该窗口曾启动候选、但候选在边界前已被丢弃，不能解释为曾被正式请求接受；它替代旧的 `previously_used` 状态。
 
