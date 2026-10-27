@@ -1,0 +1,383 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -663,7 +663,17 @@
+                     # `request.num_prompt_tokens` to consider the resumed
+                     # requests, which have output tokens.
+                     num_new_tokens = request.num_tokens - num_computed_tokens
++                    initial_draft = bool(request.spec_token_ids) and bool(
++                        (getattr(request.sampling_params, 'extra_args', None) or {})
++                        .get('ascend_external_draft_first_verify', False))
+                     threshold = self.scheduler_config.long_prefill_token_threshold
++                    if initial_draft:
++                        full = request.num_tokens_with_spec - num_computed_tokens
++                        if full <= token_budget and (threshold <= 0 or full <= threshold):
++                            num_new_tokens = full
++                        else:
++                            request.spec_token_ids = []
++                            logger.info('INITIAL_DRAFT request_id=%s status=fallback reason=budget', request.request_id)
+                     if 0 < threshold < num_new_tokens:
+                         num_new_tokens = threshold
+ 
+@@ -742,6 +752,14 @@
+                     if request.has_encoder_inputs:
+                         self.encoder_cache_manager.free(request)
+                     break
++
++                if (request.spec_token_ids and
++                        (getattr(request.sampling_params, "extra_args", None) or {})
++                        .get("ascend_external_draft_first_verify", False) and
++                        num_computed_tokens + num_new_tokens < request.num_tokens_with_spec):
++                    request.spec_token_ids = []
++                    num_new_tokens = min(num_new_tokens, request.num_tokens - num_computed_tokens)
++                    logger.info("INITIAL_DRAFT request_id=%s status=fallback reason=encoder_or_chunk", request.request_id)
+ 
+                 new_blocks = self.kv_cache_manager.allocate_slots(
+                     request,
+@@ -804,6 +822,15 @@
+                     # only the successfully loaded tokens.
+                     request.num_computed_tokens = num_computed_tokens
+                     continue
++
++                if (request.spec_token_ids and
++                        (getattr(request.sampling_params, "extra_args", None) or {})
++                        .get("ascend_external_draft_first_verify", False)):
++                    assert num_computed_tokens + num_new_tokens == request.num_tokens_with_spec
++                    scheduled_spec_decode_tokens[request_id] = request.spec_token_ids
++                    request.spec_token_ids = []
++                    logger.info("INITIAL_DRAFT request_id=%s status=scheduled draft_tokens=%d",
++                                request_id, len(scheduled_spec_decode_tokens[request_id]))
+ 
+                 self.running.append(request)
+                 if self.log_stats:
+@@ -1730,6 +1757,22 @@
+         """Returns (num_running_reqs, num_waiting_reqs)."""
+         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
+ 
++    def _prepare_initial_external_draft(self, request: Request) -> None:
++        """Seed first-pass verification before the target is ever executed."""
++        params = request.sampling_params
++        extra = getattr(params, "extra_args", None) or {}
++        if not extra.get("ascend_external_draft_first_verify", False):
++            return
++        draft = extra.get("ascend_external_draft")
++        if (not isinstance(draft, (list, tuple)) or not draft
++                or any(type(token) is not int or token < 0 for token in draft)):
++            raise ValueError("first-verify external draft must be nonempty token IDs")
++        if not self.speculative_config or len(draft) > self.num_spec_tokens:
++            raise ValueError("first-verify draft exceeds speculative kmax")
++        if request.num_tokens + len(draft) >= self.max_model_len:
++            raise ValueError("first-verify draft exceeds model context")
++        request.spec_token_ids = list(draft)
++
+     def add_request(self, request: Request) -> None:
+         existing = self.requests.get(request.request_id)
+         if existing is not None:
+@@ -1747,6 +1790,7 @@
+         else:
+             if request.resumable:
+                 request.streaming_queue = deque()
++            self._prepare_initial_external_draft(request)
+             self._enqueue_waiting_request(request)
+             self.requests[request.request_id] = request
+             if self.log_stats:
+--- a/vllm_ascend/core/recompute_scheduler.py
++++ b/vllm_ascend/core/recompute_scheduler.py
+@@ -124,9 +124,11 @@
+         else:
+             if request.resumable:
+                 request.streaming_queue = deque()
++            self._prepare_initial_external_draft(request)
+             # Fill in placeholder tokens to enable full graph compatibility. Without
+             # placeholders, graph matching may fail, forcing eager mode execution.
+-            if self.is_mtp_kv_consumer and (self.max_model_len >= (request.num_tokens + self.num_spec_tokens)):
++            if (not request.spec_token_ids and self.is_mtp_kv_consumer
++                    and self.max_model_len >= request.num_tokens + self.num_spec_tokens):
+                 request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
+             self._enqueue_waiting_request(request)
+             self.requests[request.request_id] = request
+@@ -558,11 +560,19 @@
+                     # We use `request.num_tokens` instead of
+                     # `request.num_prompt_tokens` to consider the resumed
+                     # requests, which have output tokens.
+-                    if self.is_mtp_kv_consumer:
++                    initial_draft = bool(request.spec_token_ids) and bool(
++                        (getattr(request.sampling_params, 'extra_args', None) or {})
++                        .get('ascend_external_draft_first_verify', False))
++                    if self.is_mtp_kv_consumer or initial_draft:
+                         num_new_tokens = request.num_tokens_with_spec - num_computed_tokens
+                     else:
+                         num_new_tokens = request.num_tokens - num_computed_tokens
+                     threshold = self.scheduler_config.long_prefill_token_threshold
++                    if initial_draft and (num_new_tokens > token_budget or
++                                          0 < threshold < num_new_tokens):
++                        request.spec_token_ids = []
++                        num_new_tokens = request.num_tokens - num_computed_tokens
++                        logger.info('INITIAL_DRAFT request_id=%s status=fallback reason=budget', request.request_id)
+                     if 0 < threshold < num_new_tokens:
+                         num_new_tokens = threshold
+ 
+@@ -615,6 +625,14 @@
+                 num_encoder_tokens = 0
+                 if self.is_encoder_decoder and request.has_encoder_inputs and encoder_inputs_to_schedule:
+                     num_encoder_tokens = sum(request.get_num_encoder_embeds(i) for i in encoder_inputs_to_schedule)
++
++                if (request.spec_token_ids and
++                        (getattr(request.sampling_params, "extra_args", None) or {})
++                        .get("ascend_external_draft_first_verify", False) and
++                        num_computed_tokens + num_new_tokens < request.num_tokens_with_spec):
++                    request.spec_token_ids = []
++                    num_new_tokens = min(num_new_tokens, request.num_tokens - num_computed_tokens)
++                    logger.info("INITIAL_DRAFT request_id=%s status=fallback reason=encoder_or_chunk", request.request_id)
+ 
+                 new_blocks = self.kv_cache_manager.allocate_slots(
+                     request,
+@@ -678,10 +696,12 @@
+ 
+                 # For spec_token_ids, the waiting queue has the same processing
+                 # as the running queue.
+-                if self.is_mtp_kv_consumer and request.spec_token_ids:
++                if (self.is_mtp_kv_consumer or
++                    (getattr(request.sampling_params, 'extra_args', None) or {})
++                    .get('ascend_external_draft_first_verify', False)) and request.spec_token_ids:
+                     num_scheduled_spec_tokens = (
+                         num_new_tokens
+-                        + request.num_computed_tokens
++                        + num_computed_tokens
+                         - request.num_tokens
+                         - request.num_output_placeholders
+                     )
+--- a/vllm_ascend/spec_decode/external_draft_proposer.py
++++ b/vllm_ascend/spec_decode/external_draft_proposer.py
+@@ -19,8 +19,11 @@
+ 
+ from __future__ import annotations
+ 
++import logging
++
+ import torch
+ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
++from vllm_ascend.spec_decode.external_draft_rejoin import first_mismatch, next_draft
+ 
+ # Per-request draft tokens are transported to the worker through
+ # ``SamplingParams.extra_args`` under this key by ``patch_external_draft``.
+@@ -30,6 +33,12 @@
+ # tokens between ``add_request`` and ``propose``. Kept as a module constant so
+ # the producer (patch) and consumer (proposer) never drift apart.
+ EXTERNAL_DRAFT_ATTR = "_external_draft_tokens"
++EXTERNAL_DRAFT_FIRST_VERIFY_KEY = "ascend_external_draft_first_verify"
++EXTERNAL_DRAFT_POLICY_KEY = "ascend_external_draft_rejoin"
++EXTERNAL_DRAFT_FIRST_VERIFY_ATTR = "_external_draft_first_verify"
++EXTERNAL_DRAFT_POLICIES_ATTR = "_external_draft_policies"
++
++logger = logging.getLogger(__name__)
+ 
+ 
+ class AscendExternalDraftProposer(NgramProposer):
+@@ -81,49 +90,51 @@
+         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
+     ) -> list[list[int]]:
+         input_batch = self.runner.input_batch
+-
+         outputs: list[list[int]] = [[] for _ in sampled_token_ids]
+-
+         external_drafts = getattr(input_batch, EXTERNAL_DRAFT_ATTR, None)
+         if not external_drafts:
+             return outputs
+ 
++        first_verify = getattr(input_batch, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR, set())
++        policies = getattr(input_batch, EXTERNAL_DRAFT_POLICIES_ATTR, {})
+         for i, sampled_ids in enumerate(sampled_token_ids):
+-            num_sampled_ids = len(sampled_ids)
+-            if not num_sampled_ids:
++            if not sampled_ids:
+                 continue
+-
+             req_id = input_batch.req_ids[i]
+             if req_id in input_batch.spec_decode_unsupported_reqs:
+                 continue
+-
+             num_tokens = input_batch.num_tokens_no_spec[i]
+             if num_tokens >= input_batch.max_model_len:
+                 continue
+-
+-            # Mirror AscendNgramProposer bookkeeping: place the just-sampled
+-            # (drive) tokens into the cpu token table so the target extend /
+-            # rejection sampler see a coherent sequence.
+-            start_idx = num_tokens
+-            end_idx = start_idx + num_sampled_ids
+-            input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
+-
+-            # One-shot consumption: a draft is only proposed the first time a
+-            # request is seen after add_request. pop() makes the second call
+-            # return [] and resume plain autoregressive decoding.
+-            draft = external_drafts.pop(req_id, [])
+-            if not draft:
+-                continue
+-
+-            # Never exceed the configured speculative budget or the remaining
+-            # sequence room. The first unstable position is already produced
+-            # by the target drive token, so the external draft only covers the
+-            # subsequent positions (see streaming controller contract).
+-            remaining = input_batch.max_model_len - num_tokens - num_sampled_ids
++            end_idx = num_tokens + len(sampled_ids)
++            write_end = min(end_idx, input_batch.max_model_len)
++            input_batch.token_ids_cpu[i, num_tokens:write_end] = sampled_ids[:write_end - num_tokens]
++            remaining = input_batch.max_model_len - end_idx
+             max_draft_len = min(self.k, remaining)
+             if max_draft_len <= 0:
+                 continue
+ 
+-            outputs[i] = list(draft[:max_draft_len])
++            if req_id not in first_verify:
++                # Preserve the old rollback/shadow one-shot contract.
++                draft = external_drafts.pop(req_id, [])
++                outputs[i] = list(draft[:max_draft_len])
++                continue
+ 
++            candidate = external_drafts.get(req_id, [])
++            prompt_len = input_batch.num_prompt_tokens[i]
++            # token_ids_cpu before end_idx is confirmed target output only;
++            # speculative IDs at later positions must not influence lookup.
++            if end_idx < prompt_len:
++                continue
++            confirmed = tuple(int(token) for token in
++                              input_batch.token_ids_cpu[i, prompt_len:end_idx])
++            outputs[i] = list(next_draft(
++                candidate, confirmed, policy=policies.get(req_id, "ngram_1"),
++                max_draft_tokens=max_draft_len))
++            mismatch = first_mismatch(candidate, confirmed)
++            strategy = ("aligned" if mismatch is None or mismatch == 0
++                        else policies.get(req_id, "ngram_1"))
++            logger.debug("EXTERNAL_DRAFT_REJOIN request_id=%s confirmed_tokens=%d "
++                         "first_mismatch=%s strategy=%s proposed_tokens=%d",
++                         req_id, len(confirmed), mismatch, strategy, len(outputs[i]))
+         return outputs
+--- a/vllm_ascend/patch/worker/patch_external_draft.py
++++ b/vllm_ascend/patch/worker/patch_external_draft.py
+@@ -42,6 +42,10 @@
+ from vllm_ascend.spec_decode.external_draft_proposer import (
+     EXTERNAL_DRAFT_ATTR,
+     EXTERNAL_DRAFT_EXTRA_ARGS_KEY,
++    EXTERNAL_DRAFT_FIRST_VERIFY_ATTR,
++    EXTERNAL_DRAFT_FIRST_VERIFY_KEY,
++    EXTERNAL_DRAFT_POLICIES_ATTR,
++    EXTERNAL_DRAFT_POLICY_KEY,
+     AscendExternalDraftProposer,
+ )
+ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+@@ -86,6 +90,10 @@
+ 
+     if not hasattr(self, EXTERNAL_DRAFT_ATTR):
+         setattr(self, EXTERNAL_DRAFT_ATTR, {})
++    if not hasattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR):
++        setattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR, set())
++    if not hasattr(self, EXTERNAL_DRAFT_POLICIES_ATTR):
++        setattr(self, EXTERNAL_DRAFT_POLICIES_ATTR, {})
+ 
+     drafts = getattr(self, EXTERNAL_DRAFT_ATTR)
+     sampling_params = getattr(request, "sampling_params", None)
+@@ -94,6 +102,12 @@
+         tokens = extra_args.get(EXTERNAL_DRAFT_EXTRA_ARGS_KEY)
+         if tokens:
+             drafts[request.req_id] = list(tokens)
++            if extra_args.get(EXTERNAL_DRAFT_FIRST_VERIFY_KEY, False):
++                getattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR).add(request.req_id)
++                policy = extra_args.get(EXTERNAL_DRAFT_POLICY_KEY, 'ngram_1')
++                if policy not in ('aligned', 'ngram_1', 'ngram_2', 'ngram_3'):
++                    raise ValueError(f'invalid external draft rejoin policy: {policy}')
++                getattr(self, EXTERNAL_DRAFT_POLICIES_ATTR)[request.req_id] = policy
+ 
+     return req_index
+ 
+@@ -102,6 +116,12 @@
+     drafts = getattr(self, EXTERNAL_DRAFT_ATTR, None)
+     if drafts is not None:
+         drafts.pop(req_id, None)
++    first_verify = getattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR, None)
++    if first_verify is not None:
++        first_verify.discard(req_id)
++    policies = getattr(self, EXTERNAL_DRAFT_POLICIES_ATTR, None)
++    if policies is not None:
++        policies.pop(req_id, None)
+     return _original_remove_request(self, req_id, *args, **kwargs)
+ 
+ 
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -138,6 +138,7 @@
+     AscendExtractHiddenStatesProposer,
+ )
+ from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
++from vllm_ascend.spec_decode.external_draft_proposer import AscendExternalDraftProposer
+ from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
+ from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
+ from vllm_ascend.spec_decode.step3p5 import AscendStep3p5MTPProposer
+@@ -1625,6 +1626,8 @@
+         if not self.drafter:
+             # Speculative decoding is not enabled.
+             draft_token_ids = None
++        elif isinstance(self.drafter, AscendExternalDraftProposer):
++            draft_token_ids = self.drafter.propose(valid_sampled_token_ids)
+         elif isinstance(self.drafter, AscendNgramProposer):
+             if vllm_version_is("0.23.0"):
+                 draft_token_ids = self.drafter.propose(valid_sampled_token_ids)
+--- /dev/null
++++ b/vllm_ascend/spec_decode/external_draft_rejoin.py
+@@ -0,0 +1,57 @@
++"""Choose external drafts using only confirmed target output tokens.
++
++The first draft is submitted by the scheduler before the target's first
++forward. After a verifier correction, the proposer calls ``next_draft`` with
++the confirmed output prefix. This module is deliberately independent of vLLM
++and NPU imports so the request-local policy can be tested on a CPU.
++"""
++
++from __future__ import annotations
++
++from typing import Literal, Sequence
++
++
++RejoinPolicy = Literal["aligned", "ngram_1", "ngram_2", "ngram_3"]
++POLICIES = ("aligned", "ngram_1", "ngram_2", "ngram_3")
++
++
++def first_mismatch(candidate: Sequence[int], confirmed: Sequence[int]) -> int | None:
++    """Return the first proven mismatch; do not inspect future target output."""
++    for index, (draft, target) in enumerate(zip(candidate, confirmed)):
++        if draft != target:
++            return index
++    return None
++
++
++def next_draft(
++    candidate: Sequence[int],
++    confirmed: Sequence[int],
++    *,
++    policy: RejoinPolicy = "ngram_1",
++    max_draft_tokens: int,
++) -> tuple[int, ...]:
++    """Select a continuation after the sampled/verifier-confirmed prefix.
++
++    First-token mismatch uses the candidate at the same absolute output
++    position. Later mismatch uses the rightmost exact n-gram anchor in the
++    candidate. Before any mismatch, the aligned remaining suffix is used.
++    The caller must pass only committed target output IDs, never speculative
++    IDs still waiting for verification.
++    """
++    if policy not in POLICIES:
++        raise ValueError(f"invalid external draft rejoin policy: {policy}")
++    if max_draft_tokens < 1:
++        raise ValueError("max_draft_tokens must be positive")
++    position = len(confirmed)
++    mismatch = first_mismatch(candidate, confirmed)
++    if policy == "aligned" or mismatch is None or mismatch == 0:
++        return tuple(candidate[position:position + max_draft_tokens])
++
++    n = int(policy[-1])
++    if position < n:
++        return ()
++    anchor = tuple(confirmed[-n:])
++    for next_index in range(len(candidate) - 1, n - 1, -1):
++        if tuple(candidate[next_index - n:next_index]) == anchor:
++            return tuple(candidate[next_index:next_index + max_draft_tokens])
++    return ()

@@ -115,39 +115,29 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         async def producer(request, budget):
             self.fail("oversized draft must not reach producer")
 
-        policy = replace(self.policy, max_rollback_draft_tokens=2,
-                         max_candidate_tokens=5)
+        policy = replace(self.policy, max_rollback_draft_tokens=3,
+                         max_candidate_tokens=3)
         coordinator = PreSpecCoordinator(producer, policy, clock=lambda: self.now)
-        request = replace(self.request(), rollback_tokens=(20, 21, 22))
+        request = replace(self.request(), rollback_tokens=(20, 21, 22, 23))
         decision = coordinator.maybe_start(request, self.load(), 200)
         self.assertEqual(decision.reason, "rollback_draft_exceeds_kmax")
         self.assertFalse(decision.launched)
 
-    async def test_candidate_over_kmax_is_not_submitted_to_formal_proposer(self):
-        probes = []
-
+    async def test_candidate_budget_over_kmax_rejected_at_configuration(self):
         async def producer(request, budget):
             return (19, 20, 21, 22)
 
         policy = replace(self.policy, max_rollback_draft_tokens=2,
                          max_candidate_tokens=4)
-        coordinator = PreSpecCoordinator(producer, policy, clock=lambda: self.now,
-                                         shadow_only=False, on_probe=probes.append)
-        coordinator.maybe_start(self.request(), self.load(), 200)
-        await asyncio.sleep(0)
-        candidate = coordinator.begin_authoritative_chunk(
-            "ws-1", audio_epoch=1, prefix_version=2,
-            full_audio_end_samples=64_000, window_id=0)
-        self.assertIsNone(candidate)
-        self.assertEqual(probes[-1].status, "candidate_exceeds_kmax")
-        coordinator.end_authoritative_chunk("ws-1", audio_epoch=1, window_id=0)
-        await coordinator.close_session("ws-1")
+        with self.assertRaisesRegex(ValueError, "candidate budget must fit"):
+            PreSpecCoordinator(producer, policy, clock=lambda: self.now,
+                               shadow_only=False)
 
-    async def test_candidate_draft_starts_after_shadow_first_token(self):
+    async def test_candidate_draft_includes_shadow_first_token(self):
         async def producer(request, budget):
             return (19, 20, 21)
 
-        policy = replace(self.policy, max_rollback_draft_tokens=2,
+        policy = replace(self.policy, max_rollback_draft_tokens=4,
                          max_candidate_tokens=4)
         coordinator = PreSpecCoordinator(producer, policy, clock=lambda: self.now,
                                          shadow_only=False)
@@ -157,7 +147,7 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "ws-1", audio_epoch=1, prefix_version=2,
             full_audio_end_samples=64_000, window_id=0)
         self.assertEqual(candidate.token_ids, (19, 20, 21))
-        self.assertEqual(candidate.formal_draft_token_ids, (20, 21))
+        self.assertEqual(candidate.formal_draft_token_ids, (19, 20, 21))
         coordinator.end_authoritative_chunk("ws-1", audio_epoch=1, window_id=0)
         await coordinator.close_session("ws-1")
 
@@ -352,7 +342,7 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         candidate = coordinator.claim_formal_candidate(
             "ws-1", 1, window_id=1, prefix_version=2,
             full_audio_end_samples=62_000)
-        self.assertEqual(candidate.formal_draft_token_ids, (20, 21))
+        self.assertEqual(candidate.formal_draft_token_ids, (19, 20, 21))
         self.assertEqual(probes[-1].status, "ready_consumed")
         coordinator.finish_formal("ws-1", 1, window_id=1)
         await coordinator.close_session("ws-1")
@@ -437,7 +427,7 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         candidate = coordinator.claim_formal_candidate(
             "ws-1", 1, window_id=1, prefix_version=2,
             full_audio_end_samples=64_000)
-        self.assertEqual(candidate.formal_draft_token_ids, (20, 21, 30))
+        self.assertEqual(candidate.formal_draft_token_ids, (19, 20, 21, 30))
         self.assertTrue(candidate.is_partial)
         self.assertEqual(probes[-1].status, "partial_ready_consumed")
         await asyncio.wait_for(cancelled.wait(), 0.2)
@@ -488,7 +478,7 @@ class PreSpecCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         candidate = coordinator.begin_authoritative_chunk(
             "ws-1", audio_epoch=1, window_id=0, prefix_version=2,
             full_audio_end_samples=64_000)
-        self.assertEqual(candidate.formal_draft_token_ids, (20, 21, 30))
+        self.assertEqual(candidate.formal_draft_token_ids, (19, 20, 21, 30))
         self.assertTrue(candidate.is_partial)
         coordinator.end_authoritative_chunk("ws-1", audio_epoch=1, window_id=0)
         await coordinator.close_session("ws-1")

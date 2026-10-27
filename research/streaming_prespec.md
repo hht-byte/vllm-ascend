@@ -5,6 +5,7 @@
 - `commit_overlap.py` 用现有逐 commit JSONL/CSV 检查前一条正式 commit 的重叠；若提供服务 DEBUG 日志，还检查**同一段内流式 chunk 推理与 commit 等待**的重叠。
 - `streaming_prespec.py` 管理中点 shadow 请求、低负载 admission、候选版本、正式边界取消和 shadow 候选质量评估。
 - `streaming_prespec_helpers.py` 提供三个模型 helper 的实现；服务只需接入原有请求打包代码，并映射本地音频/token 字段，见第四节。
+- `streaming_prespec_formal_args.py` 为正式 chunk/finish 打包完整候选或旧回滚草稿；引擎首次验证补丁见 [实施说明](external_draft_first_verify_v023.md)。
 
 这些文件可以复制到 910B 服务项目，模块导入不依赖 vLLM/Ascend。当前仓库没有运行中的 `realtime_connection.py` 和 `qwen3_asr_async.py`，实际请求打包仍需接到服务已有的回滚投机实现；**只有协调器、没有模型接线时不会发送任何伪请求**。
 
@@ -34,7 +35,7 @@ python commit_overlap.py --commits baseline-c20-commits.jsonl \
 
 #### 步骤 1：复制模块并添加 import
 
-把本仓库的 `research/streaming_prespec.py` 和 `research/streaming_prespec_helpers.py` 一起复制到服务项目的 `qwen_asr/inference/`。在 `qwen3_asr_async.py` 顶部新增：
+把本仓库的 `research/streaming_prespec.py`、`research/streaming_prespec_helpers.py` 和 `research/streaming_prespec_formal_args.py` 一起复制到服务项目的 `qwen_asr/inference/`。在 `qwen3_asr_async.py` 顶部新增：
 
 ```python
 from qwen_asr.inference.streaming_prespec import (
@@ -43,6 +44,9 @@ from qwen_asr.inference.streaming_prespec import (
 )
 from qwen_asr.inference.streaming_prespec_helpers import (
     PreSpecModelHelpers, snapshot_stream_audio,
+)
+from qwen_asr.inference.streaming_prespec_formal_args import (
+    formal_external_draft_extra_args,
 )
 ```
 
@@ -58,7 +62,7 @@ from qwen_asr.inference.streaming_prespec_helpers import (
 def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
                    candidate_tokens=None, on_probe=None,
                    admission_mode="force", shadow_only=True,
-                   max_active_shadows=0):
+                   max_active_shadows=0, rejoin_policy="ngram_1"):
     # 仅在服务启动、连接尚未创建时调用一次。
     self.prespec = None
     if not enabled:
@@ -66,9 +70,14 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
     if kmax <= 0 or chunk_size_sec <= 0:
         raise ValueError("prespec requires positive kmax, budget and chunk size")
     if candidate_tokens is None:
-        candidate_tokens = kmax + 1
+        candidate_tokens = kmax
     if candidate_tokens < 3:
         raise ValueError("candidate budget needs first token, draft and continuation")
+    if candidate_tokens > kmax:
+        raise ValueError("candidate budget must fit engine kmax")
+    if rejoin_policy not in ("aligned", "ngram_1", "ngram_2", "ngram_3"):
+        raise ValueError("invalid prespec rejoin policy")
+    self.prespec_rejoin_policy = rejoin_policy
     midpoint_samples = int(chunk_size_sec * 16000 / 2)
     if midpoint_samples <= 0:
         raise ValueError("prespec midpoint must contain at least one sample")
@@ -90,11 +99,11 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
     )
 ```
 
-这个方法创建协调器并保存 engine 引用。`admission_mode="force"`、`shadow_only=True` 是初次受控实验的默认值；验证手册使用启动 parser 参数显式覆盖。`kmax` 是引擎 proposer 能接收的 external draft 上限，`candidate_tokens` 是 shadow 请求的 `max_tokens`，不再用 `min(candidate_tokens, kmax)` 混成一个预算。默认候选预算为 `kmax+1`：第一个位置由 target 采样，后面最多 `kmax` 个候选 token 可供正式请求提交。旧草稿加首 token、至少一个续写 token 放不下时会跳过。显式设置更大的候选预算时，若最终可提交的候选后缀超过 `kmax`，正式边界会返回 `candidate_exceeds_kmax`，避免 proposer 再次静默截断。`self._run_prespec` 已由 mixin 提供；第四节的 `_pack_stream_request` 接到已有实现前仍使用 `enabled=False`。`on_probe` 可传现有非阻塞日志回调；未传时不会自动输出 probe 日志。
+这个方法创建协调器并保存 engine 引用。完整预投机候选 `C[0:]` 在目标首次执行前进入 verifier，首 token 也占一个 `kmax` 槽位，因此候选预算默认等于 `kmax`，显式值也不能超过它。旧草稿加候选首 token、至少一个续写 token 放不下时跳过。回滚草稿与 shadow 旧草稿仍沿用原有跳首 token 合同。引擎补丁与服务调用见 [首次验证实施说明](external_draft_first_verify_v023.md)。
 
 `max_active_shadows=0` 表示协调器不设进程级候选并发上限，各连接可同时运行候选；实际调度和容量仍由共享 engine 决定。正整数是可选的进程级上限，负数非法。不要保留旧接线中的 `max_active_shadows=1`，否则替换协调器后仍会把所有连接串行化。
 
-例如引擎 `kmax=8`、默认候选预算 9 时，旧回滚草稿最多 7 个 token 才能同时给首 token 和至少一个新续写留位置；长度恰为 8 时返回 `candidate_budget_insufficient`。把预算改为 10 虽可启动这条 shadow，但若它真输出 10 个 token，正式可提交后缀长 9，仍会以 `candidate_exceeds_kmax` 跳过。要让完整旧草稿和新续写都可提交，必须增大引擎的 `kmax` 或缩短原回滚草稿；不能在服务端静默截断旧草稿。
+例如引擎 `kmax=8`、默认候选预算 8 时，旧回滚草稿最多 6 个 token 才能同时给首 token 和至少一个新续写留位置；长度为 7 时返回 `candidate_budget_insufficient`。需要更多续写时必须提高引擎 `kmax` 或缩短旧回滚草稿。
 
 #### 步骤 3：修改 `AsyncLLM()` 的返回位置
 
@@ -237,7 +246,7 @@ new_audio_samples = current_audio_end_samples - last_formal_audio_end_samples
 |---|---|---|
 | `prefix_text` / `stable_prefix_token_ids` | L486–518 从 `state._raw_decoded` 得到的前缀文本及对应 token IDs；固定前缀阶段 `prefix_text=""` | 实际 prompt 文本仍按 `state.prompt_raw + prefix_text` 构造；token IDs 用于快照记录，不自行拼到多模态 prompt |
 | `rollback_draft_token_ids` | 上一轮输出中，本次需要重新验证的回滚后缀 | 已实现的 external draft 字段 |
-| `candidate_token_ids` | shadow 请求的完整原始输出，含其首个 sampled token | 仅暂存；下一正式请求只把 `candidate_token_ids[1:]` 作为 external draft |
+| `candidate_token_ids` | shadow 请求的完整原始输出，含其首个 sampled token | 仅暂存；下一正式请求把完整 `candidate_token_ids` 作为首次验证草稿 |
 
 “保留前缀”只描述当前回滚算法的拆分，不额外声称这些文本永远不会变化。协调器原有字段 `stable_prefix_tokens`、`rollback_tokens`、`Candidate.token_ids` 分别记录前缀 IDs、回滚草稿和候选。`prefix_text` 在模型扩展快照中单独保存：正式请求原本拼的是文本，不能由 token IDs 猜测或重新解码来代替。
 
@@ -249,10 +258,10 @@ new_audio_samples = current_audio_end_samples - last_formal_audio_end_samples
       external draft    [21, 22]
 引擎：先采样 20 → 验证 21 → 修正 22 为 99 → 继续生成 30
 返回：candidate_token_ids = (20, 21, 99, 30)
-正式请求提交的 external draft = (21, 99, 30)
+正式请求首次验证的 external draft = (20, 21, 99, 30)
 ```
 
-候选既不包含 `[10, 11]`，也不保留被拒绝的 `22`。**验证与续写在同一次 engine 请求中完成**；服务不拆成两次请求，不自行重建验证后的 KV。对用户给出的 proposer，target 先采样首 token，再提出 external draft；因此启动前要求 `candidate_tokens >= 1 + len(rollback_draft_token_ids) + 1`，分别为首 token、完整旧草稿和至少一个新续写位置。旧草稿超过 `kmax` 返回 `rollback_draft_exceeds_kmax`，预算不足返回 `candidate_budget_insufficient`；不再截掉草稿尾部。shadow 原始输出的首 token **只在正式提交时去掉一次**，旧回滚草稿已经按原规则去首，不能再去。这个检查是**静态上限**，EOS、修正或提前取消仍可能没有续写，实际 proposer 还可能因模型上下文不足缩短草稿，需要在 910B 核实有效长度和首 token 对齐。
+候选既不包含 `[10, 11]`，也不保留被拒绝的 `22`。**验证与续写在同一次 engine 请求中完成**；服务不拆成两次请求，不自行重建验证后的 KV。shadow 旧回滚草稿仍在其首 token 采样后验证；正式目标在首次执行前取得完整候选并验证 `20`。因此启动前要求 `candidate_tokens >= 1 + len(rollback_draft_token_ids) + 1`，而正式首次提交要求 `len(candidate_token_ids) <= kmax`。旧回滚草稿不再额外去首，候选也不去首。EOS、修正或提前取消仍可能使候选没有续写；引擎若无法完整调度首轮草稿，必须明确记录 fallback。
 
 #### 4.2 哪些已提供，哪些必须从你的函数搬出
 
@@ -595,7 +604,7 @@ helper 使用 `engine.generate(**kwargs)` 返回异步生成器、`await engine.
 
 普通 vLLM 输出不包含 prompt token，因此代码没有再切掉 `len(stable_prefix_token_ids)`；否则会丢失候选开头。引擎完成标记之后才发布候选。若你修改过输出为“整个序列”或只报告增量，先还原此合同。
 
-按你提供的 external proposer，`propose(sampled_token_ids, ...)` 在 target 已经采样首 token 后运行，返回的 draft 被接在这些 `sampled_ids` 后面。故旧回滚草稿沿用 `_split_stream_rollback()` 已去首的结果；shadow `RequestOutput.token_ids` 是原始生成序列，正式请求使用 `Candidate.formal_draft_token_ids`（即 raw `[1:]`）。这一步是根据所给 proposer 代码作出的对齐推断：在 910B 用首 token ID、原始候选长度、提交草稿长度与 verifier 有效草稿长度核对；`max_model_len` 不足时 proposer 仍可能截短草稿。
+引擎首次验证补丁将预投机候选 `Candidate.formal_draft_token_ids`（即完整 `C[0:]`）在 target 首次执行前排入 scheduler；运行时先并行验证，再由 proposer 按已确认前缀选择重接草稿。只有这个候选分支带 `ascend_external_draft_first_verify=True`；原回滚与 shadow 旧草稿继续在目标首 token 之后提交。补丁和回退条件见 [首次验证实施说明](external_draft_first_verify_v023.md)。
 
 shadow 不调用正式转写/finish/`_yield_delta_text`，不发送客户端事件、不修改正式 state；引擎全局统计仍可能包含 shadow，需按 request ID 单独分析。
 
@@ -639,7 +648,8 @@ try:
                        else rollback_draft_token_ids)
     # L520–554：原 prompt_raw + prefix 和 adapter/TokensPrompt 分支。
     # 提前构造 L559–568 的正式 SamplingParams，用 draft_token_ids 写入
-    # ascend_external_draft；这一步通过 4.2 的 _pack_stream_request 复用。
+    # ascend_external_draft。candidate 非空时还要设置
+    # ascend_external_draft_first_verify=True 和 rejoin policy。
     # L557：照常 yield ChunkInferenceEvent。
     # 正式请求仍保持 temperature=0、max_tokens=4096、DELTA。
     # L583–596：继续 _yield_delta_text，照常 yield 客户端 delta。
@@ -653,7 +663,7 @@ finally:
 
 上段是**插入位置示意**：注释所列的 L520–606 必须保留原函数实际代码，不能把注释当作代码替换。最小版不采集正式请求的原始 token IDs，也不修改 `_yield_delta_text()`。`end_authoritative_chunk()` 不传 `target_continuation_tokens` 时只清理候选，返回 `None`；不得把缺失的对照数据记作“接受 0 个 token”。若需要离线候选质量评估，按 [验证手册的可选采集挂点](streaming_prespec_validation.md) 从正式请求的 DELTA 输出流收集 token IDs；不能初始化 `raw_target_tokens = ()` 后不更新便传入。`try/finally` 覆盖 L557–606 以及真正的生成迭代；清理调用者时显式退出生成器，使 finally 执行。
 
-`shadow_only=True` 时 candidate 恒为 None，正式路径仍用原回滚草稿；默认只记录候选是否赶上正式边界。若按验证手册另行采集正式输出 token，可离线计算原始输出前缀匹配和跳过首 token 后的草稿前缀匹配；它们不是 verifier 接受数。若候选只有首 token、无可提交后续 token，probe 为 `candidate_no_draft`；若后续 token 长度超过 `kmax`，probe 为 `candidate_exceeds_kmax`，两者都不进入正式请求。切换消费模式后，预投机候选仍经过现有 verifier 在完整正式音频上重新验证；实际接受数从引擎 verifier 日志获取。commit 的 residual finish 使用相同的领取与验证规则，接线见下一节。
+`shadow_only=True` 时 candidate 恒为 None，正式路径仍用原回滚草稿。`raw_matched_prefix_tokens` 是完整候选与正式输出的离线比较，旧字段 `draft_matched_prefix_tokens` 仍比较两者各自跳过首 token 的后缀，仅为历史报告兼容；实际 verifier 接受数从引擎日志读取。正式 chunk 和 finish 都必须为被消费的候选设置首次验证标记，接线见 [首次验证实施说明](external_draft_first_verify_v023.md)。
 
 ### 六、commit 与清理：给出插入代码和字段初始化
 
@@ -746,15 +756,18 @@ if (prespec is not None and prespec_ws_id is not None
     )
 
 # 与中点及正式 chunk 采用同一拆分结果；不要重新 tokenize 文本，
-# 也不要把候选首 token 拼进 prompt。
+# 也不要把候选首 token 拼进 prompt；它作为首个待验证 token。
 finish_draft_token_ids = (
     candidate.formal_draft_token_ids if candidate is not None
     else rollback_draft_token_ids
 )
-sampling_params.extra_args = {
-    **(sampling_params.extra_args or {}),
-    "ascend_external_draft": list(finish_draft_token_ids),
-}
+sampling_params.extra_args = formal_external_draft_extra_args(
+    sampling_params.extra_args,
+    candidate_tokens=(finish_draft_token_ids if candidate is not None else None),
+    rollback_tokens=rollback_draft_token_ids,
+    kmax=self.kmax,
+    rejoin_policy=self.prespec_rejoin_policy,
+)
 ```
 
 `sampling_params` 必须是本次 finish 请求专用的原有对象；保留其 temperature、max_tokens、output_kind、stop/EOS 等参数和完整音频 prompt，**只替换** `ascend_external_draft` 的值。若正式 finish 用 `_pack_stream_request(...)` 打包，传入相同的 `prefix_text`、`stable_prefix_token_ids` 与 `finish_draft_token_ids`，不要重复写一遍 `extra_args`。正式结果沿用原 finish 的输出拼接与解析位置，并核对稳定前缀恰好包含一次；`finish_...` `request_id`、`engine.generate(...)` 和状态写回位置保持原有时序。紧邻原 `engine.generate(...)` 前加一条来源日志：
@@ -874,7 +887,7 @@ if self.prespec is not None:
 
 共享的单个协调器按连接管理生命周期：连接 A 的 chunk/commit 不阻止连接 B 启动候选，也不取消或删除 B 的候选；同一连接的正式请求仍保护本连接的状态和候选边界。默认 `max_active_shadows=0`，允许多连接候选并行；正值才启用额外的全局容量限制。`PRESPEC_PROBE status=discarded_before_boundary` 表示该窗口曾启动候选、但候选在边界前已被丢弃，不能解释为曾被正式请求接受；它替代旧的 `previously_used` 状态。
 
-首次使用 `shadow_only=True`、默认候选预算 `kmax+1` 和 `admission_mode="force"`，配合现有旁路监测打通链路。`force` 不再因其他连接的 commit 生命周期否决新候选；它仍检查本连接状态、中点、预算和截止时间。在线 `gated` 继续根据共享设备的新鲜队列/利用率和实测耗时预算准入，可能因共享负载拒绝启动；生命周期隔离不代表设备资源隔离。约 2 s 的 `npu-smi` 读数不能冒充默认 200 ms 的 admission 读数。
+首次使用 `shadow_only=True`、默认候选预算 `kmax` 和 `admission_mode="force"`，配合现有旁路监测打通链路。`force` 不再因其他连接的 commit 生命周期否决新候选；它仍检查本连接状态、中点、预算和截止时间。在线 `gated` 继续根据共享设备的新鲜队列/利用率和实测耗时预算准入，可能因共享负载拒绝启动；生命周期隔离不代表设备资源隔离。约 2 s 的 `npu-smi` 读数不能冒充默认 200 ms 的 admission 读数。
 
 验收只保留直接相关的检查：
 

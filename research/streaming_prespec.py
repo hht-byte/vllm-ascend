@@ -61,7 +61,7 @@ class AdmissionPolicy:
     safety_guard_ms: float = 100.0
     max_active_shadows: int = 0  # 0 disables the coordinator-wide concurrency cap.
     max_rollback_draft_tokens: int = 8
-    max_candidate_tokens: int = 9
+    max_candidate_tokens: int = 8
 
 
 @dataclass(frozen=True)
@@ -86,8 +86,8 @@ class Candidate:
 
     @property
     def formal_draft_token_ids(self) -> tuple[int, ...]:
-        """The pasted proposer consumes drafts after target's first sampled token."""
-        return self.token_ids[1:]
+        """Full draft, including token zero, for first-prefill verification."""
+        return self.token_ids
 
 
 @dataclass(frozen=True)
@@ -223,6 +223,8 @@ class PreSpecCoordinator:
             raise ValueError("admission_mode must be gated or force")
         if policy.max_rollback_draft_tokens <= 0 or policy.max_candidate_tokens <= 0:
             raise ValueError("draft and candidate budgets must be positive")
+        if policy.max_candidate_tokens > policy.max_rollback_draft_tokens:
+            raise ValueError("candidate budget must fit the engine speculative kmax")
         if policy.max_active_shadows < 0:
             raise ValueError("max_active_shadows must be nonnegative (0 means no cap)")
         self.clock = clock
@@ -317,7 +319,9 @@ class PreSpecCoordinator:
 
         The producer calls this after each usable RequestOutput. The snapshot
         belongs to the active request/task only; the formal path may later use
-        it after canceling that task. A one-token snapshot has no formal draft.
+        it after canceling that task. A one-token snapshot has no repaired
+        rollback suffix or continuation, so it is not offered to the formal
+        request even though first-prefill verification could check one token.
         """
         key = (request.session_id, request.audio_epoch, request.window_id)
         if (self._tasks.get(key) is not asyncio.current_task()
@@ -519,7 +523,7 @@ class PreSpecCoordinator:
             self._emit_probe(key, boundary, started_ns, "candidate_no_draft", candidate)
             return None
         if (candidate.is_partial and
-                len(candidate.formal_draft_token_ids) <= candidate.rollback_draft_length):
+                len(candidate.formal_draft_token_ids) <= candidate.rollback_draft_length + 1):
             self._emit_probe(key, boundary, started_ns,
                              "partial_not_longer_than_rollback", candidate)
             return None
@@ -641,7 +645,10 @@ class PreSpecCoordinator:
 
         raw_match = matched_prefix_len(candidate.token_ids,
                                        target_continuation_tokens)
-        draft_match = matched_prefix_len(candidate.formal_draft_token_ids,
+        # Keep the historical post-first comparison for existing reports.
+        # The actual first-pass draft now includes token zero; raw_match is
+        # the first-inclusive comparison.
+        draft_match = matched_prefix_len(candidate.token_ids[1:],
                                          target_continuation_tokens[1:])
         logger.info(
             "PRESPEC_MATCH_TOKENS ws_id=%s seg=%s window=%s mode=%s "

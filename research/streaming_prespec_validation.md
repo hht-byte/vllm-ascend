@@ -24,7 +24,7 @@ A/B/C 保持同一服务代码、模型、图配置、回滚参数、chunk 长�
 rg -n 'ArgumentParser|parse_args|AsyncLLM\(' qwen_asr
 ```
 
-在现有 `parser.parse_args()` **之前**增加四个参数；保留其余已有参数：
+在现有 `parser.parse_args()` **之前**增加五个参数；保留其余已有参数：
 
 ```python
 parser.add_argument(
@@ -37,15 +37,19 @@ parser.add_argument(
 )
 parser.add_argument(
     "--prespec-candidate-tokens", type=int, default=None,
-    help="shadow output max_tokens; omitted means auto (engine kmax + 1)",
+    help="shadow output max_tokens; omitted means engine kmax",
 )
 parser.add_argument(
     "--prespec-max-active-shadows", type=int, default=0,
     help="process-wide shadow limit; 0=no coordinator limit; negative is invalid",
 )
+parser.add_argument(
+    "--prespec-rejoin-policy", choices=("aligned", "ngram_1", "ngram_2", "ngram_3"),
+    default="ngram_1", help="rejoin after later candidate mismatch",
+)
 ```
 
-这里 `default=None` 是“未显式指定”的标记：parser 阶段尚未取得引擎 `kmax`，所以不能直接写 `default=kmax + 1`。启动时将 `None` 依次传给 `AsyncLLM()`、`enable_prespec()`；仅在启用预投机后，由 `enable_prespec()` 将它解析为 `kmax + 1`。显式传入整数时原样使用，并受下文预算检查约束。
+这里 `default=None` 是“未显式指定”的标记：parser 阶段尚未取得引擎 `kmax`。启动时将 `None` 传给 `AsyncLLM()`、`enable_prespec()`；启用预投机后解析为 `kmax`。完整候选含首 token，必须满足 `candidate_tokens <= kmax`；原先 `kmax=15, candidate_budget=16` 的配置应改为预算 15 或提高引擎 `kmax`。
 
 你现在的调用是 `Qwen3ASRModelAsync.AsyncLLM(**base_config)`。保留 `base_config` 原内容，在同一调用上显式追加 parser 参数：
 
@@ -56,18 +60,20 @@ model = Qwen3ASRModelAsync.AsyncLLM(
     prespec_admission=args.prespec_admission,
     prespec_candidate_tokens=args.prespec_candidate_tokens,
     prespec_max_active_shadows=args.prespec_max_active_shadows,
+    prespec_rejoin_policy=args.prespec_rejoin_policy,
 )
 ```
 
-`base_config` 不能同时含有这四个 `prespec_...` 名字，否则 Python 会因重复关键字报错。若原调用的结果变量不是 `model`，保留原变量名。
+`base_config` 不能同时含有这五个 `prespec_...` 名字，否则 Python 会因重复关键字报错。若原调用的结果变量不是 `model`，保留原变量名。
 
-在 `qwen3_asr_async.py` 的 `AsyncLLM()` 现有类方法签名增加四个显式形参；若签名有 `**kwargs`，把它们放在 `**kwargs` **之前**。不能只在调用处传参，否则可能得到 `unexpected keyword argument`，或落入 `**kwargs` 后被错误转发给 vLLM engine：
+在 `qwen3_asr_async.py` 的 `AsyncLLM()` 现有类方法签名增加五个显式形参；若签名有 `**kwargs`，把它们放在 `**kwargs` **之前**。不能只在调用处传参，否则可能得到 `unexpected keyword argument`，或落入 `**kwargs` 后被错误转发给 vLLM engine：
 
 ```python
 prespec_mode: str = "off",
 prespec_admission: str = "force",
 prespec_candidate_tokens: int | None = None,
 prespec_max_active_shadows: int = 0,
+prespec_rejoin_policy: str = "ngram_1",
 ```
 
 这里假定现有入口用 `argparse` 且解析结果名为 `args`；若名字不同，只替换该局部变量名。服务启动脚本不在本仓库，无法填写其余既有 CLI 选项。
@@ -84,12 +90,17 @@ rg -n -A 35 'def enable_prespec' qwen_asr/inference/qwen3_asr_async.py
 def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
                    candidate_tokens=None, on_probe=None,
                    admission_mode="force", shadow_only=True,
-                   max_active_shadows=0):
+                   max_active_shadows=0, rejoin_policy="ngram_1"):
     # 保留主接入文档中已有的 enabled/kmax/engine 校验。
     if candidate_tokens is None:
-        candidate_tokens = kmax + 1
+        candidate_tokens = kmax
     if candidate_tokens < 3:
         raise ValueError("candidate budget needs first token, draft and continuation")
+    if candidate_tokens > kmax:
+        raise ValueError("candidate budget must fit engine kmax")
+    if rejoin_policy not in ("aligned", "ngram_1", "ngram_2", "ngram_3"):
+        raise ValueError("invalid prespec rejoin policy")
+    self.prespec_rejoin_policy = rejoin_policy
     # midpoint_samples 沿用主接入文档中的计算。
     self.prespec = PreSpecCoordinator(
         producer=self._logged_prespec_producer,
@@ -128,6 +139,7 @@ model.enable_prespec(
     candidate_tokens=prespec_candidate_tokens,
     admission_mode=prespec_admission,
     max_active_shadows=prespec_max_active_shadows,
+    rejoin_policy=prespec_rejoin_policy,
     shadow_only=(prespec_mode != "consume"),
     on_probe=log_prespec_probe if prespec_mode != "off" else None,
 )
@@ -228,13 +240,13 @@ if prespec is not None:
         ws_id, audio_epoch=seg_id, window_id=this_chunk_id)
 ```
 
-不传 `target_continuation_tokens` 表示**只清理候选，不计算匹配长度**，协调器返回 `None`；不能把此结果记为“接受 0 个 token”。C 组仍须在引擎实际处理 `ascend_external_draft` 的验证结果处记录 `request_id`、提交的草稿长度、实际连续接受长度、**首个草稿 token** 是否拒绝、修正 token 数、目标模型前向步数。首个 target token 已在 proposer 之前采样，不属于 external draft。只在 proposer 的 `propose()` 打日志不足以证明草稿被验证；该函数只负责提出 token。先在服务/引擎仓库定位挂点：
+不传 `target_continuation_tokens` 表示**只清理候选，不计算匹配长度**，协调器返回 `None`；不能把此结果记为“接受 0 个 token”。C 组仍须在引擎 verifier 处逐轮记录 `request_id`、实际有效草稿长度与接受数。预投机候选的首 token 由首次 prefill 并行验证；旧回滚草稿仍在正式目标采样首 token 后由 proposer 提出。只在 proposer 的 `propose()` 打日志不足以证明草稿被验证。
 
 ```bash
 rg -n 'ascend_external_draft|def propose\(|accepted.*token|rejected.*token' .
 ```
 
-还要在 910B 的 proposer 处核对 `sampled_ids` 后接入草稿的真实顺序，确认 `requested_draft_len`、`effective_draft_len`、`num_tokens_no_spec`、`max_model_len`；静态 `kmax` 检查不能发现上下文空间不足造成的运行时缩短。正式日志应满足 `candidate_raw_tokens = submitted_draft_tokens + 1`，且 `effective_draft_len = submitted_draft_tokens` 才能把该轮记为“完整提交候选草稿”。
+还要在 910B 的 scheduler 与 verifier 处确认首轮顺序。预投机消费时正式日志应满足 `candidate_raw_tokens = submitted_draft_tokens`，并看到同一正式请求的 `INITIAL_DRAFT status=scheduled draft_tokens=submitted_draft_tokens`；回滚 baseline 不设置首次验证标记，仍在目标首 token 之后由 proposer 提出旧草稿。预算或 encoder 调度导致 `INITIAL_DRAFT status=fallback` 的请求应单列，不能算作首轮并行验证。
 
 若需要**候选与正式输出的离线匹配统计**，不能把旧示例中的 `raw_target_tokens = ()` 原样传入：元组没有采集动作，会一直表示“已观测到空输出”，导致错误的 0 匹配。正式请求仍保持 `output_kind=DELTA`，在原 `_yield_delta_text()` 消费的**同一条正式 vLLM 输出流**上采集原始 token IDs。可给 `_yield_delta_text()` 增加一个可选的 `on_output` 回调，并在它原有的 `async for output in stream` 循环内、处理文本之前调用；不要另起一次 generate，也不要对输出文本重新 tokenize：
 
@@ -291,7 +303,7 @@ finally:
             )
 ```
 
-这段仅展示采集与统计挂点，不能替换原函数的其他实参或原有状态写回。只有观察到 `output.finished` 才传入 token 列表；中断/取消时传 `None`，避免把部分输出或尚未采集的 `()` 算作 0 匹配。完成且确实生成 0 个 token 时，空元组才是有效观测；此时 `target_len=0`，不能解释为候选首 token 不匹配。`raw_matched_prefix_tokens` 比较候选完整原始输出与正式完整原始输出。`draft_matched_prefix_tokens` 比较实际拟提交的候选 `token_ids[1:]` 与正式输出的 `token_ids[1:]`，跳过两个请求各自采样的首 token；例如候选 `(19, 20, 21)`、正式 `(99, 20, 22)` 时，两个值分别是 0 和 1。两者都是 shadow 离线匹配指标，**都不是引擎 verifier 的实际草稿接受数**；后者仍从 verifier 打点取得。候选和正式请求必须使用相同的输出 token 对齐起点（prompt 之后），且这里假设正式请求只有一个 completion。
+这段仅展示采集与统计挂点，不能替换原函数的其他实参或原有状态写回。只有观察到 `output.finished` 才传入 token 列表；中断/取消时传 `None`，避免把部分输出或尚未采集的 `()` 算作 0 匹配。完成且确实生成 0 个 token 时，空元组才是有效观测。`raw_matched_prefix_tokens` 比较完整候选与正式输出，包含首 token；旧字段 `draft_matched_prefix_tokens` 仍比较两个序列各自的 `[1:]`，只为保持已有离线报告可比，**不代表现在实际提交的草稿**。两者都不是 verifier 实际接受数；后者从引擎逐轮打点取得。
 
 finish 复用 `_split_stream_rollback()` 处理 `\ufffd` 时，`on_output` 本身不用改：它只采集 prompt 之后的原始生成 token，不读取或重算稳定前缀。要看 **提前 commit 的 finish 候选匹配统计**，优先按[主接入文档第六节](streaming_prespec.md)让 DELTA 输出的 finish 复用 `_yield_delta_text()` 消费同一条 `finish_...` 流，并通过适配回调收集原始 token IDs。`on_output` 接收单次 `RequestOutput`，不能直接传接收最终 token 元组的 `on_finish_tokens`。完成后的元组通过 `_finish_segment()` 存到本段，再由 `_process_segment()` 的 finally 传给 `finish_formal(..., target_continuation_tokens=...)`。仅在观察到 `output.finished` 后传 token 列表，中断时传 `None`；原 finish 若使用 CUMULATIVE/FINAL_ONLY，先核对 `_yield_delta_text()` 的输出语义，不能直接按 DELTA 累积。这个回调不会改变客户端转写文本或正式请求的输入。
 
@@ -621,7 +633,7 @@ python streaming_prespec_gain.py \
 
 ### 4.2 首次失配后的候选重接：离线初筛
 
-`raw_matched_prefix_tokens=0` 但 `draft_matched_prefix_tokens>0` 的首 token 差异已由当前 `candidate.token_ids[1:]` 方案利用。新增空间是**正式 verifier 中途拒绝后**，下一轮能否再从同一候选取到可验证的后续 token。先对现有 `PRESPEC_MATCH_TOKENS` 日志运行只读回放：
+`raw_matched_prefix_tokens=0` 但 `draft_matched_prefix_tokens>0` 表示首 token 不同、后缀相同；新方案在首次验证失配后用按位置续接尝试这个后缀。正式 verifier 中途拒绝后则按 `--prespec-rejoin-policy` 重接。以下旧日志回放仍以原来的 `candidate[1:]` 实现为基准，不能当作新方案的线上收益：
 
 ```bash
 cp /path/to/vllm-ascend/research/streaming_prespec_rejoin.py ./
