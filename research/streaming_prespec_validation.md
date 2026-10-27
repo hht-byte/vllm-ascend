@@ -674,7 +674,7 @@ python research/streaming_prespec_rejoin.py --log /path/to/consume-c20-new.log \
 python -c 'import json; d=json.load(open("rejoin-summary-full.json")); print("match_events", d["match_events"], "censored_target_count", d["censored_target_count"], "partial_unknown", d["by_candidate_partial"]["unknown"]["match_events"])'
 ```
 
-只把**这一轮**日志传给回放脚本；正常新日志的 `censored_target_count` 与 `partial_unknown` 应为 0。若前者仍大于 0，先核对服务实际加载的 `streaming_prespec.py` 是否已更新；若后者仍大于 0，检查 `PRESPEC_MATCH_TOKENS` 是否带 `candidate_partial=`。旧日志里被截掉的 token 无法从 `ASR_FORMAL_STATS` 的数量或 `Segment done` 文本恢复。在线实现还需让 proposer 保留候选池并在每次正式采样后重新选草稿；当前 `external_drafts.pop(req_id, [])` 只消费一次。随后用相同音频和并发负载比较实际 verifier 轮次、全部非空 commit 的 P95/P99、队列与 NPU 成本。
+只把**这一轮**日志传给回放脚本；新日志的 `censored_target_count` 应为 0。若仍大于 0，先核对服务实际加载的 `streaming_prespec.py` 是否已更新。`partial_unknown` 只有在服务端还输出 `candidate_partial=` 时才会归零；它不影响完整正式 token 的 ngram 回放，只影响取消候选的分组分析。旧日志里被截掉的 token 无法从 `ASR_FORMAL_STATS` 的数量或 `Segment done` 文本恢复。在线实现还需让 proposer 保留候选池并在每次正式采样后重新选草稿；当前 `external_drafts.pop(req_id, [])` 只消费一次。随后用相同音频和并发负载比较实际 verifier 轮次、全部非空 commit 的 P95/P99、队列与 NPU 成本。
 
 ## 5. 门控空档验证：在 force 对比后接入实时负载
 
