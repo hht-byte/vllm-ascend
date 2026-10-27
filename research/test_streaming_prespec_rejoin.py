@@ -74,12 +74,41 @@ class RejoinTest(unittest.TestCase):
         self.assertIsNone(result["first_mismatch_index"])
         self.assertIsNone(result["policies"])
 
-    def test_truncated_target_is_censored_not_replayed(self):
+    def test_truncated_target_replays_aligned_but_not_ngram(self):
         result = analyze_record(
             parse_match_line(log_line((1, 2, 3), (1, 9, 3), target_len=5)),
             kmax=15, eos_token_id=151645)
         self.assertTrue(result["censored"])
-        self.assertIsNone(result["policies"])
+        self.assertEqual(result["skip_reason"], "censored_target")
+        self.assertEqual(result["policies"]["aligned"]["estimated_saved_steps"], 1)
+        self.assertIsNone(result["policies"]["ngram_1"])
+        self.assertIsNone(result["policies"]["ngram_2"])
+        self.assertIsNone(result["policies"]["ngram_3"])
+
+    def test_user_censored_case_has_zero_incremental_aligned_gain(self):
+        result = analyze_record(
+            parse_match_line(log_line((1, 2, 3, 4, 5, 6),
+                                      (1, 2, 3, 4, 9, 8), target_len=12)),
+            kmax=15, eos_token_id=151645)
+        self.assertEqual(result["initial_draft_matched"], 3)
+        self.assertEqual(result["first_mismatch_index"], 4)
+        aligned = result["policies"]["aligned"]
+        self.assertEqual(aligned["attempts"], 1)
+        self.assertEqual(aligned["zero_accept_attempts"], 1)
+        self.assertEqual(aligned["accepted_tokens"], 0)
+        self.assertEqual(aligned["estimated_model_steps"], 7)
+        self.assertEqual(aligned["estimated_saved_steps"], 0)
+
+    def test_censored_aligned_replay_counts_unknown_bonus_token(self):
+        result = analyze_record(
+            parse_match_line(log_line((1, 2, 3, 4, 5, 6),
+                                      (1, 2, 3, 4, 9, 6), target_len=12)),
+            kmax=15, eos_token_id=151645)
+        aligned = result["policies"]["aligned"]
+        self.assertEqual(aligned["accepted_tokens"], 1)
+        self.assertEqual(aligned["autoregressive_steps"], 5)
+        self.assertEqual(aligned["estimated_model_steps"], 6)
+        self.assertEqual(aligned["estimated_saved_steps"], 1)
 
     def test_summary_reports_exclusive_replay_skip_reasons(self):
         examples = (
@@ -93,6 +122,8 @@ class RejoinTest(unittest.TestCase):
                 for c, t, length in examples]
         summary = summarize(rows)
         self.assertEqual(summary["replayed_count"], 1)
+        self.assertEqual(summary["policies"]["aligned"]["evaluated_request_count"], 2)
+        self.assertEqual(summary["policies"]["ngram_1"]["evaluated_request_count"], 1)
         self.assertEqual(summary["excluded_replay_reasons"], {
             "censored_target": 1,
             "no_post_first_draft_mismatch": 1,

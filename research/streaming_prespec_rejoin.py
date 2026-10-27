@@ -9,7 +9,8 @@ This is an offline, token-ID-only replay. It can count opportunities and
 idealized model steps, not actual verifier acceptance or elapsed time. A
 candidate lookup may inspect only already confirmed target tokens; future
 target tokens are used solely to score the proposed draft. Truncated target
-logs are censored and excluded from replay. ``estimated_saved_steps`` is
+logs can still support aligned replay when every candidate position is
+visible; n-gram replay needs the complete target. ``estimated_saved_steps`` is
 relative to one-token autoregressive continuation *after* the existing
 first draft's mismatch, not an observed latency reduction. An accepted
 terminal EOS by itself does not save a model step.
@@ -104,11 +105,12 @@ def _ngram_draft(candidate: tuple[int, ...], confirmed: tuple[int, ...],
 
 def _replay(candidate: tuple[int, ...], target: tuple[int, ...],
             start: int, strategy: str, kmax: int,
-            eos_token_id: int) -> dict:
+            eos_token_id: int, *, target_len: int | None = None) -> dict:
+    horizon = len(target) if target_len is None else target_len
     position = start
     attempts = zero_accept_attempts = accepted_tokens = 0
     accepted_nonterminal_tokens = autoregressive_steps = model_steps = 0
-    while position < len(target):
+    while position < horizon:
         if strategy == "aligned":
             draft = candidate[position:position + kmax]
         else:
@@ -126,7 +128,7 @@ def _replay(candidate: tuple[int, ...], target: tuple[int, ...],
             position += accepted
             # The verifier emits either a correction or a bonus when one
             # more target token exists. At target end it emits no extra token.
-            if position < len(target):
+            if position < horizon:
                 position += 1
         else:
             autoregressive_steps += 1
@@ -139,7 +141,7 @@ def _replay(candidate: tuple[int, ...], target: tuple[int, ...],
         "accepted_nonterminal_tokens": accepted_nonterminal_tokens,
         "autoregressive_steps": autoregressive_steps,
         "estimated_model_steps": model_steps,
-        "estimated_saved_steps": (len(target) - start) - model_steps,
+        "estimated_saved_steps": (horizon - start) - model_steps,
     }
 
 
@@ -162,12 +164,12 @@ def analyze_record(record: dict, *, kmax: int,
             if candidate[position] == target[position]:
                 later_same += 1
                 later_nonterminal += target[position] != eos_token_id
-    if censored:
-        skip_reason = "censored_target"
-    elif first_mismatch_index is None:
+    if first_mismatch_index is None:
         skip_reason = "no_post_first_draft_mismatch"
     elif len(candidate) - 1 > kmax:
         skip_reason = "candidate_draft_exceeds_kmax"
+    elif censored:
+        skip_reason = "censored_target"
     else:
         skip_reason = None
     result = {
@@ -187,37 +189,49 @@ def analyze_record(record: dict, *, kmax: int,
         "policies": None,
     }
     # Current one-shot external drafts over kmax are rejected, rather than
-    # silently shortened. Censored target tails do not permit exact replay.
-    if skip_reason is not None:
+    # silently shortened. A censored target still permits aligned replay if
+    # all candidate positions are visible; later n-gram anchors are unknown.
+    if skip_reason not in (None, "censored_target"):
+        return result
+    if censored and len(target) != len(candidate):
         return result
     start = first_mismatch_index + 1  # verifier's correction is confirmed
     result["policies"] = {
-        name: _replay(candidate, target, start, name, kmax, eos_token_id)
-        for name in ("aligned", "ngram_1", "ngram_2", "ngram_3")
+        "aligned": _replay(candidate, target, start, "aligned", kmax,
+                           eos_token_id, target_len=record["target_len"]),
+        **{
+            name: (None if censored else
+                   _replay(candidate, target, start, name, kmax,
+                           eos_token_id))
+            for name in ("ngram_1", "ngram_2", "ngram_3")
+        },
     }
     return result
 
 
 def summarize(cases: list[dict]) -> dict:
-    replayed = [row for row in cases if row["policies"] is not None]
+    fully_replayed = [row for row in cases if row["skip_reason"] is None]
     policies = {}
     for name in ("aligned", "ngram_1", "ngram_2", "ngram_3"):
+        evaluated = [row["policies"][name] for row in cases
+                     if row["policies"] is not None
+                     and row["policies"][name] is not None]
         policies[name] = {
-            key: sum(row["policies"][name][key] for row in replayed)
+            key: sum(row[key] for row in evaluated)
             for key in ("attempts", "zero_accept_attempts", "accepted_tokens",
                         "accepted_nonterminal_tokens", "autoregressive_steps",
                         "estimated_model_steps", "estimated_saved_steps")
         }
+        policies[name]["evaluated_request_count"] = len(evaluated)
         policies[name]["requests_with_saved_steps"] = sum(
-            row["policies"][name]["estimated_saved_steps"] > 0
-            for row in replayed)
+            row["estimated_saved_steps"] > 0 for row in evaluated)
     return {
         "match_events": len(cases),
         "complete_target_count": sum(not row["censored"] for row in cases),
         "censored_target_count": sum(row["censored"] for row in cases),
         "post_first_draft_mismatch_count": sum(
             row["first_mismatch_index"] is not None for row in cases),
-        "replayed_count": len(replayed),
+        "replayed_count": len(fully_replayed),
         "excluded_replay_reasons": {
             reason: sum(row["skip_reason"] == reason for row in cases)
             for reason in ("censored_target", "no_post_first_draft_mismatch",
@@ -262,7 +276,10 @@ def main() -> None:
     report = {
         "methodology": (
             "Offline token-ID replay after the first mismatch in the existing "
-            "candidate[1:] draft. Only complete target logs are replayed. "
+            "candidate[1:] draft. Censored targets with every candidate "
+            "position visible support aligned replay only; n-gram replay "
+            "requires complete target logs. Policy evaluated_request_count "
+            "can therefore differ from replayed_count. "
             "One verifier attempt is idealized as one model step; "
             "estimated_saved_steps exclude verifier, lookup and contention "
             "cost and are not measured latency or actual acceptance. "
