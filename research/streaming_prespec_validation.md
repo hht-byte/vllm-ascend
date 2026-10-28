@@ -178,6 +178,14 @@ async def _logged_prespec_producer(self, request, budget):
             (time.monotonic_ns() - started_ns) / 1e6,
         )
         raise
+    except TimeoutError:
+        logger.info(
+            "PRESPEC_REQUEST event=timeout ws_id=%s seg=%s window=%s request_id=%s elapsed_ms=%.3f",
+            request.session_id, request.audio_epoch, request.window_id,
+            request.request_id,
+            (time.monotonic_ns() - started_ns) / 1e6,
+        )
+        raise
     except Exception:
         logger.exception(
             "PRESPEC_REQUEST event=failed ws_id=%s seg=%s window=%s request_id=%s",
@@ -195,7 +203,7 @@ async def _logged_prespec_producer(self, request, budget):
     return token_ids
 ```
 
-这里的 `done` 只表示 shadow 引擎生成结束，尚不表示正式请求采纳。**本节日志包装器本身不会收集部分 token**；还必须按[主接入文档 `_run_prespec()` 代码](streaming_prespec.md)在每个 CUMULATIVE `RequestOutput` 到达时调用 `self.prespec.publish_partial(request, candidate_token_ids)`。不要在 `except CancelledError` 才去读取局部变量：协调器在 commit 同步路径里要先保存已输出快照、再取消 shadow，正式请求不能等待取消处理。`cancel` 时若只有首 token 或尚无输出，仍回退到 rollback。若 `cancel` 后底层 NPU 工作仍持续，另看 vLLM 请求结束/abort 日志和资源占用。
+这里的 `done` 只表示 shadow 引擎生成结束，尚不表示正式请求采纳。`asyncio.timeout` 到期会把等待中的 `CancelledError` 转为 `TimeoutError`；这是候选截止时间到达，应记 `event=timeout`，不要归入引擎故障 `event=failed`。**本节日志包装器本身不会收集部分 token**；还必须按[主接入文档 `_run_prespec()` 代码](streaming_prespec.md)在每个 CUMULATIVE `RequestOutput` 到达时调用 `self.prespec.publish_partial(request, candidate_token_ids)`。协调器在超时或 commit 取消后可领取已发布且满足长度、版本和音频截止检查的部分候选；没有可用快照则回退到 rollback。不要在 `except CancelledError` 或 `except TimeoutError` 才去读取局部变量：正式请求不能等待 shadow 的取消处理。若取消后底层 NPU 工作仍持续，另看 vLLM 请求结束/abort 日志和资源占用。
 
 ### 1.3 `realtime_connection.py`：记录中点准入决定
 

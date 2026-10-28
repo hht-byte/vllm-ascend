@@ -505,6 +505,11 @@ class PreSpecCoordinator:
                     self._emit_probe(key, boundary, started_ns, "failed")
                     return None
                 candidate = partial
+            except TimeoutError:
+                if partial is None:
+                    self._emit_probe(key, boundary, started_ns, "timeout")
+                    return None
+                candidate = partial
             except Exception:
                 self._emit_probe(key, boundary, started_ns, "failed")
                 return None

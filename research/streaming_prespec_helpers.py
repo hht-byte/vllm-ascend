@@ -164,6 +164,9 @@ class PreSpecModelHelpers:
                         candidate_token_ids = tuple(completion.token_ids)
                         if completion.finish_reason == "abort":
                             raise RuntimeError("prespec engine request aborted")
+                        # Publish verified cumulative output before a later
+                        # timeout or formal boundary cancels this task.
+                        self.prespec.publish_partial(request, candidate_token_ids)
                     finished = output.finished
             if not finished or not candidate_token_ids:
                 raise RuntimeError("prespec stream ended without a completed candidate")
