@@ -256,6 +256,10 @@ rg -n 'ascend_external_draft|def propose\(|accepted.*token|rejected.*token' .
 
 还要在 910B 的 scheduler 与 verifier 处确认首轮顺序。预投机消费时正式日志应满足 `candidate_raw_tokens = submitted_draft_tokens`，并看到同一正式请求的 `INITIAL_DRAFT status=scheduled draft_tokens=submitted_draft_tokens`；回滚 baseline 不设置首次验证标记，仍在目标首 token 之后由 proposer 提出旧草稿。预算或 encoder 调度导致 `INITIAL_DRAFT status=fallback` 的请求应单列，不能算作首轮并行验证。
 
+**0.23.0 worker 记账顺序与重接修正。** `model_runner_v1.py` 先调用 `_bookkeeping_sync()`：它把本轮 verifier 确认的 `valid_sampled_token_ids` 写入 `token_ids_cpu`，并把 `num_tokens_no_spec` 更新到正式前缀末尾；之后才调用 `AscendExternalDraftProposer.propose()`。因此预投机重接必须读取 `token_ids_cpu[prompt_len:num_tokens_no_spec]`，不能再次写入 `sampled_ids`，也不能用 `num_tokens_no_spec + len(sampled_ids)` 当作已确认前缀末尾。旧回滚的一次性 proposer 分支保留原行为。首次验证在第一个 token 失配后允许一次按位置续接；若该续接只得到一个替换 token（零草稿接受），则停止继续按位置提交更短的剩余草稿，以免每轮增加一次无收益的 verifier。`EXTERNAL_DRAFT_REJOIN` 的 `confirmed_tokens` 应以该正式请求的实际已确认输出为准，后续同一请求不得因重复写入而虚增或倒退。910B 需要重新应用更新后的 `external_draft_first_verify_v023.patch` 并重启引擎；仅更新服务端代码不能改变 worker 行为。旧负载的收益日志不可与修正后直接混算。
+
+当前 `ASR_VERIFY_STEP` 示例在同一个请求的多次 verifier 调用中反复输出 `round_index=0`。它表示每次调用内的索引，不能直接当作请求级验证轮次；旧版 `streaming_prespec_gain.py` 以 `(request_id, round_index)` 唯一为前提，会把这种日志判为重复。重新统计前须把 verifier 打点改为请求级递增轮次，或让分析脚本按该请求日志出现顺序编号，并区分初次草稿和续接草稿。
+
 若需要**候选与正式输出的离线匹配统计**，不能把旧示例中的 `raw_target_tokens = ()` 原样传入：元组没有采集动作，会一直表示“已观测到空输出”，导致错误的 0 匹配。正式请求仍保持 `output_kind=DELTA`，在原 `_yield_delta_text()` 消费的**同一条正式 vLLM 输出流**上采集原始 token IDs。可给 `_yield_delta_text()` 增加一个可选的 `on_output` 回调，并在它原有的 `async for output in stream` 循环内、处理文本之前调用；不要另起一次 generate，也不要对输出文本重新 tokenize：
 
 ```python

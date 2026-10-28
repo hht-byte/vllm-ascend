@@ -161,7 +161,7 @@
  
  # Per-request draft tokens are transported to the worker through
  # ``SamplingParams.extra_args`` under this key by ``patch_external_draft``.
-@@ -30,9 +33,15 @@
+@@ -30,9 +33,17 @@
  # tokens between ``add_request`` and ``propose``. Kept as a module constant so
  # the producer (patch) and consumer (proposer) never drift apart.
  EXTERNAL_DRAFT_ATTR = "_external_draft_tokens"
@@ -171,6 +171,8 @@
 +EXTERNAL_DRAFT_POLICIES_ATTR = "_external_draft_policies"
 +
 +logger = logging.getLogger(__name__)
++EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR = "_external_draft_last_proposal"
++EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR = "_external_draft_aligned_blocked"
  
  
 -class AscendExternalDraftProposer(NgramProposer):
@@ -178,7 +180,7 @@
      """Use request-provided token IDs as speculative drafts.
  
      Draft tokens are supplied by the caller (e.g. an ASR streaming rollback
-@@ -81,49 +90,51 @@
+@@ -81,49 +92,63 @@
          slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
      ) -> list[list[int]]:
          input_batch = self.runner.input_batch
@@ -217,42 +219,56 @@
 -            # return [] and resume plain autoregressive decoding.
 -            draft = external_drafts.pop(req_id, [])
 -            if not draft:
--                continue
--
++            if req_id not in first_verify:
++                # Preserve the old rollback/shadow one-shot contract.
++                end_idx = num_tokens + len(sampled_ids)
++                write_end = min(end_idx, input_batch.max_model_len)
++                input_batch.token_ids_cpu[i, num_tokens:write_end] = sampled_ids[:write_end - num_tokens]
++                max_draft_len = min(self.k, input_batch.max_model_len - end_idx)
++                if max_draft_len <= 0:
++                    continue
++                draft = external_drafts.pop(req_id, [])
++                outputs[i] = list(draft[:max_draft_len])
+                 continue
+ 
 -            # Never exceed the configured speculative budget or the remaining
 -            # sequence room. The first unstable position is already produced
 -            # by the target drive token, so the external draft only covers the
 -            # subsequent positions (see streaming controller contract).
 -            remaining = input_batch.max_model_len - num_tokens - num_sampled_ids
-+            end_idx = num_tokens + len(sampled_ids)
-+            write_end = min(end_idx, input_batch.max_model_len)
-+            input_batch.token_ids_cpu[i, num_tokens:write_end] = sampled_ids[:write_end - num_tokens]
-+            remaining = input_batch.max_model_len - end_idx
-             max_draft_len = min(self.k, remaining)
-             if max_draft_len <= 0:
-                 continue
- 
--            outputs[i] = list(draft[:max_draft_len])
-+            if req_id not in first_verify:
-+                # Preserve the old rollback/shadow one-shot contract.
-+                draft = external_drafts.pop(req_id, [])
-+                outputs[i] = list(draft[:max_draft_len])
-+                continue
- 
+-            max_draft_len = min(self.k, remaining)
+-            if max_draft_len <= 0:
 +            candidate = external_drafts.get(req_id, [])
 +            prompt_len = input_batch.num_prompt_tokens[i]
-+            # token_ids_cpu before end_idx is confirmed target output only;
-+            # speculative IDs at later positions must not influence lookup.
-+            if end_idx < prompt_len:
-+                continue
++            # _bookkeeping_sync already wrote sampled_ids and advanced
++            # num_tokens_no_spec before calling this proposer. Do not write
++            # sampled_ids a second time or include unconfirmed tail slots.
++            if num_tokens < prompt_len:
+                 continue
+-
+-            outputs[i] = list(draft[:max_draft_len])
+-
 +            confirmed = tuple(int(token) for token in
-+                              input_batch.token_ids_cpu[i, prompt_len:end_idx])
-+            outputs[i] = list(next_draft(
-+                candidate, confirmed, policy=policies.get(req_id, "ngram_1"),
-+                max_draft_tokens=max_draft_len))
++                              input_batch.token_ids_cpu[i, prompt_len:num_tokens])
 +            mismatch = first_mismatch(candidate, confirmed)
 +            strategy = ("aligned" if mismatch is None or mismatch == 0
 +                        else policies.get(req_id, "ngram_1"))
++            last_proposals = getattr(input_batch, EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR, {})
++            aligned_blocked = getattr(input_batch, EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR, set())
++            previous = last_proposals.get(req_id)
++            # A rejected aligned retry yields only one replacement token.
++            # Stop instead of verifying each shorter suffix again.
++            if previous and previous[0] == "aligned" and len(sampled_ids) <= 1:
++                aligned_blocked.add(req_id)
++            max_draft_len = min(self.k, input_batch.max_model_len - num_tokens)
++            if max_draft_len > 0 and not (strategy == "aligned" and req_id in aligned_blocked):
++                outputs[i] = list(next_draft(
++                    candidate, confirmed, policy=policies.get(req_id, "ngram_1"),
++                    max_draft_tokens=max_draft_len))
++                if outputs[i] and previous and len(sampled_ids) <= 1 and tuple(outputs[i]) == previous[1]:
++                    outputs[i] = []
++            if outputs[i]:
++                last_proposals[req_id] = (strategy, tuple(outputs[i]))
 +            logger.debug("EXTERNAL_DRAFT_REJOIN request_id=%s confirmed_tokens=%d "
 +                         "first_mismatch=%s strategy=%s proposed_tokens=%d",
 +                         req_id, len(confirmed), mismatch, strategy, len(outputs[i]))
@@ -326,7 +342,7 @@
 +    return ()
 --- /dev/null
 +++ b/vllm_ascend/patch/worker/patch_external_draft_first_verify.py
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,71 @@
 +"""Layer first-verification metadata onto the existing external-draft patch.
 +
 +Import this module after ``patch_external_draft`` in each NPU worker process.
@@ -336,9 +352,11 @@
 +from __future__ import annotations
 +
 +from vllm_ascend.spec_decode.external_draft_proposer import (
++    EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR,
 +    EXTERNAL_DRAFT_ATTR,
 +    EXTERNAL_DRAFT_FIRST_VERIFY_ATTR,
 +    EXTERNAL_DRAFT_FIRST_VERIFY_KEY,
++    EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR,
 +    EXTERNAL_DRAFT_POLICIES_ATTR,
 +    EXTERNAL_DRAFT_POLICY_KEY,
 +)
@@ -369,6 +387,10 @@
 +        setattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR, set())
 +    if not hasattr(self, EXTERNAL_DRAFT_POLICIES_ATTR):
 +        setattr(self, EXTERNAL_DRAFT_POLICIES_ATTR, {})
++    if not hasattr(self, EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR):
++        setattr(self, EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR, {})
++    if not hasattr(self, EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR):
++        setattr(self, EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR, set())
 +    getattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR).add(request.req_id)
 +    getattr(self, EXTERNAL_DRAFT_POLICIES_ATTR)[request.req_id] = policy
 +    return req_index
@@ -381,6 +403,12 @@
 +    policies = getattr(self, EXTERNAL_DRAFT_POLICIES_ATTR, None)
 +    if policies is not None:
 +        policies.pop(req_id, None)
++    last_proposals = getattr(self, EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR, None)
++    if last_proposals is not None:
++        last_proposals.pop(req_id, None)
++    aligned_blocked = getattr(self, EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR, None)
++    if aligned_blocked is not None:
++        aligned_blocked.discard(req_id)
 +    return _original_remove_request(self, req_id, *args, **kwargs)
 +
 +

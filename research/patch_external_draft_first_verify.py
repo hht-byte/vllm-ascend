@@ -7,9 +7,11 @@ The original patch still owns proposer registration and draft transport.
 from __future__ import annotations
 
 from vllm_ascend.spec_decode.external_draft_proposer import (
+    EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR,
     EXTERNAL_DRAFT_ATTR,
     EXTERNAL_DRAFT_FIRST_VERIFY_ATTR,
     EXTERNAL_DRAFT_FIRST_VERIFY_KEY,
+    EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR,
     EXTERNAL_DRAFT_POLICIES_ATTR,
     EXTERNAL_DRAFT_POLICY_KEY,
 )
@@ -40,6 +42,10 @@ def _patched_add_request(self, request, *args, **kwargs):
         setattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR, set())
     if not hasattr(self, EXTERNAL_DRAFT_POLICIES_ATTR):
         setattr(self, EXTERNAL_DRAFT_POLICIES_ATTR, {})
+    if not hasattr(self, EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR):
+        setattr(self, EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR, {})
+    if not hasattr(self, EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR):
+        setattr(self, EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR, set())
     getattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR).add(request.req_id)
     getattr(self, EXTERNAL_DRAFT_POLICIES_ATTR)[request.req_id] = policy
     return req_index
@@ -52,6 +58,12 @@ def _patched_remove_request(self, req_id, *args, **kwargs):
     policies = getattr(self, EXTERNAL_DRAFT_POLICIES_ATTR, None)
     if policies is not None:
         policies.pop(req_id, None)
+    last_proposals = getattr(self, EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR, None)
+    if last_proposals is not None:
+        last_proposals.pop(req_id, None)
+    aligned_blocked = getattr(self, EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR, None)
+    if aligned_blocked is not None:
+        aligned_blocked.discard(req_id)
     return _original_remove_request(self, req_id, *args, **kwargs)
 
 

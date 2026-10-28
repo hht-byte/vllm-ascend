@@ -215,7 +215,9 @@ def proposer(source: str) -> str:
         'EXTERNAL_DRAFT_FIRST_VERIFY_KEY = "ascend_external_draft_first_verify"\n'
         'EXTERNAL_DRAFT_POLICY_KEY = "ascend_external_draft_rejoin"\n'
         'EXTERNAL_DRAFT_FIRST_VERIFY_ATTR = "_external_draft_first_verify"\n'
-        'EXTERNAL_DRAFT_POLICIES_ATTR = "_external_draft_policies"\n',
+        'EXTERNAL_DRAFT_POLICIES_ATTR = "_external_draft_policies"\n'
+        'EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR = "_external_draft_last_proposal"\n'
+        'EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR = "_external_draft_aligned_blocked"\n',
         "proposer constants",
     )
     source = replace_once(
@@ -251,34 +253,46 @@ def proposer(source: str) -> str:
             num_tokens = input_batch.num_tokens_no_spec[i]
             if num_tokens >= input_batch.max_model_len:
                 continue
-            end_idx = num_tokens + len(sampled_ids)
-            write_end = min(end_idx, input_batch.max_model_len)
-            input_batch.token_ids_cpu[i, num_tokens:write_end] = sampled_ids[:write_end - num_tokens]
-            remaining = input_batch.max_model_len - end_idx
-            max_draft_len = min(self.k, remaining)
-            if max_draft_len <= 0:
-                continue
-
             if req_id not in first_verify:
                 # Preserve the old rollback/shadow one-shot contract.
+                end_idx = num_tokens + len(sampled_ids)
+                write_end = min(end_idx, input_batch.max_model_len)
+                input_batch.token_ids_cpu[i, num_tokens:write_end] = sampled_ids[:write_end - num_tokens]
+                max_draft_len = min(self.k, input_batch.max_model_len - end_idx)
+                if max_draft_len <= 0:
+                    continue
                 draft = external_drafts.pop(req_id, [])
                 outputs[i] = list(draft[:max_draft_len])
                 continue
 
             candidate = external_drafts.get(req_id, [])
             prompt_len = input_batch.num_prompt_tokens[i]
-            # token_ids_cpu before end_idx is confirmed target output only;
-            # speculative IDs at later positions must not influence lookup.
-            if end_idx < prompt_len:
+            # _bookkeeping_sync already wrote sampled_ids and advanced
+            # num_tokens_no_spec before calling this proposer. Do not write
+            # sampled_ids a second time or include unconfirmed tail slots.
+            if num_tokens < prompt_len:
                 continue
             confirmed = tuple(int(token) for token in
-                              input_batch.token_ids_cpu[i, prompt_len:end_idx])
-            outputs[i] = list(next_draft(
-                candidate, confirmed, policy=policies.get(req_id, "ngram_1"),
-                max_draft_tokens=max_draft_len))
+                              input_batch.token_ids_cpu[i, prompt_len:num_tokens])
             mismatch = first_mismatch(candidate, confirmed)
             strategy = ("aligned" if mismatch is None or mismatch == 0
                         else policies.get(req_id, "ngram_1"))
+            last_proposals = getattr(input_batch, EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR, {})
+            aligned_blocked = getattr(input_batch, EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR, set())
+            previous = last_proposals.get(req_id)
+            # A rejected aligned retry yields only one replacement token.
+            # Stop instead of verifying each shorter suffix again.
+            if previous and previous[0] == "aligned" and len(sampled_ids) <= 1:
+                aligned_blocked.add(req_id)
+            max_draft_len = min(self.k, input_batch.max_model_len - num_tokens)
+            if max_draft_len > 0 and not (strategy == "aligned" and req_id in aligned_blocked):
+                outputs[i] = list(next_draft(
+                    candidate, confirmed, policy=policies.get(req_id, "ngram_1"),
+                    max_draft_tokens=max_draft_len))
+                if outputs[i] and previous and len(sampled_ids) <= 1 and tuple(outputs[i]) == previous[1]:
+                    outputs[i] = []
+            if outputs[i]:
+                last_proposals[req_id] = (strategy, tuple(outputs[i]))
             logger.debug("EXTERNAL_DRAFT_REJOIN request_id=%s confirmed_tokens=%d "
                          "first_mismatch=%s strategy=%s proposed_tokens=%d",
                          req_id, len(confirmed), mismatch, strategy, len(outputs[i]))
