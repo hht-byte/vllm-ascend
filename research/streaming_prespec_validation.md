@@ -1,13 +1,13 @@
 # 910B 流式音频预投机验证手册
 
-本手册验证当前 **每个 `(ws_id, seg_id, window_id)` 最多一次中点候选、各连接可并行生成候选** 的实现。baseline 是“现有回滚投机开启、预投机关闭”。服务端三个源文件不在此仓库；下面标明应插入的函数与代码，需在 910B 服务项目完成接线。本仓库的 Python mock 测试不能代替真机验证。
+本手册验证当前 **每个 `(ws_id, seg_id, window_id)` 最多一次中点候选、各连接可并行生成候选** 的实现。A 组是“完整回滚草稿首次验证开启、预投机关闭”；它与更早的“目标先采样首 token”的回滚 baseline 不是同一实现。服务端三个源文件不在此仓库；下面标明应插入的函数与代码，需在 910B 服务项目完成接线。本仓库的 Python mock 测试不能代替真机验证。
 
 ## 0. 三组配置与共同前提
 
 | 组 | `--prespec-mode` | 回滚投机 | 含义 |
 |---|---|---|---|
-| A | `off` | 开 | rollback baseline |
-| B | `shadow` | 开 | 后台生成候选，正式请求仍用原回滚草稿 |
+| A | `off` | 开 | 完整回滚草稿首次验证 baseline |
+| B | `shadow` | 开 | 后台生成候选，正式请求仍首次验证完整回滚草稿 |
 | C | `consume` | 开 | 后台生成候选，正式请求在完整音频上经现有 verifier 验证候选 |
 
 A/B/C 保持同一服务代码、模型、图配置、回滚参数、chunk 长度、音频和连接负载。配置变更后重启服务，不能在活跃连接期间替换协调器。**先用 `force` 完成链路和 A/B/C 初次对比**；此时仍检查中点、本连接的正式请求状态、预算、截止时间及显式配置的候选容量，但其他连接的 chunk/commit 不会阻止启动或取消已有候选。默认候选容量参数为 0，协调器不设进程级上限。完成实时负载接线后，再用 `gated` 重跑 B/C，回答“低利用率空档是否存在且可安全利用”；`gated` 仍检查共享设备的队列/利用率。若未接入新鲜 `LoadSnapshot`，`gated` 会返回 `missing_load`；旁路 `npu-smi` 的 1 秒采样不能冒充默认要求 200 ms 内的新鲜准入读数。
@@ -29,7 +29,7 @@ rg -n 'ArgumentParser|parse_args|AsyncLLM\(' qwen_asr
 ```python
 parser.add_argument(
     "--prespec-mode", choices=("off", "shadow", "consume"), default="off",
-    help="off=rollback baseline; shadow=observe; consume=verify candidate",
+    help="off=full rollback first verify; shadow=observe; consume=verify candidate",
 )
 parser.add_argument(
     "--prespec-admission", choices=("force", "gated"), default="force",
@@ -248,15 +248,15 @@ if prespec is not None:
         ws_id, audio_epoch=seg_id, window_id=this_chunk_id)
 ```
 
-不传 `target_continuation_tokens` 表示**只清理候选，不计算匹配长度**，协调器返回 `None`；不能把此结果记为“接受 0 个 token”。C 组仍须在引擎 verifier 处逐轮记录 `request_id`、实际有效草稿长度与接受数。预投机候选的首 token 由首次 prefill 并行验证；旧回滚草稿仍在正式目标采样首 token 后由 proposer 提出。只在 proposer 的 `propose()` 打日志不足以证明草稿被验证。
+不传 `target_continuation_tokens` 表示**只清理候选，不计算匹配长度**，协调器返回 `None`；不能把此结果记为“接受 0 个 token”。C 组仍须在引擎 verifier 处逐轮记录 `request_id`、实际有效草稿长度与接受数。正式请求的预投机候选和完整回滚草稿都应由首次 prefill 验证首 token；只有 shadow 请求保留先采样首 token 的旧草稿合同。只在 proposer 的 `propose()` 打日志不足以证明草稿被验证。
 
 ```bash
 rg -n 'ascend_external_draft|def propose\(|accepted.*token|rejected.*token' .
 ```
 
-还要在 910B 的 scheduler 与 verifier 处确认首轮顺序。预投机消费时正式日志应满足 `candidate_raw_tokens = submitted_draft_tokens`，并看到同一正式请求的 `INITIAL_DRAFT status=scheduled draft_tokens=submitted_draft_tokens`；回滚 baseline 不设置首次验证标记，仍在目标首 token 之后由 proposer 提出旧草稿。预算或 encoder 调度导致 `INITIAL_DRAFT status=fallback` 的请求应单列，不能算作首轮并行验证。
+还要在 910B 的 scheduler 与 verifier 处确认首轮顺序。预投机消费时正式日志应满足 `candidate_raw_tokens = submitted_draft_tokens`；无候选且完整回滚草稿非空时，提交长度应为该完整草稿长度。两者都应看到同一正式请求的 `INITIAL_DRAFT status=scheduled draft_tokens=submitted_draft_tokens`。预算或 encoder 调度导致 `INITIAL_DRAFT status=fallback` 的请求应单列，不能算作首轮并行验证。
 
-**0.23.0 worker 记账顺序与重接修正。** `model_runner_v1.py` 先调用 `_bookkeeping_sync()`：它把本轮 verifier 确认的 `valid_sampled_token_ids` 写入 `token_ids_cpu`，并把 `num_tokens_no_spec` 更新到正式前缀末尾；之后才调用 `AscendExternalDraftProposer.propose()`。因此预投机重接必须读取 `token_ids_cpu[prompt_len:num_tokens_no_spec]`，不能再次写入 `sampled_ids`，也不能用 `num_tokens_no_spec + len(sampled_ids)` 当作已确认前缀末尾。旧回滚的一次性 proposer 分支保留原行为。首次验证在第一个 token 失配后允许一次按位置续接；若该续接只得到一个替换 token（零草稿接受），则停止继续按位置提交更短的剩余草稿，以免每轮增加一次无收益的 verifier。`EXTERNAL_DRAFT_REJOIN` 的 `confirmed_tokens` 应以该正式请求的实际已确认输出为准，后续同一请求不得因重复写入而虚增或倒退。910B 需要重新应用更新后的 `external_draft_first_verify_v023.patch` 并重启引擎；仅更新服务端代码不能改变 worker 行为。旧负载的收益日志不可与修正后直接混算。
+**0.23.0 worker 记账顺序与重接修正。** `model_runner_v1.py` 先调用 `_bookkeeping_sync()`：它把本轮 verifier 确认的 `valid_sampled_token_ids` 写入 `token_ids_cpu`，并把 `num_tokens_no_spec` 更新到正式前缀末尾；之后才调用 `AscendExternalDraftProposer.propose()`。因此首次验证后的重接必须读取 `token_ids_cpu[prompt_len:num_tokens_no_spec]`，不能再次写入 `sampled_ids`，也不能用 `num_tokens_no_spec + len(sampled_ids)` 当作已确认前缀末尾。旧的一次性 proposer 分支只供 shadow 或未迁移的正式请求使用。首次验证在第一个 token 失配后允许一次按位置续接；若该续接只得到一个替换 token（零草稿接受），则停止继续按位置提交更短的剩余草稿，以免每轮增加一次无收益的 verifier。`EXTERNAL_DRAFT_REJOIN` 的 `confirmed_tokens` 应以该正式请求的实际已确认输出为准，后续同一请求不得因重复写入而虚增或倒退。910B 需要先确认已部署 `external_draft_first_verify_v023.patch` 并重启引擎；仅更新服务端代码不能改变 worker 行为。旧负载的收益日志不可与修正后直接混算。
 
 当前 `ASR_VERIFY_STEP` 示例在同一个请求的多次 verifier 调用中反复输出 `round_index=0`。它表示每次调用内的索引，不能直接当作请求级验证轮次；旧版 `streaming_prespec_gain.py` 以 `(request_id, round_index)` 唯一为前提，会把这种日志判为重复。重新统计前须把 verifier 打点改为请求级递增轮次，或让分析脚本按该请求日志出现顺序编号，并区分初次草稿和续接草稿。
 
@@ -437,11 +437,11 @@ PY
 对同一批音频保存**每条连接的音频文件、切片顺序、发送时刻和 commit 时刻**。三组分别重启服务并使用同一回放清单：
 
 ```bash
-# A：保持现有回滚投机配置不变
+# A：关闭预投机，正式请求首次验证完整回滚草稿
 <现有服务启动命令> --prespec-mode off
 # 使用现有 WebSocket 回放命令，保存客户端事件和服务日志
 
-# B：正式请求仍用原回滚草稿
+# B：后台产生候选供观测，正式请求仍首次验证完整回滚草稿
 <现有服务启动命令> --prespec-mode shadow --prespec-admission force
 # 同一回放清单
 
@@ -641,7 +641,7 @@ python streaming_prespec_gain.py \
 | 3 正式时延 | 全部非空 commit 及正式 chunk 的 P50/P95/P99、首 delta、后续请求时延 | B 相比 A 的额外开销低于**测试前约定**的退化界限；C 相比 A 有稳定净收益 |
 | 4 排队与成本 | `service_queue_wait_ms`、`audio_blocks_pending_at_commit`、vLLM waiting/running、NPU 利用率、shadow 请求数/计算量 | 无关键路径排队恶化；不能只用 NPU 利用率上升宣称收益 |
 
-`queue_size` 是段级音频队列，含 commit 的 `None` 哨兵；`queue_waiting` 才是 vLLM 等待请求数。至少按轮次报告 A/B/C 的差值和波动，P99 样本太少时标注不确定，不能用候选命中子集的改善代替全部请求的结果。历史 `baseline-c20` 仅作参考；最终比较需要在同一代码和负载条件下重跑 rollback baseline。
+`queue_size` 是段级音频队列，含 commit 的 `None` 哨兵；`queue_waiting` 才是 vLLM 等待请求数。至少按轮次报告 A/B/C 的差值和波动，P99 样本太少时标注不确定，不能用候选命中子集的改善代替全部请求的结果。历史 `baseline-c20` 使用旧回滚首 token 合同，仅作参考；最终比较需要在同一代码和负载条件下重跑 A 组 baseline。
 
 ### 4.2 首次失配后的候选重接：离线初筛
 

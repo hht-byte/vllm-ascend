@@ -1,6 +1,6 @@
 # vLLM 0.23：预投机首轮并行验证与失配重接
 
-本变更把**预投机候选** `C[0:]` 放入正式目标请求的首次执行：scheduler 在 prefill 前写入 `request.spec_token_ids`，同次目标前向验证 `C[0]` 及后续候选。旧回滚草稿和 shadow 请求仍沿用“目标先采样一个 token，再由 proposer 提出旧草稿”的合同。首次 verifier 输出修正 token 后，proposer 保留候选池，根据**已确认的正式输出**提出下一轮草稿：首次失配在位置 0 时按位置续接；失配在后续位置时使用 `aligned` 或 `ngram_1/2/3`，默认 `ngram_1`。直到请求结束才清理候选池。
+本变更让正式请求把**完整预投机候选或完整回滚草稿** `C[0:]` 放入首次目标执行：scheduler 在 prefill 前写入 `request.spec_token_ids`，同次前向验证 `C[0]` 及后续 token。shadow 请求仍沿用“目标先采样一个 token，再由 proposer 提出旧回滚草稿 `C[1:]`”的合同。首次 verifier 输出修正 token 后，proposer 保留本次完整草稿，根据**已确认的正式输出**提出下一轮草稿：首次失配在位置 0 时按位置续接；失配在后续位置时使用 `aligned` 或 `ngram_1/2/3`，默认 `ngram_1`。直到请求结束才清理草稿池。
 
 现有 `patch_external_draft.py` 的两个 monkey-patch 继续负责 proposer 注册和 `ascend_external_draft` 传输。本补丁不改这个文件，也不改 `model_runner_v1.py`：proposer 继承 `AscendNgramProposer`，直接复用 0.23.0 已有的 ngram 分派；新 `patch_external_draft_first_verify.py` 在原补丁之后叠加 first-verify 和 rejoin 元数据。**仅靠现有两个 worker 侧 patch 不能完成首次并行验证**：waiting 请求的首次 token 数与 `scheduled_spec_decode_tokens` 由 scheduler 决定，所以补丁仍需修改普通及 recompute scheduler 的相应分支。
 
@@ -61,26 +61,50 @@ parser.add_argument(
 
 沿现有 `Qwen3ASRModelAsync.AsyncLLM(**base_config)` 调用显式传 `prespec_rejoin_policy=args.prespec_rejoin_policy`；类方法接收它后传入 `enable_prespec(rejoin_policy=prespec_rejoin_policy)`，后者校验并保存 `self.prespec_rejoin_policy`。详细形参位置见 [验证文档](streaming_prespec_validation.md)。不用环境变量。
 
-把 [服务侧 helper](streaming_prespec_formal_args.py) 复制到 `qwen_asr/inference/streaming_prespec_formal_args.py`。在**正式 chunk** 和 **正式 finish** 已领取 candidate、已构建该请求专用 `SamplingParams`，但尚未调用 `engine.generate` 时，执行同一段代码：
+把 [服务侧 helper](streaming_prespec_formal_args.py) 复制到 `qwen_asr/inference/streaming_prespec_formal_args.py`。910B 的 `_split_stream_rollback()` 在固定阶段用 `cur_ids[1:]`、动态阶段用 `cur_ids[end_idx + 1:]` 形成旧草稿；两者都缺少首次待验证的 token。保留旧 `external_draft` 给 shadow 使用，并在该函数原有 `return` 前增加完整正式草稿：
 
 ```python
 from qwen_asr.inference.streaming_prespec_formal_args import (
     formal_external_draft_extra_args,
+    formal_rollback_draft_tokens,
 )
 
-# candidate 是 begin_authoritative_chunk() 或 claim_formal_candidate() 的结果。
-# rollback_draft_token_ids 仍由原有回滚拆分逻辑产生。
-sampling_params.extra_args = formal_external_draft_extra_args(
-    sampling_params.extra_args,
+# 在 _split_stream_rollback() 的 while/if 分支结束之后、原 return 之前：
+rollback_full_token_ids = formal_rollback_draft_tokens(
+    cur_ids, stable_prefix_token_ids, kmax=kmax,
+)
+return (prefix, stable_prefix_token_ids, external_draft,
+        raw_len, used_len, rollback_full_token_ids)
+```
+
+固定阶段完整草稿从 `cur_ids[0]` 开始；动态阶段从 `cur_ids[end_idx]` 开始。更新所有解包调用点以接收第六项，原前五项保持原义；中点 shadow 仍只用第三项 `external_draft`。在**正式 chunk** 和 **正式 finish** 已领取 candidate、已打包实际请求，但尚未调用 `engine.generate` 时，对实际 `request_kwargs["sampling_params"]` 执行：
+
+910B 当前三个拆分调用点分别在 `qwen3_asr_async.py:558`（中点，只接收并忽略第六项）、`:673`（正式 chunk，使用第六项）和 `:968`（正式 finish，使用第六项）；两处正式 helper 调用在 `:751` 和 `:1047`。这些行号仅用于定位，修改后会移动。不要让中点 shadow 改用完整草稿。
+
+```python
+selected_draft_token_ids = (
+    candidate.formal_draft_token_ids if candidate is not None
+    else rollback_full_token_ids
+)
+# _pack_stream_request(..., draft_token_ids=selected_draft_token_ids, ...)
+request_kwargs["sampling_params"].extra_args = formal_external_draft_extra_args(
+    request_kwargs["sampling_params"].extra_args,
     candidate_tokens=(candidate.formal_draft_token_ids
                       if candidate is not None else None),
-    rollback_tokens=rollback_draft_token_ids,
+    rollback_tokens=external_draft,
+    rollback_full_tokens=rollback_full_token_ids,
     kmax=self.kmax,
     rejoin_policy=self.prespec_rejoin_policy,
 )
+submitted_draft_ids = tuple(
+    request_kwargs["sampling_params"].extra_args["ascend_external_draft"]
+)
+draft_stats_valid = submitted_draft_ids == tuple(selected_draft_token_ids)
 ```
 
-此处 `sampling_params` 必须是本次正式请求专用对象。helper 返回新 `extra_args` 字典，并在回退到 rollback 时删除旧的首次验证标记，避免污染下一个请求。`_pack_stream_request` 若已经写入 `ascend_external_draft`，就在其返回 `SamplingParams` 后、`engine.generate(...)` 前覆盖这三个字段；prompt、完整音频、稳定前缀、温度和输出模式保持原流程。shadow `_run_prespec()` 不设置 `ascend_external_draft_first_verify`。
+`request_kwargs` 必须是本次正式请求实际传给引擎的字典；`SamplingParams` 必须为该请求专用。helper 在有候选时选择候选，无候选时选择完整回滚草稿，并在草稿非空时设置首次验证标记和重接策略。空草稿不标记，正常自回归。旧 `rollback_tokens` 仍用于核对完整回滚草稿没有错位；正式 chunk 和 finish 均必须传 `rollback_full_tokens`，遗漏即报错。`submitted_draft_ids` 和 `draft_stats_valid` 必须在 helper 覆盖 `extra_args` **之后**从实际请求重算；`PRESPEC_TARGET`、`ASR_FORMAL_STATS` 的 `submitted_draft_tokens` 应依据最终提交值。保留原有 prompt、完整音频、稳定前缀、温度和输出模式。shadow `_run_prespec()` 不设置 `ascend_external_draft_first_verify`。
+
+本仓 `Candidate.formal_draft_token_ids` 在 `streaming_prespec.py` 返回完整 `self.token_ids`。若 910B 服务副本返回 `token_ids[1:]`，须先将其改为完整序列，否则有候选路径仍无法验证第 0 位。正式 chunk 和 finish 都已有 `formal_external_draft_extra_args()` 调用点；两处都应按上述逻辑接入。
 
 候选预算现在**包含首 token**，因此 `--prespec-candidate-tokens` 默认 `kmax`，不得大于 `kmax`。例如现有引擎 `kmax=15` 时，应把旧的候选预算 16 改为 15，或先提高引擎预算。服务 helper 与 scheduler 均拒绝超过 `kmax` 的候选；不静默截断。
 
@@ -88,7 +112,7 @@ sampling_params.extra_args = formal_external_draft_extra_args(
 
 一条 `C=(c0,c1,c2,...)` 的正式请求，预期日志顺序：
 
-1. `PRESPEC_PROBE status=ready_consumed`，正式请求 `draft_source=prespec` 且提交长度为 `len(C)`；
+1. 有候选时 `PRESPEC_PROBE status=ready_consumed`、`draft_source=prespec`；无候选且回滚草稿非空时 `draft_source=rollback`。两者提交长度均为所选完整 `C[0:]` 的长度；
 2. `INITIAL_DRAFT status=scheduled draft_tokens=len(C)`，出现在目标首次执行之前；
 3. `ASR_VERIFY_STEP round_index=0`，`effective_draft_tokens` 包含 `c0`；
 4. 如果 `c0` 被拒绝，目标确认 `t0` 后下一轮按位置提交 `C[1:]`；如果 `ck`（`k>0`）被拒绝，proposer 只用已确认的 `T[:k+1]` 查找 ngram 锚点；
@@ -102,4 +126,4 @@ python -m unittest discover -s research -p 'test_streaming_prespec_formal_args.p
 python -m unittest discover -s research -p 'test_external_draft_first_verify_patch.py' -v
 ```
 
-然后在 910B 上用现有 sustained test 做 rollback 与 consume 同负载对比，检查首轮 verifier 接受数、总模型执行轮次、commit 延迟 P50/P95/P99、正式请求队列等待、候选请求开销和文本等价。`PRESPEC_MATCH_TOKENS` 的离线匹配仅是诊断，不能替代真实 verifier 接受数。这个补丁尚未在 910B 上运行，NPU/多并发正确性与时延收益仍需实测。
+然后在 910B 上用现有 sustained test 做无候选与 consume 同负载对比，检查两组 `INITIAL_DRAFT`、首轮 verifier 接受数、总模型执行轮次、commit 延迟 P50/P95/P99、正式请求队列等待、候选请求开销和文本等价。旧的 rollback baseline 使用 `C[1:]`，新无候选组使用 `C[0:]`，不能把两者当作相同实现混算。`PRESPEC_MATCH_TOKENS` 的离线匹配仅是诊断，不能替代真实 verifier 接受数；NPU/多并发正确性与时延收益仍需实测。

@@ -5,7 +5,7 @@
 - `commit_overlap.py` 用现有逐 commit JSONL/CSV 检查前一条正式 commit 的重叠；若提供服务 DEBUG 日志，还检查**同一段内流式 chunk 推理与 commit 等待**的重叠。
 - `streaming_prespec.py` 管理中点 shadow 请求、低负载 admission、候选版本、正式边界取消和 shadow 候选质量评估。
 - `streaming_prespec_helpers.py` 提供三个模型 helper 的实现；服务只需接入原有请求打包代码，并映射本地音频/token 字段，见第四节。
-- `streaming_prespec_formal_args.py` 为正式 chunk/finish 打包完整候选或旧回滚草稿；引擎首次验证补丁见 [实施说明](external_draft_first_verify_v023.md)。
+- `streaming_prespec_formal_args.py` 为正式 chunk/finish 打包完整候选或从首 token 开始的完整回滚草稿；引擎首次验证补丁见 [实施说明](external_draft_first_verify_v023.md)。
 
 这些文件可以复制到 910B 服务项目，模块导入不依赖 vLLM/Ascend。当前仓库没有运行中的 `realtime_connection.py` 和 `qwen3_asr_async.py`，实际请求打包仍需接到服务已有的回滚投机实现；**只有协调器、没有模型接线时不会发送任何伪请求**。
 
@@ -47,6 +47,7 @@ from qwen_asr.inference.streaming_prespec_helpers import (
 )
 from qwen_asr.inference.streaming_prespec_formal_args import (
     formal_external_draft_extra_args,
+    formal_rollback_draft_tokens,
 )
 ```
 
@@ -99,7 +100,7 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
     )
 ```
 
-这个方法创建协调器并保存 engine 引用。完整预投机候选 `C[0:]` 在目标首次执行前进入 verifier，首 token 也占一个 `kmax` 槽位，因此候选预算默认等于 `kmax`，显式值也不能超过它。旧草稿加候选首 token、至少一个续写 token 放不下时跳过。回滚草稿与 shadow 旧草稿仍沿用原有跳首 token 合同。引擎补丁与服务调用见 [首次验证实施说明](external_draft_first_verify_v023.md)。
+这个方法创建协调器并保存 engine 引用。正式请求选中的完整预投机候选或完整回滚草稿 `C[0:]` 都在目标首次执行前进入 verifier，首 token 占一个 `kmax` 槽位，因此候选预算默认等于 `kmax`，显式值也不能超过它。旧草稿加候选首 token、至少一个续写 token 放不下时跳过。仅 shadow 旧草稿仍沿用跳首 token 合同。引擎补丁与服务调用见 [首次验证实施说明](external_draft_first_verify_v023.md)。
 
 `max_active_shadows=0` 表示协调器不设进程级候选并发上限，各连接可同时运行候选；实际调度和容量仍由共享 engine 决定。正整数是可选的进程级上限，负数非法。不要保留旧接线中的 `max_active_shadows=1`，否则替换协调器后仍会把所有连接串行化。
 
@@ -261,7 +262,7 @@ new_audio_samples = current_audio_end_samples - last_formal_audio_end_samples
 正式请求首次验证的 external draft = (20, 21, 99, 30)
 ```
 
-候选既不包含 `[10, 11]`，也不保留被拒绝的 `22`。**验证与续写在同一次 engine 请求中完成**；服务不拆成两次请求，不自行重建验证后的 KV。shadow 旧回滚草稿仍在其首 token 采样后验证；正式目标在首次执行前取得完整候选并验证 `20`。因此启动前要求 `candidate_tokens >= 1 + len(rollback_draft_token_ids) + 1`，而正式首次提交要求 `len(candidate_token_ids) <= kmax`。旧回滚草稿不再额外去首，候选也不去首。EOS、修正或提前取消仍可能使候选没有续写；引擎若无法完整调度首轮草稿，必须明确记录 fallback。
+候选既不包含 `[10, 11]`，也不保留被拒绝的 `22`。**验证与续写在同一次 engine 请求中完成**；服务不拆成两次请求，不自行重建验证后的 KV。shadow 旧回滚草稿仍在其首 token 采样后验证；正式目标在首次执行前取得完整候选并验证 `20`。因此启动前要求 `candidate_tokens >= 1 + len(rollback_draft_token_ids) + 1`，而正式首次提交要求 `len(candidate_token_ids) <= kmax`。正式请求选择的完整回滚草稿和候选都包含各自的首 token；shadow 仍用旧回滚后缀。EOS、修正或提前取消仍可能使候选没有续写；引擎若无法完整调度首轮草稿，必须明确记录 fallback。
 
 #### 4.2 哪些已提供，哪些必须从你的函数搬出
 
@@ -275,7 +276,7 @@ new_audio_samples = current_audio_end_samples - last_formal_audio_end_samples
 
 **从 `async_streaming_transcribe()` 提取两段只读逻辑。** 草稿拆分一段单独复用，请求打包一段放进 `_pack_stream_request`：
 
-1. 将 L486–518 的 `state._raw_decoded → cur_ids → prefix / external_draft` 拆分代码提成一个**只读**函数，例如 `_split_stream_rollback(raw_decoded, chunk_id, unfixed_chunk_num, unfixed_token_num, kmax)`。正式 chunk、中点和使用上一轮转写构造稳定前缀的正式 finish 都调用它；保留固定阶段 `prefix=""`、`cur_ids[1:][:kmax]`，以及动态阶段反复扩大回滚 token 数直到解码前缀不含 `�` 的原有细节。该函数返回原来的 `prefix` 文本、前缀 IDs 和草稿 IDs。提取时不要提前改写 `state._raw_decoded` 或 `state.chunk_id`。
+1. 将 L486–518 的 `state._raw_decoded → cur_ids → prefix / external_draft` 拆分代码提成一个**只读**函数，例如 `_split_stream_rollback(raw_decoded, chunk_id, unfixed_chunk_num, unfixed_token_num, kmax)`。正式 chunk、中点和使用上一轮转写构造稳定前缀的正式 finish 都调用它；保留固定阶段 `prefix=""`、`cur_ids[1:][:kmax]`，以及动态阶段反复扩大回滚 token 数直到解码前缀不含 `�` 的原有细节。原有 `external_draft` 给 shadow；另外从同一 `cur_ids` 和稳定前缀位置取得完整正式回滚草稿：固定阶段 `cur_ids[0:kmax]`，动态阶段 `cur_ids[end_idx:end_idx+kmax]`。把它加为返回值第六项，前五项不变，所有解包调用点同步更新。提取时不要提前改写 `state._raw_decoded` 或 `state.chunk_id`。
 2. 将 L520–554 的 `prompt = state.prompt_raw + prefix`、processor 输入、`TokensPrompt` 或 adapter 的 `build_request` 分支搬入 `_pack_stream_request`。输入改为下面六个显式形参，使用传入的完整音频，不从活跃 `state` 取 `audio_accum`。保持原有 `CACHE_ID` 路径和输入格式；这里不增加 KV 命中判断。
 3. 将 L559–568 向 `sampling_params.extra_args` 写入 `ascend_external_draft` 的原代码也搬入打包函数，使正式与 shadow 调用同一字段/格式。`_pack_stream_request` 只返回 generate 实参；不搬入 L557 的 `ChunkInferenceEvent`、L571–606 的打点、输出和状态写回。
 
@@ -320,9 +321,18 @@ request_kwargs = self._pack_stream_request(
     full_audio_pcm_f32le=state.audio_accum.astype("<f4", copy=False).tobytes(),
     prefix_text=prefix,  # L486–518 原代码返回的文本
     stable_prefix_token_ids=stable_prefix_token_ids,
-    draft_token_ids=draft_token_ids,  # 第五节选择就绪候选或原回滚草稿
+    draft_token_ids=draft_token_ids,  # 第五节选择候选或完整正式回滚草稿
     model_context=model_context,      # 至少包含 state.prompt_raw 的快照
     sampling_params=deepcopy(formal_sampling_params),
+)
+request_kwargs["sampling_params"].extra_args = formal_external_draft_extra_args(
+    request_kwargs["sampling_params"].extra_args,
+    candidate_tokens=(candidate.formal_draft_token_ids
+                      if candidate is not None else None),
+    rollback_tokens=rollback_draft_token_ids,
+    rollback_full_tokens=rollback_full_token_ids,
+    kmax=self.kmax,
+    rejoin_policy=self.prespec_rejoin_policy,
 )
 stream = engine.generate(**request_kwargs, request_id=formal_request_id)
 # yield ChunkInferenceEvent 后，stream 交回原有 _yield_delta_text 迭代；
@@ -564,7 +574,8 @@ def try_start_prespec_for_state(
     if not (self.prespec.policy.midpoint_samples <= new_samples
             < state.chunk_size_samples):
         return None  # 80 ms append 阶段不反复复制完整历史音频
-    prefix_text, stable_prefix_token_ids, rollback_draft_token_ids = (
+    (prefix_text, stable_prefix_token_ids, rollback_draft_token_ids,
+     _raw_len, _used_len, _rollback_full_token_ids) = (
         self._split_stream_rollback(
             state._raw_decoded, state.chunk_id,
             self.unfixed_chunk_num, self.unfixed_token_num, self.kmax,
@@ -604,7 +615,7 @@ helper 使用 `engine.generate(**kwargs)` 返回异步生成器、`await engine.
 
 普通 vLLM 输出不包含 prompt token，因此代码没有再切掉 `len(stable_prefix_token_ids)`；否则会丢失候选开头。引擎完成标记之后才发布候选。若你修改过输出为“整个序列”或只报告增量，先还原此合同。
 
-引擎首次验证补丁将预投机候选 `Candidate.formal_draft_token_ids`（即完整 `C[0:]`）在 target 首次执行前排入 scheduler；运行时先并行验证，再由 proposer 按已确认前缀选择重接草稿。只有这个候选分支带 `ascend_external_draft_first_verify=True`；原回滚与 shadow 旧草稿继续在目标首 token 之后提交。补丁和回退条件见 [首次验证实施说明](external_draft_first_verify_v023.md)。
+引擎首次验证补丁将正式请求选中的完整候选或完整回滚草稿 `C[0:]` 在 target 首次执行前排入 scheduler；运行时先并行验证，再由 proposer 按已确认前缀选择重接草稿。两条正式路径在草稿非空时都带 `ascend_external_draft_first_verify=True`；仅 shadow 旧草稿继续在目标首 token 之后提交。补丁和回退条件见 [首次验证实施说明](external_draft_first_verify_v023.md)。
 
 shadow 不调用正式转写/finish/`_yield_delta_text`，不发送客户端事件、不修改正式 state；引擎全局统计仍可能包含 shadow，需按 request ID 单独分析。
 
@@ -629,7 +640,8 @@ async for stream_item in self.asr.async_streaming_transcribe(
 准确的改动位置在每轮 `while len(state.buffer) >= state.chunk_size_samples` **内部**：L475–481 已切块并更新 `state.audio_accum`；L486–518 已算好原 `prefix` 与草稿；在 L520 的 prompt 构造前领取候选。使用 `len(state.audio_accum)` 作为本轮正式完整音频截止。完成 L583–596 的 DELTA 输出迭代和 L601–606 的 `_raw_decoded = prefix + accumulated_delta`、解析及 `chunk_id += 1` 后配对退出。这些现有状态更新仍只在正式路径发生。
 
 ```python
-# L486–518 已通过原有规则得到 prefix、rollback_draft_token_ids。
+# 拆分函数已得到 prefix、旧 rollback_draft_token_ids 及
+# rollback_full_token_ids（新增第六项）。
 # 位置：L475–481 之后、L520 构造请求之前。
 prespec = getattr(self, "prespec", None)
 if ws_id is None or seg_id is None:
@@ -645,11 +657,13 @@ if prespec is not None:
     )
 try:
     draft_token_ids = (candidate.formal_draft_token_ids if candidate is not None
-                       else rollback_draft_token_ids)
+                       else rollback_full_token_ids)
     # L520–554：原 prompt_raw + prefix 和 adapter/TokensPrompt 分支。
     # 提前构造 L559–568 的正式 SamplingParams，用 draft_token_ids 写入
-    # ascend_external_draft。candidate 非空时还要设置
-    # ascend_external_draft_first_verify=True 和 rejoin policy。
+    # ascend_external_draft。draft 非空时设置
+    # ascend_external_draft_first_verify=True 和 rejoin policy；
+    # formal_external_draft_extra_args 仍传旧 rollback_draft_token_ids
+    # 供错位校验，并额外传 rollback_full_tokens=rollback_full_token_ids。
     # L557：照常 yield ChunkInferenceEvent。
     # 正式请求仍保持 temperature=0、max_tokens=4096、DELTA。
     # L583–596：继续 _yield_delta_text，照常 yield 客户端 delta。
@@ -663,7 +677,7 @@ finally:
 
 上段是**插入位置示意**：注释所列的 L520–606 必须保留原函数实际代码，不能把注释当作代码替换。最小版不采集正式请求的原始 token IDs，也不修改 `_yield_delta_text()`。`end_authoritative_chunk()` 不传 `target_continuation_tokens` 时只清理候选，返回 `None`；不得把缺失的对照数据记作“接受 0 个 token”。若需要离线候选质量评估，按 [验证手册的可选采集挂点](streaming_prespec_validation.md) 从正式请求的 DELTA 输出流收集 token IDs；不能初始化 `raw_target_tokens = ()` 后不更新便传入。`try/finally` 覆盖 L557–606 以及真正的生成迭代；清理调用者时显式退出生成器，使 finally 执行。
 
-`shadow_only=True` 时 candidate 恒为 None，正式路径仍用原回滚草稿。`raw_matched_prefix_tokens` 是完整候选与正式输出的离线比较，旧字段 `draft_matched_prefix_tokens` 仍比较两者各自跳过首 token 的后缀，仅为历史报告兼容；实际 verifier 接受数从引擎日志读取。正式 chunk 和 finish 都必须为被消费的候选设置首次验证标记，接线见 [首次验证实施说明](external_draft_first_verify_v023.md)。
+`shadow_only=True` 时 candidate 恒为 None，正式路径改用从首 token 开始的完整回滚草稿；shadow 请求本身仍用旧 `rollback_draft_token_ids`。`raw_matched_prefix_tokens` 是完整候选与正式输出的离线比较，旧字段 `draft_matched_prefix_tokens` 仍比较两者各自跳过首 token 的后缀，仅为历史报告兼容；实际 verifier 接受数从引擎日志读取。正式 chunk 和 finish 的非空草稿都必须设置首次验证标记，接线见 [首次验证实施说明](external_draft_first_verify_v023.md)。
 
 ### 六、commit 与清理：给出插入代码和字段初始化
 
@@ -729,7 +743,8 @@ def record_finish_tokens(token_ids: tuple[int, ...]) -> None:
 此函数原有流程先把剩余 `state.buffer` 并入 `state.audio_accum`，再构造完整音频的正式 finish 请求。如果 finish 和正式 chunk 一样从 `state._raw_decoded` 提取稳定前缀及回滚草稿，应在合并音频后调用**同一个** `_split_stream_rollback()`；不能让 finish 另用一套不检查 `\ufffd` 的切分。按实际成员名替换示例中的配置字段：
 
 ```python
-prefix_text, stable_prefix_token_ids, rollback_draft_token_ids = (
+(prefix_text, stable_prefix_token_ids, rollback_draft_token_ids,
+ _raw_len, _used_len, rollback_full_token_ids) = (
     self._split_stream_rollback(
         state._raw_decoded, state.chunk_id,
         self.unfixed_chunk_num, self.unfixed_token_num, self.kmax,
@@ -759,18 +774,21 @@ if (prespec is not None and prespec_ws_id is not None
 # 也不要把候选首 token 拼进 prompt；它作为首个待验证 token。
 finish_draft_token_ids = (
     candidate.formal_draft_token_ids if candidate is not None
-    else rollback_draft_token_ids
+    else rollback_full_token_ids
 )
-sampling_params.extra_args = formal_external_draft_extra_args(
-    sampling_params.extra_args,
+# 原有 finish 请求先以 finish_draft_token_ids 打包成 request_kwargs；
+# 对实际传给 engine.generate 的 SamplingParams 设置标记。
+request_kwargs["sampling_params"].extra_args = formal_external_draft_extra_args(
+    request_kwargs["sampling_params"].extra_args,
     candidate_tokens=(finish_draft_token_ids if candidate is not None else None),
     rollback_tokens=rollback_draft_token_ids,
+    rollback_full_tokens=rollback_full_token_ids,
     kmax=self.kmax,
     rejoin_policy=self.prespec_rejoin_policy,
 )
 ```
 
-`sampling_params` 必须是本次 finish 请求专用的原有对象；保留其 temperature、max_tokens、output_kind、stop/EOS 等参数和完整音频 prompt，**只替换** `ascend_external_draft` 的值。若正式 finish 用 `_pack_stream_request(...)` 打包，传入相同的 `prefix_text`、`stable_prefix_token_ids` 与 `finish_draft_token_ids`，不要重复写一遍 `extra_args`。正式结果沿用原 finish 的输出拼接与解析位置，并核对稳定前缀恰好包含一次；`finish_...` `request_id`、`engine.generate(...)` 和状态写回位置保持原有时序。紧邻原 `engine.generate(...)` 前加一条来源日志：
+`request_kwargs` 必须是本次 finish 实际提交的打包结果，其 `sampling_params` 为本请求专用对象；保留 temperature、max_tokens、output_kind、stop/EOS 等参数和完整音频 prompt，只更新 external draft 相关字段。若正式 finish 用 `_pack_stream_request(...)` 打包，传入相同的 `prefix_text`、`stable_prefix_token_ids` 与 `finish_draft_token_ids`；无论打包器是否复制对象，都在打包**之后**设置上述标记。正式结果沿用原 finish 的输出拼接与解析位置，并核对稳定前缀恰好包含一次；`finish_...` `request_id`、`engine.generate(...)` 和状态写回位置保持原有时序。紧邻原 `engine.generate(...)` 前加一条来源日志：
 
 ```python
 logger.info(
