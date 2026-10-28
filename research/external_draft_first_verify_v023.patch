@@ -155,12 +155,13 @@
 +import logging
 +
  import torch
- from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+-from vllm.v1.spec_decode.ngram_proposer import NgramProposer
++from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 +from vllm_ascend.spec_decode.external_draft_rejoin import first_mismatch, next_draft
  
  # Per-request draft tokens are transported to the worker through
  # ``SamplingParams.extra_args`` under this key by ``patch_external_draft``.
-@@ -30,6 +33,12 @@
+@@ -30,9 +33,15 @@
  # tokens between ``add_request`` and ``propose``. Kept as a module constant so
  # the producer (patch) and consumer (proposer) never drift apart.
  EXTERNAL_DRAFT_ATTR = "_external_draft_tokens"
@@ -172,7 +173,11 @@
 +logger = logging.getLogger(__name__)
  
  
- class AscendExternalDraftProposer(NgramProposer):
+-class AscendExternalDraftProposer(NgramProposer):
++class AscendExternalDraftProposer(AscendNgramProposer):
+     """Use request-provided token IDs as speculative drafts.
+ 
+     Draft tokens are supplied by the caller (e.g. an ASR streaming rollback
 @@ -81,49 +90,51 @@
          slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
      ) -> list[list[int]]:
@@ -252,75 +257,13 @@
 +                         "first_mismatch=%s strategy=%s proposed_tokens=%d",
 +                         req_id, len(confirmed), mismatch, strategy, len(outputs[i]))
          return outputs
---- a/vllm_ascend/patch/worker/patch_external_draft.py
-+++ b/vllm_ascend/patch/worker/patch_external_draft.py
-@@ -42,6 +42,10 @@
- from vllm_ascend.spec_decode.external_draft_proposer import (
-     EXTERNAL_DRAFT_ATTR,
-     EXTERNAL_DRAFT_EXTRA_ARGS_KEY,
-+    EXTERNAL_DRAFT_FIRST_VERIFY_ATTR,
-+    EXTERNAL_DRAFT_FIRST_VERIFY_KEY,
-+    EXTERNAL_DRAFT_POLICIES_ATTR,
-+    EXTERNAL_DRAFT_POLICY_KEY,
-     AscendExternalDraftProposer,
- )
- from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-@@ -86,6 +90,10 @@
- 
-     if not hasattr(self, EXTERNAL_DRAFT_ATTR):
-         setattr(self, EXTERNAL_DRAFT_ATTR, {})
-+    if not hasattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR):
-+        setattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR, set())
-+    if not hasattr(self, EXTERNAL_DRAFT_POLICIES_ATTR):
-+        setattr(self, EXTERNAL_DRAFT_POLICIES_ATTR, {})
- 
-     drafts = getattr(self, EXTERNAL_DRAFT_ATTR)
-     sampling_params = getattr(request, "sampling_params", None)
-@@ -94,6 +102,12 @@
-         tokens = extra_args.get(EXTERNAL_DRAFT_EXTRA_ARGS_KEY)
-         if tokens:
-             drafts[request.req_id] = list(tokens)
-+            if extra_args.get(EXTERNAL_DRAFT_FIRST_VERIFY_KEY, False):
-+                getattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR).add(request.req_id)
-+                policy = extra_args.get(EXTERNAL_DRAFT_POLICY_KEY, 'ngram_1')
-+                if policy not in ('aligned', 'ngram_1', 'ngram_2', 'ngram_3'):
-+                    raise ValueError(f'invalid external draft rejoin policy: {policy}')
-+                getattr(self, EXTERNAL_DRAFT_POLICIES_ATTR)[request.req_id] = policy
- 
-     return req_index
- 
-@@ -102,6 +116,12 @@
-     drafts = getattr(self, EXTERNAL_DRAFT_ATTR, None)
-     if drafts is not None:
-         drafts.pop(req_id, None)
-+    first_verify = getattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR, None)
-+    if first_verify is not None:
-+        first_verify.discard(req_id)
-+    policies = getattr(self, EXTERNAL_DRAFT_POLICIES_ATTR, None)
-+    if policies is not None:
-+        policies.pop(req_id, None)
-     return _original_remove_request(self, req_id, *args, **kwargs)
- 
- 
---- a/vllm_ascend/worker/model_runner_v1.py
-+++ b/vllm_ascend/worker/model_runner_v1.py
-@@ -138,6 +138,7 @@
-     AscendExtractHiddenStatesProposer,
- )
- from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
-+from vllm_ascend.spec_decode.external_draft_proposer import AscendExternalDraftProposer
- from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
- from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
- from vllm_ascend.spec_decode.step3p5 import AscendStep3p5MTPProposer
-@@ -1625,6 +1626,8 @@
-         if not self.drafter:
-             # Speculative decoding is not enabled.
-             draft_token_ids = None
-+        elif isinstance(self.drafter, AscendExternalDraftProposer):
-+            draft_token_ids = self.drafter.propose(valid_sampled_token_ids)
-         elif isinstance(self.drafter, AscendNgramProposer):
-             if vllm_version_is("0.23.0"):
-                 draft_token_ids = self.drafter.propose(valid_sampled_token_ids)
+--- a/vllm_ascend/patch/worker/__init__.py
++++ b/vllm_ascend/patch/worker/__init__.py
+@@ -94,3 +94,4 @@
+ # method="custom_class"; vLLM core and _310p stay untouched.
+ if vllm_version_is("0.23.0"):
+     import vllm_ascend.patch.worker.patch_external_draft  # noqa
++    import vllm_ascend.patch.worker.patch_external_draft_first_verify  # noqa
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/external_draft_rejoin.py
 @@ -0,0 +1,57 @@
@@ -381,3 +324,65 @@
 +        if tuple(candidate[next_index - n:next_index]) == anchor:
 +            return tuple(candidate[next_index:next_index + max_draft_tokens])
 +    return ()
+--- /dev/null
++++ b/vllm_ascend/patch/worker/patch_external_draft_first_verify.py
+@@ -0,0 +1,59 @@
++"""Layer first-verification metadata onto the existing external-draft patch.
++
++Import this module after ``patch_external_draft`` in each NPU worker process.
++The original patch still owns proposer registration and draft transport.
++"""
++
++from __future__ import annotations
++
++from vllm_ascend.spec_decode.external_draft_proposer import (
++    EXTERNAL_DRAFT_ATTR,
++    EXTERNAL_DRAFT_FIRST_VERIFY_ATTR,
++    EXTERNAL_DRAFT_FIRST_VERIFY_KEY,
++    EXTERNAL_DRAFT_POLICIES_ATTR,
++    EXTERNAL_DRAFT_POLICY_KEY,
++)
++from vllm_ascend.worker.npu_input_batch import NPUInputBatch
++
++
++_original_add_request = NPUInputBatch.add_request
++_original_remove_request = NPUInputBatch.remove_request
++_POLICIES = frozenset(("aligned", "ngram_1", "ngram_2", "ngram_3"))
++
++
++def _patched_add_request(self, request, *args, **kwargs):
++    params = getattr(request, "sampling_params", None)
++    extra = getattr(params, "extra_args", None) or {}
++    first_verify = extra.get(EXTERNAL_DRAFT_FIRST_VERIFY_KEY, False)
++    if first_verify:
++        if not extra.get("ascend_external_draft"):
++            raise ValueError("first-verify candidate must be nonempty")
++        policy = extra.get(EXTERNAL_DRAFT_POLICY_KEY, "ngram_1")
++        if policy not in _POLICIES:
++            raise ValueError(f"invalid external draft rejoin policy: {policy}")
++    req_index = _original_add_request(self, request, *args, **kwargs)
++    if not first_verify:
++        return req_index
++    if request.req_id not in getattr(self, EXTERNAL_DRAFT_ATTR, {}):
++        raise ValueError("first-verify candidate missing from base draft transport")
++    if not hasattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR):
++        setattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR, set())
++    if not hasattr(self, EXTERNAL_DRAFT_POLICIES_ATTR):
++        setattr(self, EXTERNAL_DRAFT_POLICIES_ATTR, {})
++    getattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR).add(request.req_id)
++    getattr(self, EXTERNAL_DRAFT_POLICIES_ATTR)[request.req_id] = policy
++    return req_index
++
++
++def _patched_remove_request(self, req_id, *args, **kwargs):
++    first_verify = getattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR, None)
++    if first_verify is not None:
++        first_verify.discard(req_id)
++    policies = getattr(self, EXTERNAL_DRAFT_POLICIES_ATTR, None)
++    if policies is not None:
++        policies.pop(req_id, None)
++    return _original_remove_request(self, req_id, *args, **kwargs)
++
++
++NPUInputBatch.add_request = _patched_add_request
++NPUInputBatch.remove_request = _patched_remove_request

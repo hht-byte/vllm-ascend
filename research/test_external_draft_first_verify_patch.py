@@ -9,10 +9,9 @@ from pathlib import Path
 from build_external_draft_first_verify_patch import (
     base_scheduler,
     make_patch,
-    model_runner,
     proposer,
     recompute_scheduler,
-    worker_patch,
+    worker_patch_registry,
 )
 
 
@@ -31,8 +30,7 @@ class EnginePatchTests(unittest.TestCase):
             (VLLM / "vllm/v1/core/sched/scheduler.py", base_scheduler),
             (ASCEND / "vllm_ascend/core/recompute_scheduler.py", recompute_scheduler),
             (ASCEND / "vllm_ascend/spec_decode/external_draft_proposer.py", proposer),
-            (ASCEND / "vllm_ascend/patch/worker/patch_external_draft.py", worker_patch),
-            (ASCEND / "vllm_ascend/worker/model_runner_v1.py", model_runner),
+            (ASCEND / "vllm_ascend/patch/worker/__init__.py", worker_patch_registry),
         )
         for path, transform in cases:
             with self.subTest(path=path):
@@ -45,6 +43,26 @@ class EnginePatchTests(unittest.TestCase):
         self.assertIn("next_draft(", patch)
         self.assertIn("/dev/null", patch)
 
+    def test_existing_monkey_patch_factory_and_runner_dispatch_are_preserved(self):
+        patch = make_patch(VLLM, ASCEND,
+                           Path(__file__).with_name("external_draft_rejoin.py"))
+        self.assertNotIn("--- a/vllm_ascend/worker/model_runner_v1.py", patch)
+        transformed = proposer(
+            (ASCEND / "vllm_ascend/spec_decode/external_draft_proposer.py")
+            .read_text(encoding="utf-8"))
+        self.assertIn("class AscendExternalDraftProposer(AscendNgramProposer):",
+                      transformed)
+        runner = (ASCEND / "vllm_ascend/worker/model_runner_v1.py").read_text(
+            encoding="utf-8")
+        self.assertIn("isinstance(self.drafter, AscendNgramProposer)", runner)
+
+    def test_first_verify_transport_layers_on_existing_monkey_patch(self):
+        patch = make_patch(VLLM, ASCEND,
+                           Path(__file__).with_name("external_draft_rejoin.py"))
+        self.assertFalse("--- a/vllm_ascend/patch/worker/patch_external_draft.py" in patch)
+        self.assertTrue("+++ b/vllm_ascend/patch/worker/patch_external_draft_first_verify.py" in patch)
+        self.assertTrue("import vllm_ascend.patch.worker.patch_external_draft_first_verify" in patch)
+
     def test_patch_applies_to_reference_files(self):
         workspace_tmp = Path(__file__).parents[1] / ".tmp"
         workspace_tmp.mkdir(exist_ok=True)
@@ -55,8 +73,7 @@ class EnginePatchTests(unittest.TestCase):
                 (VLLM, "vllm/v1/core/sched/scheduler.py"),
                 (ASCEND, "vllm_ascend/core/recompute_scheduler.py"),
                 (ASCEND, "vllm_ascend/spec_decode/external_draft_proposer.py"),
-                (ASCEND, "vllm_ascend/patch/worker/patch_external_draft.py"),
-                (ASCEND, "vllm_ascend/worker/model_runner_v1.py"),
+                (ASCEND, "vllm_ascend/patch/worker/__init__.py"),
             ):
                 target = root / name
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -82,8 +99,8 @@ class EnginePatchTests(unittest.TestCase):
                 "vllm/v1/core/sched/scheduler.py",
                 "vllm_ascend/core/recompute_scheduler.py",
                 "vllm_ascend/spec_decode/external_draft_proposer.py",
-                "vllm_ascend/patch/worker/patch_external_draft.py",
-                "vllm_ascend/worker/model_runner_v1.py",
+                "vllm_ascend/patch/worker/__init__.py",
+                "vllm_ascend/patch/worker/patch_external_draft_first_verify.py",
                 "vllm_ascend/spec_decode/external_draft_rejoin.py",
             ):
                 ast.parse((root / name).read_text(encoding="utf-8"), filename=name)

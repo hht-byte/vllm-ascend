@@ -198,9 +198,15 @@ def proposer(source: str) -> str:
     source = replace_once(
         source,
         "from vllm.v1.spec_decode.ngram_proposer import NgramProposer\n",
-        "from vllm.v1.spec_decode.ngram_proposer import NgramProposer\n"
+        "from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer\n"
         "from vllm_ascend.spec_decode.external_draft_rejoin import first_mismatch, next_draft\n",
         "proposer import",
+    )
+    source = replace_once(
+        source,
+        "class AscendExternalDraftProposer(NgramProposer):\n",
+        "class AscendExternalDraftProposer(AscendNgramProposer):\n",
+        "reuse existing Ascend ngram runner dispatch",
     )
     source = replace_once(
         source,
@@ -281,71 +287,14 @@ def proposer(source: str) -> str:
     return source
 
 
-def worker_patch(source: str) -> str:
-    source = replace_once(
+def worker_patch_registry(source: str) -> str:
+    return replace_once(
         source,
-        "    EXTERNAL_DRAFT_ATTR,\n    EXTERNAL_DRAFT_EXTRA_ARGS_KEY,\n",
-        "    EXTERNAL_DRAFT_ATTR,\n    EXTERNAL_DRAFT_EXTRA_ARGS_KEY,\n"
-        "    EXTERNAL_DRAFT_FIRST_VERIFY_ATTR,\n    EXTERNAL_DRAFT_FIRST_VERIFY_KEY,\n"
-        "    EXTERNAL_DRAFT_POLICIES_ATTR,\n    EXTERNAL_DRAFT_POLICY_KEY,\n",
-        "worker imports",
+        "    import vllm_ascend.patch.worker.patch_external_draft  # noqa\n",
+        "    import vllm_ascend.patch.worker.patch_external_draft  # noqa\n"
+        "    import vllm_ascend.patch.worker.patch_external_draft_first_verify  # noqa\n",
+        "load first-verify transport after base monkey-patch",
     )
-    source = replace_once(
-        source,
-        "    if not hasattr(self, EXTERNAL_DRAFT_ATTR):\n"
-        "        setattr(self, EXTERNAL_DRAFT_ATTR, {})\n",
-        "    if not hasattr(self, EXTERNAL_DRAFT_ATTR):\n"
-        "        setattr(self, EXTERNAL_DRAFT_ATTR, {})\n"
-        "    if not hasattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR):\n"
-        "        setattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR, set())\n"
-        "    if not hasattr(self, EXTERNAL_DRAFT_POLICIES_ATTR):\n"
-        "        setattr(self, EXTERNAL_DRAFT_POLICIES_ATTR, {})\n",
-        "worker add stores",
-    )
-    source = replace_once(
-        source,
-        "        if tokens:\n            drafts[request.req_id] = list(tokens)\n",
-        "        if tokens:\n            drafts[request.req_id] = list(tokens)\n"
-        "            if extra_args.get(EXTERNAL_DRAFT_FIRST_VERIFY_KEY, False):\n"
-        "                getattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR).add(request.req_id)\n"
-        "                policy = extra_args.get(EXTERNAL_DRAFT_POLICY_KEY, 'ngram_1')\n"
-        "                if policy not in ('aligned', 'ngram_1', 'ngram_2', 'ngram_3'):\n"
-        "                    raise ValueError(f'invalid external draft rejoin policy: {policy}')\n"
-        "                getattr(self, EXTERNAL_DRAFT_POLICIES_ATTR)[request.req_id] = policy\n",
-        "worker policy transport",
-    )
-    source = replace_once(
-        source,
-        "    if drafts is not None:\n        drafts.pop(req_id, None)\n"
-        "    return _original_remove_request(self, req_id, *args, **kwargs)\n",
-        "    if drafts is not None:\n        drafts.pop(req_id, None)\n"
-        "    first_verify = getattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR, None)\n"
-        "    if first_verify is not None:\n        first_verify.discard(req_id)\n"
-        "    policies = getattr(self, EXTERNAL_DRAFT_POLICIES_ATTR, None)\n"
-        "    if policies is not None:\n        policies.pop(req_id, None)\n"
-        "    return _original_remove_request(self, req_id, *args, **kwargs)\n",
-        "worker cleanup",
-    )
-    return source
-
-
-def model_runner(source: str) -> str:
-    source = replace_once(
-        source,
-        "from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer\n",
-        "from vllm_ascend.spec_decode.external_draft_proposer import AscendExternalDraftProposer\n"
-        "from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer\n",
-        "model runner import",
-    )
-    source = replace_once(
-        source,
-        "        elif isinstance(self.drafter, AscendNgramProposer):\n",
-        "        elif isinstance(self.drafter, AscendExternalDraftProposer):\n"
-        "            draft_token_ids = self.drafter.propose(valid_sampled_token_ids)\n"
-        "        elif isinstance(self.drafter, AscendNgramProposer):\n",
-        "model runner proposer dispatch",
-    )
-    return source
 
 
 def make_patch(vllm_root: Path, ascend_root: Path, helper: Path) -> str:
@@ -356,10 +305,8 @@ def make_patch(vllm_root: Path, ascend_root: Path, helper: Path) -> str:
          "vllm_ascend/core/recompute_scheduler.py", recompute_scheduler),
         (ascend_root / "vllm_ascend/spec_decode/external_draft_proposer.py",
          "vllm_ascend/spec_decode/external_draft_proposer.py", proposer),
-        (ascend_root / "vllm_ascend/patch/worker/patch_external_draft.py",
-         "vllm_ascend/patch/worker/patch_external_draft.py", worker_patch),
-        (ascend_root / "vllm_ascend/worker/model_runner_v1.py",
-         "vllm_ascend/worker/model_runner_v1.py", model_runner),
+        (ascend_root / "vllm_ascend/patch/worker/__init__.py",
+         "vllm_ascend/patch/worker/__init__.py", worker_patch_registry),
     ]
     chunks = []
     for path, name, transform in sources:
@@ -369,12 +316,16 @@ def make_patch(vllm_root: Path, ascend_root: Path, helper: Path) -> str:
             old.splitlines(keepends=True), new.splitlines(keepends=True),
             fromfile="a/" + name, tofile="b/" + name,
         ))
-    name = "vllm_ascend/spec_decode/external_draft_rejoin.py"
-    helper_text = helper.read_text(encoding="utf-8")
-    chunks.extend(difflib.unified_diff(
-        [], helper_text.splitlines(keepends=True),
-        fromfile="/dev/null", tofile="b/" + name,
-    ))
+    for name, path in (
+        ("vllm_ascend/spec_decode/external_draft_rejoin.py", helper),
+        ("vllm_ascend/patch/worker/patch_external_draft_first_verify.py",
+         helper.with_name("patch_external_draft_first_verify.py")),
+    ):
+        helper_text = path.read_text(encoding="utf-8")
+        chunks.extend(difflib.unified_diff(
+            [], helper_text.splitlines(keepends=True),
+            fromfile="/dev/null", tofile="b/" + name,
+        ))
     # Keep the exported patch clean even when indented snippets contain
     # whitespace-only separator lines.
     return "".join("+\n" if line.startswith("+") and not line[1:].strip()

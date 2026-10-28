@@ -2,14 +2,17 @@
 
 本变更把**预投机候选** `C[0:]` 放入正式目标请求的首次执行：scheduler 在 prefill 前写入 `request.spec_token_ids`，同次目标前向验证 `C[0]` 及后续候选。旧回滚草稿和 shadow 请求仍沿用“目标先采样一个 token，再由 proposer 提出旧草稿”的合同。首次 verifier 输出修正 token 后，proposer 保留候选池，根据**已确认的正式输出**提出下一轮草稿：首次失配在位置 0 时按位置续接；失配在后续位置时使用 `aligned` 或 `ngram_1/2/3`，默认 `ngram_1`。直到请求结束才清理候选池。
 
+现有 `patch_external_draft.py` 的两个 monkey-patch 继续负责 proposer 注册和 `ascend_external_draft` 传输。本补丁不改这个文件，也不改 `model_runner_v1.py`：proposer 继承 `AscendNgramProposer`，直接复用 0.23.0 已有的 ngram 分派；新 `patch_external_draft_first_verify.py` 在原补丁之后叠加 first-verify 和 rejoin 元数据。**仅靠现有两个 worker 侧 patch 不能完成首次并行验证**：waiting 请求的首次 token 数与 `scheduled_spec_decode_tokens` 由 scheduler 决定，所以补丁仍需修改普通及 recompute scheduler 的相应分支。
+
 ## 1. 引擎补丁
 
 [补丁文件](external_draft_first_verify_v023.patch) 是基于本机可读的 vLLM 0.23 / vLLM-Ascend 对应源码生成的 unified diff。它修改：
 
 - `vllm/v1/core/sched/scheduler.py`：普通 scheduler 首次执行前排入完整草稿；
 - `vllm_ascend/core/recompute_scheduler.py`：recompute scheduler 做同一处理；
-- `vllm_ascend/worker/model_runner_v1.py`：显式分派 `AscendExternalDraftProposer`；
-- `vllm_ascend/spec_decode/external_draft_proposer.py`、`patch/worker/patch_external_draft.py`：候选池和逐轮策略；
+- `vllm_ascend/spec_decode/external_draft_proposer.py`：复用已有 ngram 分派，保留候选池并逐轮重接；
+- `vllm_ascend/patch/worker/__init__.py`：在原有 patch 导入之后导入新 patch；
+- 新增 `vllm_ascend/patch/worker/patch_external_draft_first_verify.py`：只存取 first-verify 标记与策略；
 - 新增 `vllm_ascend/spec_decode/external_draft_rejoin.py`：纯 token-ID 选择逻辑。
 
 在 910B 的 **vLLM 源码根目录**执行：
@@ -26,7 +29,7 @@ git apply --check --include='vllm_ascend/*' /path/to/external_draft_first_verify
 git apply         --include='vllm_ascend/*' /path/to/external_draft_first_verify_v023.patch
 ```
 
-若 910B 源码与参考源码不同，先运行 `git apply --check`，按冲突函数人工移植；不要强制套用。尤其检查实际运行的是普通 scheduler 还是 recompute scheduler。引擎重启后要看到 `INITIAL_DRAFT ... status=scheduled draft_tokens=N`，否则不能声称完成首轮验证。`status=fallback` 表示本轮无法把完整 prompt 和草稿排进同次执行，转回原先“先采样首 token”的路径；不得把它算作首轮收益。
+若 910B 源码与参考源码不同，先运行 `git apply --check`，按冲突函数人工移植；不要强制套用。尤其检查实际运行的是普通 scheduler 还是 recompute scheduler。你描述的原 patch 包装 `spec_decode.get_spec_decode_method`；本地参考版包装 `NPUModelRunner._get_drafter`。两者都负责注册 proposer，本补丁不改这段，保持服务器原实现。若 `patch/worker/__init__.py` 的导入行也不同，只需在原 patch 的导入**后**加一行 `import vllm_ascend.patch.worker.patch_external_draft_first_verify`，并确认每个 worker 进程均执行。引擎重启后要看到 `INITIAL_DRAFT ... status=scheduled draft_tokens=N`，否则不能声称完成首轮验证。`status=fallback` 表示本轮无法把完整 prompt 和草稿排进同次执行，转回原先“先采样首 token”的路径；不得把它算作首轮收益。
 
 ## 2. 服务端参数与 chunk/finish 两个挂点
 
