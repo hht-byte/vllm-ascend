@@ -3,6 +3,7 @@
 import ast
 import subprocess
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -25,6 +26,29 @@ ASCEND = Path(r"E:\26B-multimodal\opencode-project\asr-optimize\vllm-ascend")
     "local 0.23 reference source unavailable",
 )
 class EnginePatchTests(unittest.TestCase):
+    def test_first_verify_accepts_scheduler_without_speculative_config_attribute(self):
+        source = base_scheduler((VLLM / "vllm/v1/core/sched/scheduler.py")
+                                .read_text(encoding="utf-8"))
+        scheduler_class = next(node for node in ast.parse(source).body
+                               if isinstance(node, ast.ClassDef) and node.name == "Scheduler")
+        helper = next(node for node in scheduler_class.body
+                      if isinstance(node, ast.FunctionDef)
+                      and node.name == "_prepare_initial_external_draft")
+        namespace = {"Request": object}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "helper", "exec"),
+             namespace)
+        scheduler = types.SimpleNamespace(num_spec_tokens=15, max_model_len=100)
+        request = types.SimpleNamespace(
+            sampling_params=types.SimpleNamespace(extra_args={
+                "ascend_external_draft_first_verify": True,
+                "ascend_external_draft": [4, 5],
+            }),
+            num_tokens=10,
+            spec_token_ids=[],
+        )
+        namespace["_prepare_initial_external_draft"](scheduler, request)
+        self.assertEqual(request.spec_token_ids, [4, 5])
+
     def test_changed_engine_files_parse(self):
         cases = (
             (VLLM / "vllm/v1/core/sched/scheduler.py", base_scheduler),

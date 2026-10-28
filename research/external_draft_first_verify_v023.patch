@@ -63,7 +63,7 @@
 +        if (not isinstance(draft, (list, tuple)) or not draft
 +                or any(type(token) is not int or token < 0 for token in draft)):
 +            raise ValueError("first-verify external draft must be nonempty token IDs")
-+        if not self.speculative_config or len(draft) > self.num_spec_tokens:
++        if self.num_spec_tokens <= 0 or len(draft) > self.num_spec_tokens:
 +            raise ValueError("first-verify draft exceeds speculative kmax")
 +        if request.num_tokens + len(draft) >= self.max_model_len:
 +            raise ValueError("first-verify draft exceeds model context")

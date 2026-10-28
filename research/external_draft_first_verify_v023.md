@@ -31,6 +31,22 @@ git apply         --include='vllm_ascend/*' /path/to/external_draft_first_verify
 
 若 910B 源码与参考源码不同，先运行 `git apply --check`，按冲突函数人工移植；不要强制套用。尤其检查实际运行的是普通 scheduler 还是 recompute scheduler。你描述的原 patch 包装 `spec_decode.get_spec_decode_method`；本地参考版包装 `NPUModelRunner._get_drafter`。两者都负责注册 proposer，本补丁不改这段，保持服务器原实现。若 `patch/worker/__init__.py` 的导入行也不同，只需在原 patch 的导入**后**加一行 `import vllm_ascend.patch.worker.patch_external_draft_first_verify`，并确认每个 worker 进程均执行。引擎重启后要看到 `INITIAL_DRAFT ... status=scheduled draft_tokens=N`，否则不能声称完成首轮验证。`status=fallback` 表示本轮无法把完整 prompt 和草稿排进同次执行，转回原先“先采样首 token”的路径；不得把它算作首轮收益。
 
+### 已应用旧版补丁的 910B 热修复
+
+若服务启动时报 `BalanceScheduler object has no attribute speculative_config`，在服务器已修改的 `vllm/v1/core/sched/scheduler.py` 的 `_prepare_initial_external_draft()` 中，把唯一一行
+
+```python
+if not self.speculative_config or len(draft) > self.num_spec_tokens:
+```
+
+改为
+
+```python
+if self.num_spec_tokens <= 0 or len(draft) > self.num_spec_tokens:
+```
+
+然后重启 EngineCore。这里 `speculative_config` 在 0.23.0 的 `Scheduler.__init__` 中只是局部变量，实际保存到实例的是 `num_spec_tokens`；不要对已应用过的引擎源码再次执行整份 unified diff。修复后先确认请求不再触发 EngineCore fatal，再用 `INITIAL_DRAFT ... status=scheduled` 和 verifier 日志验证首轮候选确实执行。
+
 ## 2. 服务端参数与 chunk/finish 两个挂点
 
 启动 parser 增加：
