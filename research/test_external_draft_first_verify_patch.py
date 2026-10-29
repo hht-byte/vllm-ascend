@@ -28,6 +28,126 @@ ASCEND = Path(r"E:\26B-multimodal\opencode-project\asr-optimize\vllm-ascend")
     "local 0.23 reference source unavailable",
 )
 class EnginePatchTests(unittest.TestCase):
+    def _candidate_proposer(self, candidate):
+        source = proposer((ASCEND / "vllm_ascend/spec_decode/external_draft_proposer.py")
+                          .read_text(encoding="utf-8"))
+        cls = next(node for node in ast.parse(source).body
+                   if isinstance(node, ast.ClassDef)
+                   and node.name == "AscendExternalDraftProposer")
+        method = next(node for node in cls.body
+                      if isinstance(node, ast.FunctionDef) and node.name == "propose")
+        method.decorator_list = []
+        namespace = {
+            "EXTERNAL_DRAFT_ATTR": "_external_draft_tokens",
+            "EXTERNAL_DRAFT_FIRST_VERIFY_ATTR": "_external_draft_first_verify",
+            "EXTERNAL_DRAFT_POLICIES_ATTR": "_external_draft_policies",
+            "EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR": "_external_draft_last_proposal",
+            "EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR": "_external_draft_aligned_blocked",
+            "EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_ATTR": "_external_draft_first_mismatch_ngram",
+            "first_mismatch": first_mismatch,
+            "next_draft": next_draft,
+            "logger": types.SimpleNamespace(debug=lambda *args: None),
+        }
+        exec(compile(ast.Module(body=[method], type_ignores=[]), "propose", "exec"),
+             namespace)
+
+        class TokenTable:
+            def __init__(self):
+                self.row = [101, 102, 103] + [0] * 20
+
+            def __getitem__(self, key):
+                row, columns = key
+                assert row == 0
+                return self.row[columns]
+
+            def __setitem__(self, key, value):
+                raise AssertionError("first-verify path must not rewrite bookkept tokens")
+
+        batch = types.SimpleNamespace(
+            req_ids=["request"], spec_decode_unsupported_reqs=set(),
+            num_tokens_no_spec=[4], num_prompt_tokens=[3], max_model_len=23,
+            token_ids_cpu=TokenTable(),
+            _external_draft_tokens={"request": list(candidate)},
+            _external_draft_first_verify={"request"},
+            _external_draft_policies={"request": "ngram_1"},
+            _external_draft_last_proposal={},
+            _external_draft_aligned_blocked=set(),
+            _external_draft_first_mismatch_ngram={"request"},
+        )
+        proposer_obj = types.SimpleNamespace(
+            runner=types.SimpleNamespace(input_batch=batch), k=15)
+        return namespace["propose"], proposer_obj, batch
+
+    def test_prespec_uses_ngram_after_aligned_second_token_rejected(self):
+        propose, proposer_obj, batch = self._candidate_proposer((1, 2, 3, 4, 5))
+        batch.token_ids_cpu.row[3] = 9
+        self.assertEqual(propose(proposer_obj, [[9]]), [[2, 3, 4, 5]])
+        batch.token_ids_cpu.row[4] = 3
+        batch.num_tokens_no_spec[0] = 5
+        self.assertEqual(propose(proposer_obj, [[3]]), [[4, 5]])
+
+    def test_prespec_rechecks_ngram_after_ar_and_later_anchor(self):
+        propose, proposer_obj, batch = self._candidate_proposer((1, 2, 3, 4, 5, 6, 7))
+        batch.token_ids_cpu.row[3] = 9
+        self.assertEqual(propose(proposer_obj, [[9]]), [[2, 3, 4, 5, 6, 7]])
+        batch.token_ids_cpu.row[4] = 8
+        batch.num_tokens_no_spec[0] = 5
+        self.assertEqual(propose(proposer_obj, [[8]]), [[]])
+        batch.token_ids_cpu.row[5] = 3
+        batch.num_tokens_no_spec[0] = 6
+        self.assertEqual(propose(proposer_obj, [[3]]), [[4, 5, 6, 7]])
+        batch.token_ids_cpu.row[6] = 5
+        batch.num_tokens_no_spec[0] = 7
+        self.assertEqual(propose(proposer_obj, [[5]]), [[6, 7]])
+        batch.token_ids_cpu.row[7] = 6
+        batch.num_tokens_no_spec[0] = 8
+        self.assertEqual(propose(proposer_obj, [[6]]), [[7]])
+
+    def test_prespec_can_retry_same_anchor_in_new_target_context(self):
+        propose, proposer_obj, batch = self._candidate_proposer((1, 2, 3, 4, 3, 4))
+        batch.token_ids_cpu.row[3] = 9
+        self.assertEqual(propose(proposer_obj, [[9]]), [[2, 3, 4, 3, 4]])
+        batch.token_ids_cpu.row[4] = 3
+        batch.num_tokens_no_spec[0] = 5
+        self.assertEqual(propose(proposer_obj, [[3]]), [[4]])
+        batch.token_ids_cpu.row[5] = 3
+        batch.num_tokens_no_spec[0] = 6
+        self.assertEqual(propose(proposer_obj, [[3]]), [[4]])
+
+    def test_prespec_partial_aligned_acceptance_switches_to_ngram(self):
+        propose, proposer_obj, batch = self._candidate_proposer((1, 2, 3, 4, 8, 5))
+        batch.token_ids_cpu.row[3] = 9
+        self.assertEqual(propose(proposer_obj, [[9]]), [[2, 3, 4, 8, 5]])
+        batch.token_ids_cpu.row[4:7] = [2, 3, 8]
+        batch.num_tokens_no_spec[0] = 7
+        self.assertEqual(propose(proposer_obj, [[2, 3, 8]]), [[5]])
+
+    def test_prespec_complete_aligned_suffix_has_no_more_candidate(self):
+        propose, proposer_obj, batch = self._candidate_proposer((1, 2, 3))
+        batch.token_ids_cpu.row[3] = 9
+        self.assertEqual(propose(proposer_obj, [[9]]), [[2, 3]])
+        batch.token_ids_cpu.row[4:7] = [2, 3, 8]
+        batch.num_tokens_no_spec[0] = 7
+        self.assertEqual(propose(proposer_obj, [[2, 3, 8]]), [[]])
+
+    def test_prespec_truncated_full_acceptance_keeps_aligned_continuation(self):
+        propose, proposer_obj, batch = self._candidate_proposer((1, 2, 3, 4, 5, 4, 6))
+        batch.token_ids_cpu.row[3] = 9
+        self.assertEqual(propose(proposer_obj, [[9]]), [[2, 3, 4, 5, 4, 6]])
+        # The scheduler may verify only [2, 3] and sample 4 as a bonus.
+        batch.token_ids_cpu.row[4:7] = [2, 3, 4]
+        batch.num_tokens_no_spec[0] = 7
+        self.assertEqual(propose(proposer_obj, [[2, 3, 4]]), [[5, 4, 6]])
+
+    def test_prespec_target_only_matching_token_keeps_alignment(self):
+        propose, proposer_obj, batch = self._candidate_proposer((1, 2, 3, 2, 4))
+        batch.token_ids_cpu.row[3] = 9
+        self.assertEqual(propose(proposer_obj, [[9]]), [[2, 3, 2, 4]])
+        # A scheduler step can omit the draft and sample T1 autoregressively.
+        batch.token_ids_cpu.row[4] = 2
+        batch.num_tokens_no_spec[0] = 5
+        self.assertEqual(propose(proposer_obj, [[2]]), [[3, 2, 4]])
+
     def test_first_verify_reads_bookkept_prefix_and_stops_after_failed_aligned_retry(self):
         source = proposer((ASCEND / "vllm_ascend/spec_decode/external_draft_proposer.py")
                           .read_text(encoding="utf-8"))
@@ -43,6 +163,7 @@ class EnginePatchTests(unittest.TestCase):
             "EXTERNAL_DRAFT_POLICIES_ATTR": "_external_draft_policies",
             "EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR": "_external_draft_last_proposal",
             "EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR": "_external_draft_aligned_blocked",
+            "EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_ATTR": "_external_draft_first_mismatch_ngram",
             "first_mismatch": first_mismatch,
             "next_draft": next_draft,
             "logger": types.SimpleNamespace(debug=lambda *args: None),
@@ -76,8 +197,8 @@ class EnginePatchTests(unittest.TestCase):
         proposer_obj = types.SimpleNamespace(runner=types.SimpleNamespace(input_batch=batch), k=15)
         self.assertEqual(namespace["propose"](proposer_obj, [[9]]), [[2, 3, 4]])
         batch.num_tokens_no_spec[0] = 5
-        batch.token_ids_cpu.row[4] = 8
-        self.assertEqual(namespace["propose"](proposer_obj, [[8]]), [[]])
+        batch.token_ids_cpu.row[4] = 3
+        self.assertEqual(namespace["propose"](proposer_obj, [[3]]), [[]])
         self.assertIn("request", batch._external_draft_aligned_blocked)
 
         class LegacyTokenTable(TokenTable):

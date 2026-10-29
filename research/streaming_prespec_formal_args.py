@@ -38,6 +38,7 @@ def formal_external_draft_extra_args(
     kmax: int,
     rejoin_policy: RejoinPolicy = "ngram_1",
     rollback_first_verify: bool = True,
+    prespec_first_mismatch_ngram: bool = True,
 ) -> dict[str, object]:
     """Select a candidate or rollback draft for the formal request.
 
@@ -53,9 +54,12 @@ def formal_external_draft_extra_args(
         raise ValueError("kmax must be positive")
     if type(rollback_first_verify) is not bool:
         raise TypeError("rollback_first_verify must be a bool")
+    if type(prespec_first_mismatch_ngram) is not bool:
+        raise TypeError("prespec_first_mismatch_ngram must be a bool")
     args = dict(existing or {})
     args.pop("ascend_external_draft_first_verify", None)
     args.pop("ascend_external_draft_rejoin", None)
+    args.pop("ascend_external_draft_ngram_after_first_mismatch", None)
     if candidate_tokens is not None:
         draft = candidate_tokens
         first_verify = True
@@ -77,4 +81,7 @@ def formal_external_draft_extra_args(
     if first_verify:
         args["ascend_external_draft_first_verify"] = True
         args["ascend_external_draft_rejoin"] = rejoin_policy
+        if (candidate_tokens is not None and prespec_first_mismatch_ngram
+                and rejoin_policy != "aligned"):
+            args["ascend_external_draft_ngram_after_first_mismatch"] = True
     return args

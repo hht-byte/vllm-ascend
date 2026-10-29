@@ -161,7 +161,7 @@
  
  # Per-request draft tokens are transported to the worker through
  # ``SamplingParams.extra_args`` under this key by ``patch_external_draft``.
-@@ -30,9 +33,17 @@
+@@ -30,9 +33,19 @@
  # tokens between ``add_request`` and ``propose``. Kept as a module constant so
  # the producer (patch) and consumer (proposer) never drift apart.
  EXTERNAL_DRAFT_ATTR = "_external_draft_tokens"
@@ -173,6 +173,8 @@
 +logger = logging.getLogger(__name__)
 +EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR = "_external_draft_last_proposal"
 +EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR = "_external_draft_aligned_blocked"
++EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_KEY = "ascend_external_draft_ngram_after_first_mismatch"
++EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_ATTR = "_external_draft_first_mismatch_ngram"
  
  
 -class AscendExternalDraftProposer(NgramProposer):
@@ -180,7 +182,7 @@
      """Use request-provided token IDs as speculative drafts.
  
      Draft tokens are supplied by the caller (e.g. an ASR streaming rollback
-@@ -81,49 +92,63 @@
+@@ -81,49 +94,75 @@
          slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
      ) -> list[list[int]]:
          input_batch = self.runner.input_batch
@@ -193,6 +195,7 @@
  
 +        first_verify = getattr(input_batch, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR, set())
 +        policies = getattr(input_batch, EXTERNAL_DRAFT_POLICIES_ATTR, {})
++        first_mismatch_ngram = getattr(input_batch, EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_ATTR, set())
          for i, sampled_ids in enumerate(sampled_token_ids):
 -            num_sampled_ids = len(sampled_ids)
 -            if not num_sampled_ids:
@@ -251,21 +254,32 @@
 +            confirmed = tuple(int(token) for token in
 +                              input_batch.token_ids_cpu[i, prompt_len:num_tokens])
 +            mismatch = first_mismatch(candidate, confirmed)
-+            strategy = ("aligned" if mismatch is None or mismatch == 0
-+                        else policies.get(req_id, "ngram_1"))
 +            last_proposals = getattr(input_batch, EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR, {})
 +            aligned_blocked = getattr(input_batch, EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR, set())
 +            previous = last_proposals.get(req_id)
-+            # A rejected aligned retry yields only one replacement token.
-+            # Stop instead of verifying each shorter suffix again.
-+            if previous and previous[0] == "aligned" and len(sampled_ids) <= 1:
++            # The scheduler can verify only a prefix of C[1:] and emit a
++            # bonus token. Switch only after a confirmed token differs at a
++            # post-first position, regardless of the scheduled draft length.
++            if req_id in first_mismatch_ngram and mismatch == 0:
++                if first_mismatch(candidate[1:], confirmed[1:]) is not None:
++                    aligned_blocked.add(req_id)
++            elif previous and previous[0] == "aligned" and len(sampled_ids) <= 1:
++                # Preserve the old rollback and non-first-mismatch stop.
 +                aligned_blocked.add(req_id)
++            after_aligned_retry = (req_id in first_mismatch_ngram and
++                                   mismatch == 0 and req_id in aligned_blocked)
++            strategy = (policies.get(req_id, "ngram_1") if
++                        after_aligned_retry or mismatch not in (None, 0)
++                        else "aligned")
 +            max_draft_len = min(self.k, input_batch.max_model_len - num_tokens)
-+            if max_draft_len > 0 and not (strategy == "aligned" and req_id in aligned_blocked):
++            if (max_draft_len > 0 and
++                    not (strategy == "aligned" and req_id in aligned_blocked)):
 +                outputs[i] = list(next_draft(
 +                    candidate, confirmed, policy=policies.get(req_id, "ngram_1"),
-+                    max_draft_tokens=max_draft_len))
-+                if outputs[i] and previous and len(sampled_ids) <= 1 and tuple(outputs[i]) == previous[1]:
++                    max_draft_tokens=max_draft_len,
++                    after_aligned_retry=after_aligned_retry))
++                if (outputs[i] and not after_aligned_retry and previous and
++                        len(sampled_ids) <= 1 and tuple(outputs[i]) == previous[1]):
 +                    outputs[i] = []
 +            if outputs[i]:
 +                last_proposals[req_id] = (strategy, tuple(outputs[i]))
@@ -282,7 +296,7 @@
 +    import vllm_ascend.patch.worker.patch_external_draft_first_verify  # noqa
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/external_draft_rejoin.py
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,60 @@
 +"""Choose external drafts using only confirmed target output tokens.
 +
 +The first draft is submitted by the scheduler before the target's first
@@ -314,12 +328,14 @@
 +    *,
 +    policy: RejoinPolicy = "ngram_1",
 +    max_draft_tokens: int,
++    after_aligned_retry: bool = False,
 +) -> tuple[int, ...]:
 +    """Select a continuation after the sampled/verifier-confirmed prefix.
 +
-+    First-token mismatch uses the candidate at the same absolute output
-+    position. Later mismatch uses the rightmost exact n-gram anchor in the
-+    candidate. Before any mismatch, the aligned remaining suffix is used.
++    First-token mismatch initially uses the candidate at the same absolute
++    output position. After that aligned retry fails, callers may enable
++    n-gram rejoining even though the first mismatch remains at position zero.
++    Before any mismatch, the aligned remaining suffix is used.
 +    The caller must pass only committed target output IDs, never speculative
 +    IDs still waiting for verification.
 +    """
@@ -329,7 +345,8 @@
 +        raise ValueError("max_draft_tokens must be positive")
 +    position = len(confirmed)
 +    mismatch = first_mismatch(candidate, confirmed)
-+    if policy == "aligned" or mismatch is None or mismatch == 0:
++    if policy == "aligned" or mismatch is None or (mismatch == 0 and
++                                                not after_aligned_retry):
 +        return tuple(candidate[position:position + max_draft_tokens])
 +
 +    n = int(policy[-1])
@@ -342,7 +359,7 @@
 +    return ()
 --- /dev/null
 +++ b/vllm_ascend/patch/worker/patch_external_draft_first_verify.py
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,87 @@
 +"""Layer first-verification metadata onto the existing external-draft patch.
 +
 +Import this module after ``patch_external_draft`` in each NPU worker process.
@@ -356,6 +373,8 @@
 +    EXTERNAL_DRAFT_ATTR,
 +    EXTERNAL_DRAFT_FIRST_VERIFY_ATTR,
 +    EXTERNAL_DRAFT_FIRST_VERIFY_KEY,
++    EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_ATTR,
++    EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_KEY,
 +    EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR,
 +    EXTERNAL_DRAFT_POLICIES_ATTR,
 +    EXTERNAL_DRAFT_POLICY_KEY,
@@ -372,12 +391,19 @@
 +    params = getattr(request, "sampling_params", None)
 +    extra = getattr(params, "extra_args", None) or {}
 +    first_verify = extra.get(EXTERNAL_DRAFT_FIRST_VERIFY_KEY, False)
++    first_mismatch_ngram = extra.get(EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_KEY, False)
++    if type(first_mismatch_ngram) is not bool:
++        raise TypeError("first-mismatch ngram marker must be a bool")
++    if first_mismatch_ngram and not first_verify:
++        raise ValueError("first-mismatch ngram requires first verification")
 +    if first_verify:
 +        if not extra.get("ascend_external_draft"):
 +            raise ValueError("first-verify candidate must be nonempty")
 +        policy = extra.get(EXTERNAL_DRAFT_POLICY_KEY, "ngram_1")
 +        if policy not in _POLICIES:
 +            raise ValueError(f"invalid external draft rejoin policy: {policy}")
++        if first_mismatch_ngram and policy == "aligned":
++            raise ValueError("first-mismatch ngram requires an ngram policy")
 +    req_index = _original_add_request(self, request, *args, **kwargs)
 +    if not first_verify:
 +        return req_index
@@ -391,8 +417,12 @@
 +        setattr(self, EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR, {})
 +    if not hasattr(self, EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR):
 +        setattr(self, EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR, set())
++    if not hasattr(self, EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_ATTR):
++        setattr(self, EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_ATTR, set())
 +    getattr(self, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR).add(request.req_id)
 +    getattr(self, EXTERNAL_DRAFT_POLICIES_ATTR)[request.req_id] = policy
++    if first_mismatch_ngram:
++        getattr(self, EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_ATTR).add(request.req_id)
 +    return req_index
 +
 +
@@ -409,6 +439,9 @@
 +    aligned_blocked = getattr(self, EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR, None)
 +    if aligned_blocked is not None:
 +        aligned_blocked.discard(req_id)
++    first_mismatch_ngram = getattr(self, EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_ATTR, None)
++    if first_mismatch_ngram is not None:
++        first_mismatch_ngram.discard(req_id)
 +    return _original_remove_request(self, req_id, *args, **kwargs)
 +
 +

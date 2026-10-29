@@ -645,7 +645,7 @@ python streaming_prespec_gain.py \
 
 ### 4.2 首次失配后的候选重接：离线初筛
 
-`raw_matched_prefix_tokens=0` 但 `draft_matched_prefix_tokens>0` 表示首 token 不同、后缀相同；新方案在首次验证失配后用按位置续接尝试这个后缀。正式 verifier 中途拒绝后则按 `--prespec-rejoin-policy` 重接。以下旧日志回放仍以原来的 `candidate[1:]` 实现为基准，不能当作新方案的线上收益：
+`raw_matched_prefix_tokens=0` 但 `draft_matched_prefix_tokens>0` 表示首 token 不同、后缀相同；新方案在首次验证失配后一次性用按位置续接验证 `C[1:]`。这次验证若仍失配，预投机候选按 `--prespec-rejoin-policy` 的 ngram 策略寻找锚点；没有锚点时自回归，后续确认 token 可继续触发搜索，找到锚点就验证该后缀。`--no-prespec-first-mismatch-ngram` 可单独关闭这一阶段以做 A/B；回滚草稿仍用原有失配路径。以下旧日志回放仍以原来的 `candidate[1:]` 实现为基准，不能当作新方案的线上收益：
 
 ```bash
 cp /path/to/vllm-ascend/research/streaming_prespec_rejoin.py ./

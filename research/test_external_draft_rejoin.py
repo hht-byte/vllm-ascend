@@ -15,6 +15,18 @@ class RejoinTests(unittest.TestCase):
                                     policy="ngram_3", max_draft_tokens=3),
                          (2, 3, 4))
 
+    def test_first_token_mismatch_uses_ngram_after_aligned_retry(self):
+        candidate = (1, 2, 3, 4, 5)
+        self.assertEqual(next_draft(candidate, (9, 3), policy="ngram_1",
+                                    max_draft_tokens=4,
+                                    after_aligned_retry=True), (4, 5))
+
+    def test_first_token_mismatch_without_ngram_anchor_returns_no_draft(self):
+        candidate = (325, 5580, 26241, 2328, 151645)
+        self.assertEqual(next_draft(candidate, (1514, 438), policy="ngram_1",
+                                    max_draft_tokens=4,
+                                    after_aligned_retry=True), ())
+
     def test_later_mismatch_uses_rightmost_ngram_anchor(self):
         candidate = (10, 20, 30, 40, 20, 30, 50, 60)
         confirmed = (10, 20, 30, 99, 20, 30)

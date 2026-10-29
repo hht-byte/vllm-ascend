@@ -217,7 +217,9 @@ def proposer(source: str) -> str:
         'EXTERNAL_DRAFT_FIRST_VERIFY_ATTR = "_external_draft_first_verify"\n'
         'EXTERNAL_DRAFT_POLICIES_ATTR = "_external_draft_policies"\n'
         'EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR = "_external_draft_last_proposal"\n'
-        'EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR = "_external_draft_aligned_blocked"\n',
+        'EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR = "_external_draft_aligned_blocked"\n'
+        'EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_KEY = "ascend_external_draft_ngram_after_first_mismatch"\n'
+        'EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_ATTR = "_external_draft_first_mismatch_ngram"\n',
         "proposer constants",
     )
     source = replace_once(
@@ -244,6 +246,7 @@ def proposer(source: str) -> str:
 
         first_verify = getattr(input_batch, EXTERNAL_DRAFT_FIRST_VERIFY_ATTR, set())
         policies = getattr(input_batch, EXTERNAL_DRAFT_POLICIES_ATTR, {})
+        first_mismatch_ngram = getattr(input_batch, EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_ATTR, set())
         for i, sampled_ids in enumerate(sampled_token_ids):
             if not sampled_ids:
                 continue
@@ -275,21 +278,32 @@ def proposer(source: str) -> str:
             confirmed = tuple(int(token) for token in
                               input_batch.token_ids_cpu[i, prompt_len:num_tokens])
             mismatch = first_mismatch(candidate, confirmed)
-            strategy = ("aligned" if mismatch is None or mismatch == 0
-                        else policies.get(req_id, "ngram_1"))
             last_proposals = getattr(input_batch, EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR, {})
             aligned_blocked = getattr(input_batch, EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR, set())
             previous = last_proposals.get(req_id)
-            # A rejected aligned retry yields only one replacement token.
-            # Stop instead of verifying each shorter suffix again.
-            if previous and previous[0] == "aligned" and len(sampled_ids) <= 1:
+            # The scheduler can verify only a prefix of C[1:] and emit a
+            # bonus token. Switch only after a confirmed token differs at a
+            # post-first position, regardless of the scheduled draft length.
+            if req_id in first_mismatch_ngram and mismatch == 0:
+                if first_mismatch(candidate[1:], confirmed[1:]) is not None:
+                    aligned_blocked.add(req_id)
+            elif previous and previous[0] == "aligned" and len(sampled_ids) <= 1:
+                # Preserve the old rollback and non-first-mismatch stop.
                 aligned_blocked.add(req_id)
+            after_aligned_retry = (req_id in first_mismatch_ngram and
+                                   mismatch == 0 and req_id in aligned_blocked)
+            strategy = (policies.get(req_id, "ngram_1") if
+                        after_aligned_retry or mismatch not in (None, 0)
+                        else "aligned")
             max_draft_len = min(self.k, input_batch.max_model_len - num_tokens)
-            if max_draft_len > 0 and not (strategy == "aligned" and req_id in aligned_blocked):
+            if (max_draft_len > 0 and
+                    not (strategy == "aligned" and req_id in aligned_blocked)):
                 outputs[i] = list(next_draft(
                     candidate, confirmed, policy=policies.get(req_id, "ngram_1"),
-                    max_draft_tokens=max_draft_len))
-                if outputs[i] and previous and len(sampled_ids) <= 1 and tuple(outputs[i]) == previous[1]:
+                    max_draft_tokens=max_draft_len,
+                    after_aligned_retry=after_aligned_retry))
+                if (outputs[i] and not after_aligned_retry and previous and
+                        len(sampled_ids) <= 1 and tuple(outputs[i]) == previous[1]):
                     outputs[i] = []
             if outputs[i]:
                 last_proposals[req_id] = (strategy, tuple(outputs[i]))

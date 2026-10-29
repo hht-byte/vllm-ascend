@@ -35,6 +35,8 @@ class TransportPatchTests(unittest.TestCase):
         proposer.EXTERNAL_DRAFT_FIRST_VERIFY_ATTR = "_external_draft_first_verify"
         proposer.EXTERNAL_DRAFT_FIRST_VERIFY_KEY = "ascend_external_draft_first_verify"
         proposer.EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR = "_external_draft_last_proposal"
+        proposer.EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_ATTR = "_external_draft_first_mismatch_ngram"
+        proposer.EXTERNAL_DRAFT_FIRST_MISMATCH_NGRAM_KEY = "ascend_external_draft_ngram_after_first_mismatch"
         proposer.EXTERNAL_DRAFT_POLICIES_ATTR = "_external_draft_policies"
         proposer.EXTERNAL_DRAFT_POLICY_KEY = "ascend_external_draft_rejoin"
         batch_module = types.ModuleType("vllm_ascend.worker.npu_input_batch")
@@ -64,16 +66,29 @@ class TransportPatchTests(unittest.TestCase):
             "ascend_external_draft": [10, 11],
             "ascend_external_draft_first_verify": True,
             "ascend_external_draft_rejoin": "ngram_2",
+            "ascend_external_draft_ngram_after_first_mismatch": True,
         })
         self.assertEqual(batch.add_request(request), 3)
         self.assertEqual(batch._external_draft_tokens["a"], [10, 11])
         self.assertEqual(batch._external_draft_first_verify, {"a"})
         self.assertEqual(batch._external_draft_policies, {"a": "ngram_2"})
+        self.assertEqual(batch._external_draft_first_mismatch_ngram, {"a"})
         batch.remove_request("a")
         self.assertEqual(batch.requests, set())
         self.assertEqual(batch._external_draft_tokens, {})
         self.assertEqual(batch._external_draft_first_verify, set())
         self.assertEqual(batch._external_draft_policies, {})
+        self.assertEqual(batch._external_draft_first_mismatch_ngram, set())
+
+    def test_rollback_first_verify_keeps_candidate_rejoin_disabled(self):
+        batch = self._load()()
+        batch.add_request(self._request("rollback", {
+            "ascend_external_draft": [10, 11],
+            "ascend_external_draft_first_verify": True,
+            "ascend_external_draft_rejoin": "ngram_1",
+        }))
+        self.assertEqual(batch._external_draft_first_verify, {"rollback"})
+        self.assertEqual(getattr(batch, "_external_draft_first_mismatch_ngram", set()), set())
 
     def test_rollback_does_not_get_first_verify_metadata(self):
         batch = self._load()()

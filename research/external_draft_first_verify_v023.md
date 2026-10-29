@@ -1,6 +1,6 @@
 # vLLM 0.23：预投机首轮并行验证与失配重接
 
-默认设置让正式请求把**完整预投机候选或完整回滚草稿** `C[0:]` 放入首次目标执行：scheduler 在 prefill 前写入 `request.spec_token_ids`，同次前向验证 `C[0]` 及后续 token。shadow 请求仍沿用“目标先采样一个 token，再由 proposer 提出旧回滚草稿 `C[1:]`”的合同。首次 verifier 输出修正 token 后，proposer 保留本次完整草稿，根据**已确认的正式输出**提出下一轮草稿：首次失配在位置 0 时按位置续接；失配在后续位置时使用 `aligned` 或 `ngram_1/2/3`，默认 `ngram_1`。直到请求结束才清理草稿池。
+默认设置让正式请求把**完整预投机候选或完整回滚草稿** `C[0:]` 放入首次目标执行：scheduler 在 prefill 前写入 `request.spec_token_ids`，同次前向验证 `C[0]` 及后续 token。shadow 请求仍沿用“目标先采样一个 token，再由 proposer 提出旧回滚草稿 `C[1:]`”的合同。首次 verifier 输出修正 token 后，proposer 保留本次完整草稿，只根据**已确认的正式输出**选择续接。预投机候选若在位置 0 失配，先按位置一次性验证 `C[1:]`；这一次验证若又失配，按 `ngram_1/2/3` 搜索锚点（默认 `ngram_1`），无锚点时由目标模型自回归，并在新 token 确认后继续搜索。即使同一锚点在新的目标上下文中再次出现，也允许重新验证；`aligned` 策略及回滚草稿保留原有行为。直到请求结束才清理草稿池。
 
 现有 `patch_external_draft.py` 的两个 monkey-patch 继续负责 proposer 注册和 `ascend_external_draft` 传输。本补丁不改这个文件，也不改 `model_runner_v1.py`：proposer 继承 `AscendNgramProposer`，直接复用 0.23.0 已有的 ngram 分派；新 `patch_external_draft_first_verify.py` 在原补丁之后叠加 first-verify 和 rejoin 元数据。**仅靠现有两个 worker 侧 patch 不能完成首次并行验证**：waiting 请求的首次 token 数与 `scheduled_spec_decode_tokens` 由 scheduler 决定，所以补丁仍需修改普通及 recompute scheduler 的相应分支。
 
@@ -14,6 +14,10 @@
 - `vllm_ascend/patch/worker/__init__.py`：在原有 patch 导入之后导入新 patch；
 - 新增 `vllm_ascend/patch/worker/patch_external_draft_first_verify.py`：只存取 first-verify 标记与策略；
 - 新增 `vllm_ascend/spec_decode/external_draft_rejoin.py`：纯 token-ID 选择逻辑。
+
+正式请求的 helper 仅在**选中预投机候选、开启新策略且 rejoin policy 为 ngram** 时写入 `ascend_external_draft_ngram_after_first_mismatch=True`。worker 据此区分候选与回滚的首 token 失配路径，并在请求结束时清理阶段状态。`--prespec-rejoin-policy aligned` 或 `--no-prespec-first-mismatch-ngram` 不写入该标记。
+
+若服务器已经应用此前的首轮验证补丁，不要把本文件对应的完整 unified diff 再次直接套在已修改源码上。更新服务侧 `streaming_prespec_formal_args.py`，并将新补丁中 `external_draft_rejoin.py`、`external_draft_proposer.py`、`patch_external_draft_first_verify.py` 的变更移植到现有文件；普通和 recompute scheduler 无需为这次重接策略再改。重启全部 worker 后才会生效。
 
 在 910B 的 **vLLM 源码根目录**执行：
 
@@ -57,9 +61,15 @@ parser.add_argument(
     choices=("aligned", "ngram_1", "ngram_2", "ngram_3"),
     default="ngram_1",
 )
+parser.add_argument(
+    "--prespec-first-mismatch-ngram",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="after a rejected first candidate token, use ngram rejoining if the aligned suffix also diverges",
+)
 ```
 
-沿现有 `Qwen3ASRModelAsync.AsyncLLM(**base_config)` 调用显式传 `prespec_rejoin_policy=args.prespec_rejoin_policy`；类方法接收它后传入 `enable_prespec(rejoin_policy=prespec_rejoin_policy)`，后者校验并保存 `self.prespec_rejoin_policy`。详细形参位置见 [验证文档](streaming_prespec_validation.md)。不用环境变量。
+沿现有 `Qwen3ASRModelAsync.AsyncLLM(**base_config)` 调用显式传 `prespec_rejoin_policy=args.prespec_rejoin_policy` 和 `prespec_first_mismatch_ngram=args.prespec_first_mismatch_ngram`；类方法接收前者后传入 `enable_prespec(rejoin_policy=prespec_rejoin_policy)`，并将后者保存为 `self.prespec_first_mismatch_ngram`。详细形参位置见 [验证文档](streaming_prespec_validation.md)。不用环境变量。
 
 把 [服务侧 helper](streaming_prespec_formal_args.py) 复制到 `qwen_asr/inference/streaming_prespec_formal_args.py`。910B 的 `_split_stream_rollback()` 在固定阶段用 `cur_ids[1:]`、动态阶段用 `cur_ids[end_idx + 1:]` 形成旧草稿；两者都缺少首次待验证的 token。保留旧 `external_draft` 给 shadow 使用，并在该函数原有 `return` 前增加完整正式草稿：
 
@@ -95,6 +105,7 @@ request_kwargs["sampling_params"].extra_args = formal_external_draft_extra_args(
     rollback_full_tokens=rollback_full_token_ids,
     kmax=self.kmax,
     rejoin_policy=self.prespec_rejoin_policy,
+    prespec_first_mismatch_ngram=self.prespec_first_mismatch_ngram,
 )
 submitted_draft_ids = tuple(
     request_kwargs["sampling_params"].extra_args["ascend_external_draft"]
@@ -137,6 +148,7 @@ request_kwargs["sampling_params"].extra_args = formal_external_draft_extra_args(
     kmax=self.kmax,
     rejoin_policy=self.prespec_rejoin_policy,
     rollback_first_verify=self.rollback_first_verify,
+    prespec_first_mismatch_ngram=self.prespec_first_mismatch_ngram,
 )
 submitted_draft_ids = tuple(
     request_kwargs["sampling_params"].extra_args["ascend_external_draft"]
@@ -148,7 +160,7 @@ draft_source = ("prespec" if candidate is not None else
 
 关 (`--no-rollback-first-verify`) 且无候选时，helper 只提交原有 `rollback_draft_token_ids=C[1:]`，删除首次验证及重接标记。worker 保留旧的一次性 proposer 路径：目标首次执行先产生 `T[0]`，下一轮才验证旧草稿；原旧草稿可能长达 `kmax`，不能直接用 `rollback_full_token_ids[1:]` 代替，否则会无意少提交最后一个 token。开时提交 `rollback_full_token_ids=C[0:]`，包括首 token。两种设置下，只要领取了 prespec 候选，仍提交完整候选并启用首次验证。`submitted_draft_tokens`、`draft_source` 和统计有效性必须在 helper 覆盖后按实际发送值重算，尤其要处理关时完整回滚只有一个 token、旧草稿为空的 `draft_source=none` 情况。
 
-隔离比较时，先确认 `--prespec-mode off` 下正式 chunk 和 finish 仍调用该 helper，再用同一组音频和并发分别以 `--prespec-mode off --rollback-first-verify`、`--prespec-mode off --no-rollback-first-verify` 运行并重启服务，其他参数不变。真实 consume 负载也可固定 `--prespec-mode consume` 重复两组；同时报告候选覆盖率，避免仅按本轮 `draft_source=rollback` 过滤造成样本选择偏差。开组的 rollback 正式请求应看到 `INITIAL_DRAFT status=scheduled`，首个 `ASR_VERIFY_STEP` 的有效草稿包含 `C[0]`；关组不应有该 `INITIAL_DRAFT`，首次验证在目标已采样 `T[0]` 后进行，首个 verifier 接受数对应 `C[1:]`，不能用于计算首 token 匹配率。两组比较同音频请求的输出 token 数、正式解码轮次、实际目标执行次数、commit 延迟和队列等待；`decode_rounds` 不是设备前向调用计数。旧 patch 不需重新应用，只需替换服务侧 helper 与两处接线后重启。
+隔离比较时，先确认 `--prespec-mode off` 下正式 chunk 和 finish 仍调用该 helper，再用同一组音频和并发分别以 `--prespec-mode off --rollback-first-verify`、`--prespec-mode off --no-rollback-first-verify` 运行并重启服务，其他参数不变。真实 consume 负载也可固定 `--prespec-mode consume` 重复两组；同时报告候选覆盖率，避免仅按本轮 `draft_source=rollback` 过滤造成样本选择偏差。开组的 rollback 正式请求应看到 `INITIAL_DRAFT status=scheduled`，首个 `ASR_VERIFY_STEP` 的有效草稿包含 `C[0]`；关组不应有该 `INITIAL_DRAFT`，首次验证在目标已采样 `T[0]` 后进行，首个 verifier 接受数对应 `C[1:]`，不能用于计算首 token 匹配率。两组比较同音频请求的输出 token 数、正式解码轮次、实际目标执行次数、commit 延迟和队列等待；`decode_rounds` 不是设备前向调用计数。回滚开关本身不要求改动 worker；升级本文的候选重接策略时，仍须按第 1 节更新 worker 文件并重启。
 
 这一开关比较的是“完整回滚首轮验证并允许后续重接”和“目标先采样首 token、旧草稿一次性验证”的整体效果；当前 worker 用首轮验证标记同时控制重接，关组也关闭了重接。若要单独估计首 token 是否参与首次执行的因果效应，两组还需使用相同的失配后重接行为，并扩展 worker 元数据和 proposer，不能把本 A/B 的全部差异归因于首 token。
 
@@ -163,8 +175,9 @@ draft_source = ("prespec" if candidate is not None else
 1. 有候选时 `PRESPEC_PROBE status=ready_consumed`、`draft_source=prespec`；无候选且回滚草稿非空时 `draft_source=rollback`。两者提交长度均为所选完整 `C[0:]` 的长度；
 2. `INITIAL_DRAFT status=scheduled draft_tokens=len(C)`，出现在目标首次执行之前；
 3. `ASR_VERIFY_STEP round_index=0`，`effective_draft_tokens` 包含 `c0`；
-4. 如果 `c0` 被拒绝，目标确认 `t0` 后下一轮按位置提交 `C[1:]`；如果 `ck`（`k>0`）被拒绝，proposer 只用已确认的 `T[:k+1]` 查找 ngram 锚点；
-5. 请求结束/取消时，worker 的 `remove_request` 清理候选池和策略。
+4. 如果候选的 `c0` 被拒绝，目标确认 `t0` 后下一轮按位置提交一次 `C[1:]`。若这次验证再次失配（包括先接受若干 token 后失配），使用它产出的修正 token 查找 ngram 锚点；无锚点时提交空草稿，后续目标自回归 token 确认后可再找；
+5. 首 token 本来匹配、后续 `ck`（`k>0`）失配时继续使用原有 `--prespec-rejoin-policy`；回滚草稿和 shadow 请求不进入新的候选专属阶段；
+6. 请求结束/取消时，worker 的 `remove_request` 清理候选池和阶段状态。
 
 先运行 CPU 检查：
 
@@ -172,6 +185,7 @@ draft_source = ("prespec" if candidate is not None else
 python -m unittest discover -s research -p 'test_external_draft_rejoin.py' -v
 python -m unittest discover -s research -p 'test_streaming_prespec_formal_args.py' -v
 python -m unittest discover -s research -p 'test_external_draft_first_verify_patch.py' -v
+python -m unittest discover -s research -p 'test_patch_external_draft_first_verify.py' -v
 ```
 
 然后在 910B 上用现有 sustained test 做无候选与 consume 同负载对比，检查两组 `INITIAL_DRAFT`、首轮 verifier 接受数、总模型执行轮次、commit 延迟 P50/P95/P99、正式请求队列等待、候选请求开销和文本等价。旧的 rollback baseline 使用 `C[1:]`，新无候选组使用 `C[0:]`，不能把两者当作相同实现混算。`PRESPEC_MATCH_TOKENS` 的离线匹配仅是诊断，不能替代真实 verifier 接受数；NPU/多并发正确性与时延收益仍需实测。

@@ -29,12 +29,14 @@ def next_draft(
     *,
     policy: RejoinPolicy = "ngram_1",
     max_draft_tokens: int,
+    after_aligned_retry: bool = False,
 ) -> tuple[int, ...]:
     """Select a continuation after the sampled/verifier-confirmed prefix.
 
-    First-token mismatch uses the candidate at the same absolute output
-    position. Later mismatch uses the rightmost exact n-gram anchor in the
-    candidate. Before any mismatch, the aligned remaining suffix is used.
+    First-token mismatch initially uses the candidate at the same absolute
+    output position. After that aligned retry fails, callers may enable
+    n-gram rejoining even though the first mismatch remains at position zero.
+    Before any mismatch, the aligned remaining suffix is used.
     The caller must pass only committed target output IDs, never speculative
     IDs still waiting for verification.
     """
@@ -44,7 +46,8 @@ def next_draft(
         raise ValueError("max_draft_tokens must be positive")
     position = len(confirmed)
     mismatch = first_mismatch(candidate, confirmed)
-    if policy == "aligned" or mismatch is None or mismatch == 0:
+    if policy == "aligned" or mismatch is None or (mismatch == 0 and
+                                                not after_aligned_retry):
         return tuple(candidate[position:position + max_draft_tokens])
 
     n = int(policy[-1])

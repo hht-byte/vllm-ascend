@@ -26,17 +26,39 @@ class FormalArgsTests(unittest.TestCase):
         self.assertEqual(args["ascend_external_draft"], [10, 20, 30])
         self.assertTrue(args["ascend_external_draft_first_verify"])
         self.assertEqual(args["ascend_external_draft_rejoin"], "ngram_1")
+        self.assertTrue(args["ascend_external_draft_ngram_after_first_mismatch"])
         self.assertEqual(original, {"other": 123})
+
+    def test_candidate_first_mismatch_ngram_can_be_disabled_independently(self):
+        args = formal_external_draft_extra_args(
+            None, candidate_tokens=(10, 20), rollback_tokens=(),
+            rollback_full_tokens=(), kmax=3,
+            prespec_first_mismatch_ngram=False,
+        )
+        self.assertEqual(args["ascend_external_draft"], [10, 20])
+        self.assertTrue(args["ascend_external_draft_first_verify"])
+        self.assertEqual(args["ascend_external_draft_rejoin"], "ngram_1")
+        self.assertNotIn("ascend_external_draft_ngram_after_first_mismatch", args)
+
+    def test_candidate_first_mismatch_ngram_requires_boolean(self):
+        with self.assertRaisesRegex(TypeError, "prespec_first_mismatch_ngram must be a bool"):
+            formal_external_draft_extra_args(
+                None, candidate_tokens=(10, 20), rollback_tokens=(),
+                rollback_full_tokens=(), kmax=3,
+                prespec_first_mismatch_ngram="false",
+            )
 
     def test_rollback_replaces_stale_candidate_and_first_verifies(self):
         args = formal_external_draft_extra_args(
             {"ascend_external_draft_first_verify": True,
-             "ascend_external_draft_rejoin": "ngram_3"},
+             "ascend_external_draft_rejoin": "ngram_3",
+             "ascend_external_draft_ngram_after_first_mismatch": True},
             candidate_tokens=None, rollback_tokens=(20, 30),
             rollback_full_tokens=(10, 20, 30), kmax=3)
         self.assertEqual(args["ascend_external_draft"], [10, 20, 30])
         self.assertTrue(args["ascend_external_draft_first_verify"])
         self.assertEqual(args["ascend_external_draft_rejoin"], "ngram_1")
+        self.assertNotIn("ascend_external_draft_ngram_after_first_mismatch", args)
 
     def test_no_silent_candidate_truncation(self):
         with self.assertRaisesRegex(ValueError, "exceeds engine kmax"):
