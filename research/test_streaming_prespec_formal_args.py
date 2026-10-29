@@ -71,6 +71,46 @@ class FormalArgsTests(unittest.TestCase):
         self.assertEqual(args["ascend_external_draft_rejoin"], "ngram_2")
         self.assertEqual(args["other"], 123)
 
+    def test_disabled_rollback_first_verify_restores_legacy_suffix(self):
+        args = formal_external_draft_extra_args(
+            {"other": 123, "ascend_external_draft_first_verify": True,
+             "ascend_external_draft_rejoin": "ngram_3"},
+            candidate_tokens=None,
+            rollback_tokens=(21, 22, 23),
+            rollback_full_tokens=(20, 21, 22),
+            kmax=3,
+            rollback_first_verify=False,
+        )
+        self.assertEqual(args, {"other": 123,
+                                "ascend_external_draft": [21, 22, 23]})
+
+    def test_disabled_rollback_first_verify_does_not_change_candidate(self):
+        args = formal_external_draft_extra_args(
+            None, candidate_tokens=(30, 31),
+            rollback_tokens=(21, 22),
+            rollback_full_tokens=(20, 21, 22),
+            kmax=3, rollback_first_verify=False,
+        )
+        self.assertEqual(args["ascend_external_draft"], [30, 31])
+        self.assertTrue(args["ascend_external_draft_first_verify"])
+        self.assertEqual(args["ascend_external_draft_rejoin"], "ngram_1")
+
+    def test_disabled_rollback_first_verify_with_only_one_token_is_target_only(self):
+        args = formal_external_draft_extra_args(
+            None, candidate_tokens=None, rollback_tokens=(),
+            rollback_full_tokens=(20,), kmax=3,
+            rollback_first_verify=False,
+        )
+        self.assertEqual(args, {"ascend_external_draft": []})
+
+    def test_rollback_first_verify_requires_boolean(self):
+        with self.assertRaisesRegex(TypeError, "rollback_first_verify must be a bool"):
+            formal_external_draft_extra_args(
+                None, candidate_tokens=None, rollback_tokens=(21,),
+                rollback_full_tokens=(20, 21), kmax=3,
+                rollback_first_verify="false",
+            )
+
     def test_candidate_takes_priority_over_full_rollback(self):
         args = formal_external_draft_extra_args(
             None, candidate_tokens=(30, 31),

@@ -37,17 +37,22 @@ def formal_external_draft_extra_args(
     rollback_full_tokens: Sequence[int],
     kmax: int,
     rejoin_policy: RejoinPolicy = "ngram_1",
+    rollback_first_verify: bool = True,
 ) -> dict[str, object]:
-    """Mark a full candidate or full rollback for first-prefill verification.
+    """Select a candidate or rollback draft for the formal request.
 
     ``rollback_full_tokens`` must begin at the formal request's first output
     position. Formal chunk and finish must both pass it, including when a
-    candidate is selected. Shadow requests do not call this helper.
+    candidate is selected. With rollback first verification disabled, the
+    legacy suffix is proposed after the target samples its first token.
+    Shadow requests do not call this helper.
     """
     if rejoin_policy not in POLICIES:
         raise ValueError(f"invalid prespec rejoin policy: {rejoin_policy}")
     if kmax <= 0:
         raise ValueError("kmax must be positive")
+    if type(rollback_first_verify) is not bool:
+        raise TypeError("rollback_first_verify must be a bool")
     args = dict(existing or {})
     args.pop("ascend_external_draft_first_verify", None)
     args.pop("ascend_external_draft_rejoin", None)
@@ -55,12 +60,13 @@ def formal_external_draft_extra_args(
         draft = candidate_tokens
         first_verify = True
     else:
-        draft = rollback_full_tokens
-        first_verify = bool(draft)
-        if not draft and rollback_tokens:
+        if not rollback_full_tokens and rollback_tokens:
             raise ValueError("full rollback draft cannot be empty with a legacy suffix")
-        if tuple(draft[1:]) != tuple(rollback_tokens[:max(0, len(draft) - 1)]):
+        if tuple(rollback_full_tokens[1:]) != tuple(
+                rollback_tokens[:max(0, len(rollback_full_tokens) - 1)]):
             raise ValueError("full rollback draft does not extend the legacy suffix")
+        draft = rollback_full_tokens if rollback_first_verify else rollback_tokens
+        first_verify = rollback_first_verify and bool(draft)
     if any(type(token) is not int or token < 0 for token in draft):
         raise ValueError("external draft must contain nonnegative token IDs")
     if len(draft) > kmax:

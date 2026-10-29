@@ -31,8 +31,10 @@ class TransportPatchTests(unittest.TestCase):
         proposer = types.ModuleType(
             "vllm_ascend.spec_decode.external_draft_proposer")
         proposer.EXTERNAL_DRAFT_ATTR = "_external_draft_tokens"
+        proposer.EXTERNAL_DRAFT_ALIGNED_BLOCKED_ATTR = "_external_draft_aligned_blocked"
         proposer.EXTERNAL_DRAFT_FIRST_VERIFY_ATTR = "_external_draft_first_verify"
         proposer.EXTERNAL_DRAFT_FIRST_VERIFY_KEY = "ascend_external_draft_first_verify"
+        proposer.EXTERNAL_DRAFT_LAST_PROPOSAL_ATTR = "_external_draft_last_proposal"
         proposer.EXTERNAL_DRAFT_POLICIES_ATTR = "_external_draft_policies"
         proposer.EXTERNAL_DRAFT_POLICY_KEY = "ascend_external_draft_rejoin"
         batch_module = types.ModuleType("vllm_ascend.worker.npu_input_batch")
