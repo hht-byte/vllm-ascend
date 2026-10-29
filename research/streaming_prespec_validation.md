@@ -24,7 +24,7 @@ A/B/C 保持同一服务代码、模型、图配置、回滚参数、chunk 长�
 rg -n 'ArgumentParser|parse_args|AsyncLLM\(' qwen_asr
 ```
 
-在现有 `parser.parse_args()` **之前**增加五个参数；保留其余已有参数：
+在现有 `parser.parse_args()` **之前**增加以下参数；保留其余已有参数：
 
 ```python
 parser.add_argument(
@@ -47,9 +47,13 @@ parser.add_argument(
     "--prespec-rejoin-policy", choices=("aligned", "ngram_1", "ngram_2", "ngram_3"),
     default="ngram_1", help="rejoin after later candidate mismatch",
 )
+parser.add_argument(
+    "--prespec-launch-sec", type=float, default=1.6,
+    help="audio seconds within each formal chunk before launching a shadow",
+)
 ```
 
-这里 `default=None` 是“未显式指定”的标记：parser 阶段尚未取得引擎 `kmax`。启动时将 `None` 传给 `AsyncLLM()`、`enable_prespec()`；启用预投机后解析为 `kmax`。完整候选含首 token，必须满足 `candidate_tokens <= kmax`；原先 `kmax=15, candidate_budget=16` 的配置应改为预算 15 或提高引擎 `kmax`。
+这里候选预算的 `default=None` 是“未显式指定”的标记：parser 阶段尚未取得引擎 `kmax`。启动时将 `None` 传给 `AsyncLLM()`、`enable_prespec()`；启用预投机后解析为 `kmax`。完整候选含首 token，必须满足 `candidate_tokens <= kmax`；原先 `kmax=15, candidate_budget=16` 的配置应改为预算 15 或提高引擎 `kmax`。启动时间默认 1.6 秒；在 16 kHz、2 秒 chunk 下为 25,600 样本，距正式边界仅 400 ms。实际触发是首个已处理音频达到阈值、队列为空且准入通过的 append，不保证墙钟恰好 1.600 秒。
 
 你现在的调用是 `Qwen3ASRModelAsync.AsyncLLM(**base_config)`。保留 `base_config` 原内容，在同一调用上显式追加 parser 参数：
 
@@ -61,12 +65,13 @@ model = Qwen3ASRModelAsync.AsyncLLM(
     prespec_candidate_tokens=args.prespec_candidate_tokens,
     prespec_max_active_shadows=args.prespec_max_active_shadows,
     prespec_rejoin_policy=args.prespec_rejoin_policy,
+    prespec_launch_sec=args.prespec_launch_sec,
 )
 ```
 
-`base_config` 不能同时含有这五个 `prespec_...` 名字，否则 Python 会因重复关键字报错。若原调用的结果变量不是 `model`，保留原变量名。
+`base_config` 不能同时含有上述 `prespec_...` 名字，否则 Python 会因重复关键字报错。若原调用的结果变量不是 `model`，保留原变量名。
 
-在 `qwen3_asr_async.py` 的 `AsyncLLM()` 现有类方法签名增加五个显式形参；若签名有 `**kwargs`，把它们放在 `**kwargs` **之前**。不能只在调用处传参，否则可能得到 `unexpected keyword argument`，或落入 `**kwargs` 后被错误转发给 vLLM engine：
+在 `qwen3_asr_async.py` 的 `AsyncLLM()` 现有类方法签名增加对应显式形参；若签名有 `**kwargs`，把它们放在 `**kwargs` **之前**。不能只在调用处传参，否则可能得到 `unexpected keyword argument`，或落入 `**kwargs` 后被错误转发给 vLLM engine：
 
 ```python
 prespec_mode: str = "off",
@@ -74,6 +79,7 @@ prespec_admission: str = "force",
 prespec_candidate_tokens: int | None = None,
 prespec_max_active_shadows: int = 0,
 prespec_rejoin_policy: str = "ngram_1",
+prespec_launch_sec: float = 1.6,
 ```
 
 这里假定现有入口用 `argparse` 且解析结果名为 `args`；若名字不同，只替换该局部变量名。服务启动脚本不在本仓库，无法填写其余既有 CLI 选项。
@@ -84,11 +90,11 @@ prespec_rejoin_policy: str = "ngram_1",
 rg -n -A 35 'def enable_prespec' qwen_asr/inference/qwen3_asr_async.py
 ```
 
-这里的 `enable_prespec()` **不是上游已有 API**，而是 [主接入文档步骤 2](streaming_prespec.md) 要在 `Qwen3ASRModelAsync` 中新增的方法。同步其 `admission_mode`、`shadow_only`、`max_active_shadows` 形参，并把旧的 `max_active_shadows=1` 改为传入参数，否则更换协调器后仍只允许一个候选运行。为记录 shadow 请求生命周期，再把其中的 `producer=self._run_prespec` 替换为 `producer=self._logged_prespec_producer`。完整的关键行是：
+这里的 `enable_prespec()` **不是上游已有 API**，而是 [主接入文档步骤 2](streaming_prespec.md) 要在 `Qwen3ASRModelAsync` 中新增的方法。从 `qwen_asr.inference.streaming_prespec` 导入 `launch_samples_for_window`，同步 `admission_mode`、`shadow_only`、`max_active_shadows` 和 `launch_sec` 形参，并把旧的 `max_active_shadows=1` 改为传入参数，否则更换协调器后仍只允许一个候选运行。为记录 shadow 请求生命周期，再把其中的 `producer=self._run_prespec` 替换为 `producer=self._logged_prespec_producer`。完整的关键行是：
 
 ```python
 def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
-                   candidate_tokens=None, on_probe=None,
+                   launch_sec=1.6, candidate_tokens=None, on_probe=None,
                    admission_mode="force", shadow_only=True,
                    max_active_shadows=0, rejoin_policy="ngram_1"):
     # 保留主接入文档中已有的 enabled/kmax/engine 校验。
@@ -101,7 +107,7 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
     if rejoin_policy not in ("aligned", "ngram_1", "ngram_2", "ngram_3"):
         raise ValueError("invalid prespec rejoin policy")
     self.prespec_rejoin_policy = rejoin_policy
-    # midpoint_samples 沿用主接入文档中的计算。
+    midpoint_samples = launch_samples_for_window(launch_sec, chunk_size_sec)
     self.prespec = PreSpecCoordinator(
         producer=self._logged_prespec_producer,
         policy=AdmissionPolicy(
@@ -136,6 +142,7 @@ if prespec_max_active_shadows < 0:
 model.enable_prespec(
     enabled=(prespec_mode != "off"), kmax=kmax, engine=engine,
     chunk_size_sec=chunk_size_sec,
+    launch_sec=prespec_launch_sec,
     candidate_tokens=prespec_candidate_tokens,
     admission_mode=prespec_admission,
     max_active_shadows=prespec_max_active_shadows,
@@ -145,10 +152,11 @@ model.enable_prespec(
 )
 logger.info(
     "PRESPEC_CONFIG mode=%s admission=%s kmax=%s candidate_budget=%s "
-    "max_active_shadows=%s",
+    "max_active_shadows=%s launch_sec=%s launch_samples=%s",
     prespec_mode, prespec_admission, kmax,
     model.prespec.policy.max_candidate_tokens if model.prespec is not None else None,
-    prespec_max_active_shadows,
+    prespec_max_active_shadows, prespec_launch_sec,
+    model.prespec.policy.midpoint_samples if model.prespec is not None else None,
 )
 ```
 
@@ -205,7 +213,7 @@ async def _logged_prespec_producer(self, request, budget):
 
 这里的 `done` 只表示 shadow 引擎生成结束，尚不表示正式请求采纳。`asyncio.timeout` 到期会把等待中的 `CancelledError` 转为 `TimeoutError`；这是候选截止时间到达，应记 `event=timeout`，不要归入引擎故障 `event=failed`。**本节日志包装器本身不会收集部分 token**；还必须按[主接入文档 `_run_prespec()` 代码](streaming_prespec.md)在每个 CUMULATIVE `RequestOutput` 到达时调用 `self.prespec.publish_partial(request, candidate_token_ids)`。协调器在超时或 commit 取消后可领取已发布且满足长度、版本和音频截止检查的部分候选；没有可用快照则回退到 rollback。不要在 `except CancelledError` 或 `except TimeoutError` 才去读取局部变量：正式请求不能等待 shadow 的取消处理。若取消后底层 NPU 工作仍持续，另看 vLLM 请求结束/abort 日志和资源占用。
 
-### 1.3 `realtime_connection.py`：记录中点准入决定
+### 1.3 `realtime_connection.py`：记录启动准入决定
 
 在 [第三节](streaming_prespec.md) 的 `_process_segment()` 中，用下列代码替换 `try_start_prespec_for_state(...)` 返回后的简短 `if decision...` 块。该节已在调用前保存 `window_id = segment.asr_state.chunk_id`；`segment.prespec_started_window` 只赋值一次：
 
@@ -221,7 +229,7 @@ if decision is not None and decision.launched:
     segment.prespec_started_window = window_id
 ```
 
-`try_start_prespec_for_state()` 在未达中点、已 commit 或音频队列非空时返回 `None`，因此这些路径**不会**出现 `PRESPEC_LAUNCH`。`chunk-0` 没有旧回滚草稿，空草稿有效；在 consume 模式下，正式请求可验证它在 1 s 音频下生成的候选。真正进入 `try_start_prespec()` 后，旧草稿超出引擎 `kmax` 或输出预算放不下 `1 + 旧草稿长度 + 1` 时，分别返回 `rollback_draft_exceeds_kmax` / `candidate_budget_insufficient`，不会给引擎发缩短后的草稿。这两项准入检查在 shadow 和 consume 模式都执行；两者只在正式请求是否使用已完成候选或已输出部分快照上不同。helper 对每个 `(ws_id, seg_id, window_id, reason)` 只输出一次 `PRESPEC_SKIP` INFO，避免同一窗口的后续 80 ms chunk 重复刷屏。若预期到达中点却没有 launch，请在包装函数这些 `return None` 前临时加一条 `DEBUG` 日志，包含 `ws_id/seg/window_id/len(state.buffer)/reason`；不要据“无 launch 日志”直接判断负载门控拒绝。
+`try_start_prespec_for_state()` 在未达启动阈值、已 commit 或音频队列非空时返回 `None`，因此这些路径**不会**出现 `PRESPEC_LAUNCH`。`chunk-0` 没有旧回滚草稿，空草稿有效；在 consume 模式下，正式请求可验证它在默认 1.6 s 音频下生成的候选。真正进入 `try_start_prespec()` 后，旧草稿超出引擎 `kmax` 或输出预算放不下 `1 + 旧草稿长度 + 1` 时，分别返回 `rollback_draft_exceeds_kmax` / `candidate_budget_insufficient`，不会给引擎发缩短后的草稿。这两项准入检查在 shadow 和 consume 模式都执行；两者只在正式请求是否使用已完成候选或已输出部分快照上不同。helper 对每个 `(ws_id, seg_id, window_id, reason)` 只输出一次 `PRESPEC_SKIP` INFO，避免同一窗口的后续 80 ms chunk 重复刷屏。若预期到达启动阈值却没有 launch，请在包装函数这些 `return None` 前临时加一条 `DEBUG` 日志，包含 `ws_id/seg/window_id/len(state.buffer)/reason`；不要据“无 launch 日志”直接判断负载门控拒绝。
 
 ### 1.4 `qwen3_asr_async.py`：关联正式请求与候选
 
@@ -356,7 +364,7 @@ rg -n 'PRESPEC_CONFIG|PRESPEC_LAUNCH|PRESPEC_SKIP|PRESPEC_REQUEST|PRESPEC_PROBE|
 在 910B 服务项目完成第 1 节的代码接线、复制与语法检查后，按 [主接入说明](streaming_prespec.md) 导入。以服务现有启动命令启动一份 B 组实例：
 
 ```bash
-<现有服务启动命令> --prespec-mode shadow --prespec-admission force
+<现有服务启动命令> --prespec-mode shadow --prespec-admission force --prespec-launch-sec 1.6
 ```
 
 使用现有 WebSocket 测试脚本发送**同一段超过 6 秒、6 秒前不 commit**的音频；这一步并发为 1，不开启自动补位。服务若写日志文件：
@@ -365,7 +373,7 @@ rg -n 'PRESPEC_CONFIG|PRESPEC_LAUNCH|PRESPEC_SKIP|PRESPEC_REQUEST|PRESPEC_PROBE|
 tail -F /path/to/server.log | rg --line-buffered 'PRESPEC_|inference submit|Commit received|Segment done'
 ```
 
-若服务由 systemd 管理，改用 `journalctl -u <实际服务单元名> -f -o cat` 作为管道左侧。先用**连续超过 6 秒且 6 秒前不 commit 的单段音频**核对三个窗口：约 1、3、5 秒分别看到 `window=0/1/2` 的 `PRESPEC_LAUNCH/REQUEST`，约 2、4、6 秒分别看到对应 `window=0/1/2 boundary=chunk status=ready_shadow_only`，或候选仍在运行但已输出快照时的 `partial_ready_shadow_only`。三个窗口的 `request_id` 应不同，正式 `chunk=0/1/2` 分别只关联同号窗口；任一窗口跳过时不应误领前一窗口候选。`ready_lead_ms > 0` 表示候选早于对应正式请求提交完成；若为 `pending`，候选被取消，不应等待它。若是 `candidate_exceeds_kmax`，shadow 的输出超过正式 proposer 可接收长度，协调器不会把它交给正式请求。随后分别重放提前 commit、≤0.4 秒短尾和断连，确认无遗留 `prespec-...` 请求、重复 begin 或未结束的 session。约 5.95 秒就 commit 的段在 5 秒启动 `window=2`，若未凑足 6 秒正式 chunk，应在实际 `finish_...` 请求提交时看到 `PRESPEC_PROBE window=2 boundary=formal status=ready_shadow_only` 或 `partial_ready_shadow_only`；consume 模式则应为 `ready_consumed` 或 `partial_ready_consumed`，且 `PRESPEC_TARGET boundary=formal` 的 `candidate_request_id` 对应先前的 `prespec-...`。commit 到达时保留已完成候选或取消前已输出的部分快照，不立即打印 formal probe；若后续完整 chunk 先领取了它，finish 不得重复领取。短尾跳过 finish 时也不会出现 formal probe，外层清理会丢弃候选。
+若服务由 systemd 管理，改用 `journalctl -u <实际服务单元名> -f -o cat` 作为管道左侧。先用**连续超过 6 秒且 6 秒前不 commit 的单段音频**核对三个窗口：默认约 1.6、3.6、5.6 秒分别看到 `window=0/1/2` 的 `PRESPEC_LAUNCH/REQUEST`，约 2、4、6 秒分别看到对应 `window=0/1/2 boundary=chunk status=ready_shadow_only`，或候选仍在运行但已输出快照时的 `partial_ready_shadow_only`。三个窗口的 `request_id` 应不同，正式 `chunk=0/1/2` 分别只关联同号窗口；任一窗口跳过时不应误领前一窗口候选。`ready_lead_ms > 0` 表示候选早于对应正式请求提交完成；若为 `pending`，候选被取消，不应等待它。若是 `candidate_exceeds_kmax`，shadow 的输出超过正式 proposer 可接收长度，协调器不会把它交给正式请求。随后分别重放提前 commit、≤0.4 秒短尾和断连，确认无遗留 `prespec-...` 请求、重复 begin 或未结束的 session。约 5.95 秒就 commit 的段在 5.6 秒启动 `window=2`，若未凑足 6 秒正式 chunk，应在实际 `finish_...` 请求提交时看到 `PRESPEC_PROBE window=2 boundary=formal status=ready_shadow_only` 或 `partial_ready_shadow_only`；consume 模式则应为 `ready_consumed` 或 `partial_ready_consumed`，且 `PRESPEC_TARGET boundary=formal` 的 `candidate_request_id` 对应先前的 `prespec-...`。commit 到达时保留已完成候选或取消前已输出的部分快照，不立即打印 formal probe；若后续完整 chunk 先领取了它，finish 不得重复领取。短尾跳过 finish 时也不会出现 formal probe，外层清理会丢弃候选。
 
 上段的 `pending` 只表示取消时没有可提交的部分草稿。接入 `publish_partial()` 后，运行中的候选若已输出足够长的快照，finish 的 probe 会改为 `partial_ready_shadow_only` 或 `partial_ready_consumed`；部分草稿不长于原回滚草稿时为 `partial_not_longer_than_rollback`，继续回滚。consume 模式下，服务端 `PRESPEC_TARGET candidate_partial=True` 及同一正式请求的 `ASR_VERIFY_STEP effective_draft_tokens>0` 要同时出现，才可判断该部分候选进入了实际 verifier。`PRESPEC_REQUEST event=cancel` 本身只表示后台请求被取消，不能据此断定它没有已输出 token。
 
@@ -442,11 +450,11 @@ PY
 # 使用现有 WebSocket 回放命令，保存客户端事件和服务日志
 
 # B：后台产生候选供观测，正式请求仍首次验证完整回滚草稿
-<现有服务启动命令> --prespec-mode shadow --prespec-admission force
+<现有服务启动命令> --prespec-mode shadow --prespec-admission force --prespec-launch-sec 1.6
 # 同一回放清单
 
 # C：先仅在固定输入回放中启用消费
-<现有服务启动命令> --prespec-mode consume --prespec-admission force
+<现有服务启动命令> --prespec-mode consume --prespec-admission force --prespec-launch-sec 1.6
 # 同一回放清单
 ```
 
@@ -454,7 +462,7 @@ PY
 
 ## 4. 同负载性能对比：A→B、B→C、A→C
 
-先用 B/C 的 `--prespec-admission force` 完成初次同负载对比；这一步只能衡量后台请求的收益与干扰，**不能证明低利用率准入策略有效**。分别跑现有 `sustained_test` 的并发档位 `1、5、20`，再扩到拐点附近；每组保持相同音频清单、到达时序、自动补位规则、持续时间和预热。A/B/C 交错排序，至少重复 3 轮，记录实际测试起止 UTC。每轮单独设置 `run_id`、切片服务日志、导出该轮 `commits.jsonl`。导出行须含 `ws_id, seg, received_at, done_at, commit_latency_ms, queue_wait_ms, queue_size, is_empty_commit`；空 commit 不算正式时延。客户端执行命令仍用你现有 `test_v2.py` 的真实 CLI。
+先用 B/C 的 `--prespec-admission force` 完成初次同负载对比；这一步只能衡量后台请求的收益与干扰，**不能证明低利用率准入策略有效**。分别跑现有 `sustained_test` 的并发档位 `1、5、20`，再扩到拐点附近；每组保持相同音频清单、到达时序、自动补位规则、持续时间和预热。若要单独评估晚启动，将 B/C 的 `--prespec-launch-sec` 在 `1.0` 与 `1.6` 间切换，其他参数固定，并报告候选 `ready_*` 覆盖率、首 token/后缀接受数、正式请求 queue wait 和 commit P95/P99。A/B/C 交错排序，至少重复 3 轮，记录实际测试起止 UTC。每轮单独设置 `run_id`、切片服务日志、导出该轮 `commits.jsonl`。导出行须含 `ws_id, seg, received_at, done_at, commit_latency_ms, queue_wait_ms, queue_size, is_empty_commit`；空 commit 不算正式时延。客户端执行命令仍用你现有 `test_v2.py` 的真实 CLI。
 
 与负载同时启动旁路采样；下面以 A、并发 20、第一轮为例，`--duration` 应覆盖测试加启停等待：
 

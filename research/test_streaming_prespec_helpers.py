@@ -51,6 +51,7 @@ class Model(PreSpecModelHelpers):
         self.prespec = PreSpecCoordinator(
             self._run_prespec,
             AdmissionPolicy(admission_mode="force",
+                            midpoint_samples=16_000,
                             max_rollback_draft_tokens=kmax,
                             max_candidate_tokens=candidate_budget),
             shadow_only=False,

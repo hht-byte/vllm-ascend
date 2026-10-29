@@ -41,6 +41,7 @@ python commit_overlap.py --commits baseline-c20-commits.jsonl \
 from qwen_asr.inference.streaming_prespec import (
     AdmissionPolicy,
     PreSpecCoordinator,
+    launch_samples_for_window,
 )
 from qwen_asr.inference.streaming_prespec_helpers import (
     PreSpecModelHelpers, snapshot_stream_audio,
@@ -61,7 +62,7 @@ from qwen_asr.inference.streaming_prespec_formal_args import (
 
 ```python
 def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
-                   candidate_tokens=None, on_probe=None,
+                   launch_sec=1.6, candidate_tokens=None, on_probe=None,
                    admission_mode="force", shadow_only=True,
                    max_active_shadows=0, rejoin_policy="ngram_1"):
     # 仅在服务启动、连接尚未创建时调用一次。
@@ -79,9 +80,7 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
     if rejoin_policy not in ("aligned", "ngram_1", "ngram_2", "ngram_3"):
         raise ValueError("invalid prespec rejoin policy")
     self.prespec_rejoin_policy = rejoin_policy
-    midpoint_samples = int(chunk_size_sec * 16000 / 2)
-    if midpoint_samples <= 0:
-        raise ValueError("prespec midpoint must contain at least one sample")
+    midpoint_samples = launch_samples_for_window(launch_sec, chunk_size_sec)
     if engine is None or not callable(getattr(self, "_pack_stream_request", None)):
         raise ValueError("prespec requires engine and the existing request packer")
     self.prespec_engine = engine  # 引用已创建的同一个 engine，不创建第二个
@@ -100,7 +99,7 @@ def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
     )
 ```
 
-这个方法创建协调器并保存 engine 引用。正式请求选中的完整预投机候选或完整回滚草稿 `C[0:]` 都在目标首次执行前进入 verifier，首 token 占一个 `kmax` 槽位，因此候选预算默认等于 `kmax`，显式值也不能超过它。旧草稿加候选首 token、至少一个续写 token 放不下时跳过。仅 shadow 旧草稿仍沿用跳首 token 合同。引擎补丁与服务调用见 [首次验证实施说明](external_draft_first_verify_v023.md)。
+这个方法创建协调器并保存 engine 引用。`launch_samples_for_window()` 从本仓复制的 `streaming_prespec.py` 导入；默认 2 秒窗口在 1.6 秒（25,600 个 16 kHz 样本）启动，距正式边界剩 0.4 秒。`midpoint_samples` 保留旧字段名以兼容现有 helper，其含义现在是可配置启动阈值。正式请求选中的完整预投机候选或完整回滚草稿 `C[0:]` 都在目标首次执行前进入 verifier，首 token 占一个 `kmax` 槽位，因此候选预算默认等于 `kmax`，显式值也不能超过它。旧草稿加候选首 token、至少一个续写 token 放不下时跳过。仅 shadow 旧草稿仍沿用跳首 token 合同。引擎补丁与服务调用见 [首次验证实施说明](external_draft_first_verify_v023.md)。
 
 `max_active_shadows=0` 表示协调器不设进程级候选并发上限，各连接可同时运行候选；实际调度和容量仍由共享 engine 决定。正整数是可选的进程级上限，负数非法。不要保留旧接线中的 `max_active_shadows=1`，否则替换协调器后仍会把所有连接串行化。
 
@@ -124,6 +123,7 @@ model.enable_prespec(
     kmax=kmax,           # 对应你从 speculative config 读出的现有局部变量
     engine=engine,      # 对应本函数已创建的 AsyncLLMEngine 实例变量
     chunk_size_sec=2.0,  # 必须与 set_streaming_params 的实际值一致
+    launch_sec=1.6,
 )
 return model
 ```
@@ -132,7 +132,7 @@ return model
 
 上面的 `enabled=False` 是完成适配前的静态安全起点。A/B/C 验证时，按 [验证手册第 1.1 节](streaming_prespec_validation.md) 从现有启动 parser 传入预投机参数，再调用本方法；不要同时保留这个写死的 `enabled=False` 调用，也不要把服务侧参数直接传给 vLLM engine 构造函数。
 
-你当前的工厂调用是 `Qwen3ASRModelAsync.AsyncLLM(**base_config)`；验证手册给出的实际改法是在这一次调用中追加 `prespec_mode=args.prespec_mode`、`prespec_admission=args.prespec_admission`、`prespec_candidate_tokens=args.prespec_candidate_tokens`、`prespec_max_active_shadows=args.prespec_max_active_shadows`，并由 `AsyncLLM()` 的显式形参接收。工厂再将最后一项传给 `enable_prespec(max_active_shadows=prespec_max_active_shadows)`。`base_config` 保持原用途，不向 vLLM engine 透传这些服务侧参数。
+你当前的工厂调用是 `Qwen3ASRModelAsync.AsyncLLM(**base_config)`；验证手册给出的实际改法是在这一次调用中追加 `prespec_mode=args.prespec_mode`、`prespec_admission=args.prespec_admission`、`prespec_candidate_tokens=args.prespec_candidate_tokens`、`prespec_max_active_shadows=args.prespec_max_active_shadows`、`prespec_launch_sec=args.prespec_launch_sec`，并由 `AsyncLLM()` 的显式形参接收。工厂把启动时间传给 `enable_prespec(launch_sec=prespec_launch_sec)`。`base_config` 保持原用途，不向 vLLM engine 透传这些服务侧参数。
 
 #### 步骤 4：`websocket_router.py` 不修改
 
@@ -215,11 +215,11 @@ if (self.prespec is not None
         segment.prespec_started_window = window_id
 ```
 
-本次调用可能刚完成一个 2 s chunk，也可能仅向 `state.buffer` 追加了 80 ms 而没有进入 `while`。**后者正是检查 1 s 中点的机会。** 在生成器退出后，`state.audio_accum` 和 `state.buffer` 都已更新；这里先调用 `try_start_prespec_for_state(state, ...)`，由它构造完整快照、回滚拆分和采样截止位置，再调用 `try_start_prespec(...)`。两层实参分别列在 4.5。它仅在以下条件满足时调用现有 `maybe_start()`：
+本次调用可能刚完成一个 2 s chunk，也可能仅向 `state.buffer` 追加了 80 ms 而没有进入 `while`。**后者正是检查可配置启动阈值的机会，默认在 1.6 s。** 在生成器退出后，`state.audio_accum` 和 `state.buffer` 都已更新；这里先调用 `try_start_prespec_for_state(state, ...)`，由它构造完整快照、回滚拆分和采样截止位置，再调用 `try_start_prespec(...)`。两层实参分别列在 4.5。它仅在以下条件满足时调用现有 `maybe_start()`：
 
 1. segment 未 commit、当前段音频队列无积压、上一轮正式推理已结束。commit 后合并剩余音频的路径不启动 shadow。
-2. 自上次正式请求的音频截止位置以来，新增音频量 `new_audio_samples` 位于 `[中点, chunk_size_samples)`；对 2 s chunk，就是 `[16000, 32000)`。这只是触发计数，传给引擎的音频仍是完整累计音频。
-3. 按**下一次正式请求的现有回滚规则**拆分前缀和回滚草稿。包括 `unfixed_chunk_num` 的预热条件、`unfixed_token_num` 和 `kmax`，不要另写固定“最后 5 个 token”的拆分。首个 `chunk-0` 没有上一轮结果，空草稿是合法输入；它在约 1 s 中点也可起草。
+2. 自上次正式请求的音频截止位置以来，新增音频量 `new_audio_samples` 位于 `[启动阈值, chunk_size_samples)`；默认 2 s chunk 为 `[25600, 32000)`，即 1.6–2.0 s。这只是触发计数，传给引擎的音频仍是完整累计音频。
+3. 按**下一次正式请求的现有回滚规则**拆分前缀和回滚草稿。包括 `unfixed_chunk_num` 的预热条件、`unfixed_token_num` 和 `kmax`，不要另写固定“最后 5 个 token”的拆分。首个 `chunk-0` 没有上一轮结果，空草稿是合法输入；它在约 1.6 s 也可起草。
 4. 当前窗口尚未成功启动过预投机；正式队列、负载、剩余时间是否允许，再由协调器判定。
 
 这里检查队列是防止消费协程追赶积压时制造“伪空档”：如果下一正式 chunk 所需音频已经在队列里，只是还没取出，就不应再起 shadow。段级队列非空是这一额外跳过条件，不能把它当作 `LoadSnapshot.waiting`（vLLM 等待请求数）。
@@ -235,9 +235,9 @@ new_audio_samples = current_audio_end_samples - last_formal_audio_end_samples
 
 两个截止位置都采用**段内采样坐标**：这里它们分别等于 `len(state.audio_accum) + len(state.buffer)` 和 `len(state.audio_accum)`。`current_audio_end_samples` 不包含仍在段级队列、尚未追加到 `state.buffer` 的客户端音频。shadow 快照包含已经正式处理的全部 chunk 加上当前 buffer；`new_audio_samples` 只用于中点判断，不能拿来裁剪引擎输入。
 
-例如上一次正式输入是本段 `[0, 2s]`：到 3 s 时，触发计数是 1 s，预投机传 `[0, 3s]`；到 4 s 时，正式请求仍传 `[0, 4s]`。两次请求分别可能命中多少缓存，均由引擎决定。
+例如上一次正式输入是本段 `[0, 2s]`：到 3.6 s 时，触发计数是 1.6 s，预投机传 `[0, 3.6s]`；到 4 s 时，正式请求仍传 `[0, 4s]`。两次请求分别可能命中多少缓存，均由引擎决定。
 
-预算按**距离下一正式提交尚缺的采样数**估计：`(chunk_size_samples - new_audio_samples) / 16000`，结合实际接收节奏；不能在完成上一次推理后重新假定还有整整 1 s。VAD 仍可能提前 commit，取消只是尽力让路，不保证 NPU kernel 立即退出。
+预算按**距离下一正式提交尚缺的采样数**估计：`(chunk_size_samples - new_audio_samples) / 16000`，结合实际接收节奏；默认在 1.6 s 启动时只剩约 0.4 s，不能在完成上一次推理后重新假定还有整整 1 s。VAD 仍可能提前 commit，取消只是尽力让路，不保证 NPU kernel 立即退出。
 
 ### 四、模型侧 helper：直接复制的代码与需要搬出的原代码
 
@@ -534,7 +534,7 @@ class PreSpecModelHelpers:
 
 根据 L475–481，进入正式请求前先从 `state.buffer` 取完整 chunk，并拼进 `state.audio_accum`。因此正式请求的音频截止是 `len(state.audio_accum)`；中点尚未达到下个 chunk 大小，当前 shadow 音频截止是 `len(state.audio_accum) + len(state.buffer)`。`snapshot_stream_audio` 同时给出这两个**段内**采样数和完整音频 bytes，无需另加 `prespec_last_formal_audio_end_samples` 字段，也无需用客户端已接收字节数估计。
 
-例如 `state.audio_accum` 长 32000、`state.buffer` 长 16000，则新音频量为 16000，shadow 提交全部 48000 samples。到下个正式 chunk 切出后，`state.audio_accum` 长 64000，正式请求提交全部 64000。shadow 不更新这两个数组，缓存能复用多少由引擎决定。
+例如 `state.audio_accum` 长 32000、`state.buffer` 长 25600，则新音频量为 25600，shadow 提交全部 57600 samples。到下个正式 chunk 切出后，`state.audio_accum` 长 64000，正式请求提交全部 64000。shadow 不更新这两个数组，缓存能复用多少由引擎决定。
 
 #### 4.5 第三节挂点与 helper 的两层实参
 
@@ -901,7 +901,7 @@ if self.prespec is not None:
 
 910B 上按“回滚投机 baseline → shadow → 消费候选”逐步验证的可执行命令、最小日志接线和判定表见 [streaming_prespec_validation.md](streaming_prespec_validation.md)。launch/probe 仍需要按文档接入日志；正式输出 token 交给协调器后，它会打印匹配 token 和 formal 摘要。只看原有服务日志无法判断预投机是否运行。
 
-当前协调器按 `(session_id, audio_epoch, window_id)` 去重，其中 `audio_epoch=seg_id`、`window_id=state.chunk_id`。**每个尚未提交的正式 chunk 窗口可启动一次**：`chunk-0` 在约 1 s 中点用空旧草稿起草；2 s 正式结果后，3 s 中点为 4 s 的 `chunk-1` 起草；4 s 正式结果写回后，5 s 中点为 6 s 的 `chunk-2` 起草。每次正式 chunk 结束回收该窗口；提前 commit 则保留本窗口已完成候选或已输出的部分快照，在 residual finish 正式请求提交时核对并领取。后续窗口按原规则验证已有回滚草稿；不能跨 VAD 段借用旧 token，也不能把旧窗口候选交给新窗口。
+当前协调器按 `(session_id, audio_epoch, window_id)` 去重，其中 `audio_epoch=seg_id`、`window_id=state.chunk_id`。**每个尚未提交的正式 chunk 窗口可启动一次**：默认 `chunk-0` 在约 1.6 s 用空旧草稿起草；2 s 正式结果后，3.6 s 为 4 s 的 `chunk-1` 起草；4 s 正式结果写回后，5.6 s 为 6 s 的 `chunk-2` 起草。每次正式 chunk 结束回收该窗口；提前 commit 则保留本窗口已完成候选或已输出的部分快照，在 residual finish 正式请求提交时核对并领取。后续窗口按原规则验证已有回滚草稿；不能跨 VAD 段借用旧 token，也不能把旧窗口候选交给新窗口。
 
 共享的单个协调器按连接管理生命周期：连接 A 的 chunk/commit 不阻止连接 B 启动候选，也不取消或删除 B 的候选；同一连接的正式请求仍保护本连接的状态和候选边界。默认 `max_active_shadows=0`，允许多连接候选并行；正值才启用额外的全局容量限制。`PRESPEC_PROBE status=discarded_before_boundary` 表示该窗口曾启动候选、但候选在边界前已被丢弃，不能解释为曾被正式请求接受；它替代旧的 `previously_used` 状态。
 

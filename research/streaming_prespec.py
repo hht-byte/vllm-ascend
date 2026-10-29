@@ -1,7 +1,7 @@
-"""Service-side coordinator for an isolated, midpoint ASR shadow request.
+"""Service-side coordinator for an isolated, timed ASR shadow request.
 
 The model adapter supplies ``producer`` and submits the complete audio input
-available at the midpoint under the existing service input contract. The engine
+available at the configured launch point under the existing service input contract. The engine
 owns request state and decides encoder/prefix/KV reuse. The producer verifies
 and repairs the old rollback suffix, then extends that corrected result. This
 module never modifies authoritative state or chooses cached audio/KV ranges.
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Literal, Protocol, Sequence
@@ -18,6 +19,21 @@ from uuid import uuid4
 
 
 logger = logging.getLogger(__name__)
+
+
+def launch_samples_for_window(launch_sec: float, chunk_size_sec: float) -> int:
+    """Convert a 16 kHz launch time to a sample count before the chunk edge."""
+    if not math.isfinite(launch_sec) or not math.isfinite(chunk_size_sec):
+        raise ValueError("prespec launch and chunk seconds must be finite")
+    raw_launch_samples = launch_sec * 16_000
+    raw_chunk_samples = chunk_size_sec * 16_000
+    if not math.isfinite(raw_launch_samples) or not math.isfinite(raw_chunk_samples):
+        raise ValueError("prespec launch and chunk sample counts must be finite")
+    launch_samples = round(raw_launch_samples)
+    chunk_samples = round(raw_chunk_samples)
+    if chunk_samples <= 0 or not 0 < launch_samples < chunk_samples:
+        raise ValueError("prespec launch must be within the formal chunk")
+    return launch_samples
 
 
 @dataclass(frozen=True)
@@ -54,7 +70,7 @@ class LoadSnapshot:
 @dataclass(frozen=True)
 class AdmissionPolicy:
     admission_mode: Literal["gated", "force"] = "gated"
-    midpoint_samples: int = 16_000
+    midpoint_samples: int = 25_600  # Legacy field name: launch offset within a window.
     max_utilization_pct: float = 40.0
     max_load_age_ms: float = 200.0
     cancel_margin_ms: float = 100.0
@@ -258,7 +274,7 @@ class PreSpecCoordinator:
 
     def maybe_start(self, request: ShadowRequest, load: LoadSnapshot | None,
                     predicted_draft_ms: float) -> LaunchDecision:
-        """Try one midpoint request; never put a shadow task in a waiting queue."""
+        """Try one timed request; never put a shadow task in a waiting queue."""
         key = (request.session_id, request.audio_epoch, request.window_id)
         segment_key = key[:2]
         now = self.clock()
