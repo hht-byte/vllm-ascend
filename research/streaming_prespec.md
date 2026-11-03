@@ -6,8 +6,9 @@
 - `streaming_prespec.py` 管理中点 shadow 请求、低负载 admission、候选版本、正式边界取消和 shadow 候选质量评估。
 - `streaming_prespec_helpers.py` 提供三个模型 helper 的实现；服务只需接入原有请求打包代码，并映射本地音频/token 字段，见第四节。
 - `streaming_prespec_formal_args.py` 为正式 chunk/finish 打包完整候选或从首 token 开始的完整回滚草稿；引擎首次验证补丁见 [实施说明](external_draft_first_verify_v023.md)。
+- `mtp_rollback_handoff.py` 等文件提供 [回滚首次验证后接力 spec-asr MTP 的参考穿刺](mtp_rollback_handoff.md)，可逐 chunk 对照 greedy 输出。
 
-这些文件可以复制到 910B 服务项目，模块导入不依赖 vLLM/Ascend。当前仓库没有运行中的 `realtime_connection.py` 和 `qwen3_asr_async.py`，实际请求打包仍需接到服务已有的回滚投机实现；**只有协调器、没有模型接线时不会发送任何伪请求**。
+前三个服务接入文件可以复制到 910B 服务项目，模块导入不依赖 vLLM/Ascend；MTP 参考穿刺额外依赖 spec-asr 模型环境。当前仓库没有运行中的 `realtime_connection.py` 和 `qwen3_asr_async.py`，实际请求打包仍需接到服务已有的回滚投机实现；**只有协调器、没有模型接线时不会发送任何伪请求**。
 
 ## 先验证“上一轮推理尚未完成”的解释
 
