@@ -34,3 +34,11 @@
 - Added complete server integration instructions (parser -> explicit AsyncLLM arguments -> engine config before construction -> model initialization -> both formal helper call sites). Removed the stale duplicate helper code block from the general guide to avoid copy/paste drift.
 - RED reproduced missing startup methods and a stale-shadow override; final scoped service / engine / launch suite passes 63 tests. compileall and diff checks pass. Independent review and a separate check of the final defensive master override found no concrete issue.
 - Server source is not present; no server changes, deployment or service restart performed. User subsequently requested a scoped commit/push of the service-switch changes; earlier independent reference-script edits remain local.
+
+## Startup circular-import correction (2026-11-05)
+
+- User's real stack showed model_runner_v1 importing patch.worker before NPUModelRunner was defined; the old registry then imported the MTP module, which eagerly read that incomplete class. Earlier hook tests supplied an already-defined mock runner and missed this startup order.
+- Added a temporary package imported through real importlib machinery. Before the fix it reproduced the exact partially initialized NPUModelRunner ImportError. After the fix it checks registration on 0.23, skip on other versions, and enabled / disabled drafter selection.
+- Moved only the registration point: remove old eager MTP import from patch/worker/__init__.py, add the version-gated MTP import to worker/worker.py after its original runner import. Runner methods, decoding logic and first-verify transport are unchanged. Exporter handles both fresh installation and upgrade, and validates the worker anchor/version import.
+- Refreshed the release patch and deployment instructions. Fresh and upgrade fixtures pass git apply --check and installation, with empty second exports. Blank unified-diff context lines are normalized to avoid trailing-space warnings in the committed patch artifact.
+- Related CPU regression suite passes 65 tests; independent review found no concrete issue and confirmed the XliteWorker -> NPUWorker -> runner registration order. Real server startup/NPU validation is still pending; no server changes, restart or push performed in this correction.

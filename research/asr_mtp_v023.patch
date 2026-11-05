@@ -1,10 +1,16 @@
---- a/vllm_ascend/patch/worker/__init__.py
-+++ b/vllm_ascend/patch/worker/__init__.py
-@@ -95,3 +95,4 @@
- if vllm_version_is("0.23.0"):
-     import vllm_ascend.patch.worker.patch_external_draft  # noqa
-     import vllm_ascend.patch.worker.patch_external_draft_first_verify  # noqa
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -74,6 +74,10 @@
+ )
+ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
++# Install optional ASR MTP hooks only after the runner is fully imported.
++if vllm_version_is("0.23.0"):
 +    import vllm_ascend.patch.worker.patch_external_draft_mtp  # noqa
++
+ torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
+ from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
+ from vllm.utils.torch_utils import set_random_seed  # noqa: E402
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_heads.py
 @@ -0,0 +1,226 @@
@@ -524,9 +530,12 @@
 +    return worker
 --- /dev/null
 +++ b/vllm_ascend/patch/worker/patch_external_draft_mtp.py
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,102 @@
 +# SPDX-License-Identifier: Apache-2.0
-+"""Optional, idempotent worker hooks; import after the first-verify patch.
++"""Optional worker hooks; import from worker.py AFTER its NPUModelRunner import.
++
++Do not import here from patch/worker/__init__.py: model_runner_v1 imports that
++package before defining NPUModelRunner, causing a circular import.
 +
 +The installed target runner, sampler, rejection sampler and paged KV are not
 +replaced. Without additional_config.asr_mtp, every original method is retained.

@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Optional, idempotent worker hooks; import after the first-verify patch.
+"""Optional worker hooks; import from worker.py AFTER its NPUModelRunner import.
+
+Do not import here from patch/worker/__init__.py: model_runner_v1 imports that
+package before defining NPUModelRunner, causing a circular import.
 
 The installed target runner, sampler, rejection sampler and paged KV are not
 replaced. Without additional_config.asr_mtp, every original method is retained.

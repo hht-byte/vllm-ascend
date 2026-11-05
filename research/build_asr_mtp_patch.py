@@ -1,4 +1,4 @@
-"""Export online MTP modules plus one worker-registry import; never edit the engine.
+"""Export online MTP modules plus a late worker import; never edit the engine.
 
 Apply on top of external_draft_first_verify_v023.patch in the user's engine
 checkout. Source anchors/API and post-bookkeeping call order are checked first.
@@ -10,13 +10,36 @@ from pathlib import Path
 
 
 def registry(source):
-    added = '    import vllm_ascend.patch.worker.patch_external_draft_mtp  # noqa\n'
+    obsolete = '    import vllm_ascend.patch.worker.patch_external_draft_mtp  # noqa\n'
     anchor = '    import vllm_ascend.patch.worker.patch_external_draft_first_verify  # noqa\n'
-    if source.count(added) == 1:
-        return source
     if source.count(anchor) != 1:
         raise ValueError('apply the existing first-verify worker patch before the MTP extension')
-    return source.replace(anchor, anchor + added, 1)
+    if source.count(obsolete) > 1:
+        raise ValueError('ambiguous old MTP worker registry imports')
+    # This package is imported by model_runner_v1 before its class definition.
+    # Undo the old registration location when upgrading an installed patch.
+    return source.replace(obsolete, '', 1)
+
+
+def worker_entry(source):
+    anchor = 'from vllm_ascend.worker.model_runner_v1 import NPUModelRunner\n'
+    block = ('\n# Install optional ASR MTP hooks only after the runner is fully imported.\n'
+             'if vllm_version_is("0.23.0"):\n'
+             '    import vllm_ascend.patch.worker.patch_external_draft_mtp  # noqa\n')
+    if source.count(anchor) != 1:
+        raise ValueError('unsupported worker entry: expected one NPUModelRunner import')
+    imports_version = any(
+        isinstance(node, ast.ImportFrom) and node.module == 'vllm_ascend.utils'
+        and any((alias.asname or alias.name) == 'vllm_version_is' for alias in node.names)
+        for node in ast.walk(ast.parse(source))
+    )
+    if not imports_version:
+        raise ValueError('unsupported worker entry: missing vllm_version_is import')
+    if source.count(block) == 1 and source.index(block) > source.index(anchor):
+        return source
+    if 'import vllm_ascend.patch.worker.patch_external_draft_mtp' in source:
+        raise ValueError('unsupported worker entry: ambiguous MTP registration')
+    return source.replace(anchor, anchor + block, 1)
 
 
 def check_runner(source):
@@ -50,6 +73,7 @@ def make_patch(root):
     directory = Path(__file__).resolve().parent
     paths = {
         'vllm_ascend/patch/worker/__init__.py': None,
+        'vllm_ascend/worker/worker.py': None,
         'vllm_ascend/spec_decode/asr_mtp_heads.py': directory / 'asr_mtp_heads.py',
         'vllm_ascend/spec_decode/asr_mtp_worker.py': directory / 'asr_mtp_worker.py',
         'vllm_ascend/patch/worker/patch_external_draft_mtp.py': directory / 'patch_external_draft_mtp.py',
@@ -58,10 +82,17 @@ def make_patch(root):
     for name, source in paths.items():
         target = root / name
         old = target.read_text(encoding='utf-8').replace('\r\n', '\n') if target.exists() else ''
-        new = registry(old) if source is None else source.read_text(encoding='utf-8').replace('\r\n', '\n')
-        chunks.extend(difflib.unified_diff(
+        if source is None:
+            transform = registry if name.endswith('/__init__.py') else worker_entry
+            new = transform(old)
+        else:
+            new = source.read_text(encoding='utf-8').replace('\r\n', '\n')
+        diff = difflib.unified_diff(
             old.splitlines(keepends=True), new.splitlines(keepends=True),
-            fromfile='a/' + name if target.exists() else '/dev/null', tofile='b/' + name))
+            fromfile='a/' + name if target.exists() else '/dev/null', tofile='b/' + name)
+        # git apply accepts empty context lines; avoid trailing spaces in a
+        # committed patch artifact for unchanged blank source lines.
+        chunks.extend('\n' if line == ' \n' else line for line in diff)
     return ''.join(chunks)
 
 

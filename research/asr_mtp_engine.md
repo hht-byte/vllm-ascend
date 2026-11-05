@@ -2,7 +2,7 @@
 
 本实现运行在 **vLLM worker 内**。加载用户提供的 `asr-mtp` checkpoint 中的辅助 heads，共享已加载目标模型的 embedding 和 logits 计算；不加载第二个 ASR 主干，不使用 HF `generate()`，不重新编码音频。回滚和 Prespec 的完整草稿仍先由已有 first-verify scheduler 补丁排入首次目标执行。随后，无论部分失配还是草稿耗尽，worker 从实际确认的目标上下文进入 MTP，后续草稿继续交给原有目标模型 / rejection sampler 验证。MTP 启用的请求不再进行旧 aligned/ngram 重接。
 
-新增代码只有三个可部署模块，加 worker 注册表一行 import：[补丁](asr_mtp_v023.patch)。不重写 `model_runner_v1.py`、目标模型、scheduler 或 paged KV 管理。安装必须在现有 [first-verify 补丁](external_draft_first_verify_v023.md)之上。
+新增代码只有三个可部署模块，加 `worker.py` 中 runner 导入完成后的一处注册：[补丁](asr_mtp_v023.patch)。不重写 `model_runner_v1.py`、目标模型、scheduler 或 paged KV 管理。安装必须在现有 [first-verify 补丁](external_draft_first_verify_v023.md)之上。
 
 ## 1. 安装到引擎
 
@@ -26,9 +26,27 @@ git apply /tmp/asr-mtp.patch
 | `asr_mtp_heads.py` | `vllm_ascend/spec_decode/asr_mtp_heads.py` |
 | `asr_mtp_worker.py` | `vllm_ascend/spec_decode/asr_mtp_worker.py` |
 | `patch_external_draft_mtp.py` | `vllm_ascend/patch/worker/patch_external_draft_mtp.py` |
-| 注册 import | `vllm_ascend/patch/worker/__init__.py`，紧接 first-verify import |
+| 注册 import | `vllm_ascend/worker/worker.py`，紧接 `NPUModelRunner` 的导入；受 0.23 版本条件保护 |
 
 三个 monkey patch 分别负责 drafter 选择、带 hidden states 的提案分派、finished/abort 状态清理。重复 import 幂等。未配置 MTP 时委托原方法。
+
+### 已安装版本出现循环导入
+
+若启动报 `cannot import name 'NPUModelRunner' from partially initialized module`，并且调用链经过 `patch/worker/__init__.py -> patch_external_draft_mtp.py`，原因是旧版把 MTP import 放在了会被 runner 自身提前导入的注册表。这个问题发生在加载引擎配置之前，单独加 `--no-mtp` 不能消除该导入错误。
+
+更新导出器后，针对**服务器实际已安装目录**重新导出并按上方命令 `git apply --check` / `git apply`。升级 diff 会移除注册表中的旧 MTP import，并在 `worker.py` 原来的 runner 导入后添加：
+
+```python
+from vllm_ascend.worker.model_runner_v1 import NPUModelRunner  # 原有行
+
+# Install optional ASR MTP hooks only after the runner is fully imported.
+if vllm_version_is("0.23.0"):
+    import vllm_ascend.patch.worker.patch_external_draft_mtp  # noqa
+```
+
+`patch/worker/__init__.py` 中原有 external-draft / first-verify import 保留，**仅删除 MTP import**。手动修复时也必须同时改这两处。只把 `patch_external_draft_mtp.py` 内的类 import 移进 `install()`，但仍在导入时执行 `install()`，仍然会循环。
+
+修复需要按原方式重启 worker；这里不会自动重启服务。新增回归使用实际 Python package 导入顺序复现旧异常，再检查新注册在 0.23 上安装、其他版本跳过；CPU 测试不等于 910B 服务已通过启动验收。
 
 ## 2. 引擎配置
 
