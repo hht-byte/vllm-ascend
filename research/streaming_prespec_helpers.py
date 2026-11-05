@@ -48,6 +48,8 @@ class PreSpecModelHelpers:
     Set ``prespec_engine`` to the existing shared engine before enabling.
     Supply ``_pack_stream_request`` as documented; it must not mutate live state.
     ``prespec`` is the existing PreSpecCoordinator, or None when disabled.
+    ``prespec_mtp_enabled`` defaults to True; the engine must separately load
+    the MTP extension. False keeps shadow on its existing one-shot rollback path.
     """
 
     def try_start_prespec(
@@ -117,6 +119,9 @@ class PreSpecModelHelpers:
         return coordinator.maybe_start(request, load, predicted_draft_ms)
 
     def _build_stream_request(self, request, budget):
+        shadow_mtp = getattr(self, "prespec_mtp_enabled", True)
+        if type(shadow_mtp) is not bool:
+            raise TypeError("prespec_mtp_enabled must be a bool")
         if len(request.rollback_tokens) > self.prespec.policy.max_rollback_draft_tokens:
             raise ValueError("rollback draft exceeds engine kmax")
         if len(request.rollback_tokens) + 2 > budget:
@@ -139,6 +144,15 @@ class PreSpecModelHelpers:
         )
         if "prompt" not in kwargs or kwargs.get("sampling_params") is not params:
             raise ValueError("packer must return prompt and supplied sampling_params")
+        # This shadow still verifies the original legacy rollback after its
+        # target drive token. Inherited formal flags would first-verify C[1:]
+        # at the wrong position, or enable formal-only rejoin behavior.
+        extra = dict(getattr(params, "extra_args", None) or {})
+        for key in ("ascend_external_draft_first_verify", "ascend_external_draft_rejoin",
+                    "ascend_external_draft_ngram_after_first_mismatch"):
+            extra.pop(key, None)
+        extra["ascend_mtp"] = shadow_mtp
+        params.extra_args = extra
         kwargs = dict(kwargs)
         kwargs["request_id"] = request.request_id
         return kwargs

@@ -64,7 +64,7 @@ checkpoint 按 supplied `asr-mtp` 的 `{"metadata": ..., "mtp": ...}` 格式读�
 
 ## 3. ASR 请求接线与 A/B
 
-引擎开启 MTP 后，已有 `ascend_external_draft_first_verify=True` 的正式请求自动接力，两种草稿来源相同。现有 shadow 不带该标记，保持原有行为。因此，现有 first-verify 正式 chunk/finish 可以直接使用引擎扩展。
+引擎开启 MTP 后，已有 `ascend_external_draft_first_verify=True` 的正式请求自动接力，两种草稿来源相同。正式 chunk/finish 使用 first-verify；更新后的 Prespec helper 可另外给 shadow 设置 `ascend_mtp=True`，保留其原有回滚验证之后再接 MTP。两条路径的首轮草稿合同不同。
 
 要让**无外部草稿**的正式请求也在首次目标采样后进入 MTP，或明确做请求级 A/B，把本仓更新后的 `streaming_prespec_formal_args.py` 复制到服务的 `qwen_asr/inference/`，在 **chunk 和 finish 两处**现有 helper 调用都传入：
 
@@ -82,7 +82,23 @@ request_kwargs["sampling_params"].extra_args = formal_external_draft_extra_args(
 )
 ```
 
-`mtp_enabled=True` 注入 `ascend_mtp=True`；`False` 注入显式 opt-out；默认 `None` 不注入，由 first-verify 标记决定。只在正式 helper 中传值，**不要在 `_pack_stream_request()` 全局注入，也不要在 `_run_prespec()` 注入**。A/B 可沿已有配置链保存 `self.mtp_enabled`，两处都传 `mtp_enabled=self.mtp_enabled`；OFF/ON 均保留回滚首轮验证和相同初始草稿。MTP ON 需要 `rollback_first_verify=True`，防止误把旧的 `C[1:]` 合同当成完整草稿。MTP OFF 仍使用原重接策略，因此这是两套完整后续策略的对照，不是只衡量辅助头 kernel。
+`mtp_enabled=True` 注入 `ascend_mtp=True`；`False` 注入显式 opt-out；默认 `None` 不注入，由 first-verify 标记决定。此参数仅在正式 helper 中传值，**不要在 `_pack_stream_request()` 全局注入，也不要把正式 first-verify helper 用于 shadow**。A/B 可沿已有配置链保存 `self.mtp_enabled`，两处都传 `mtp_enabled=self.mtp_enabled`；OFF/ON 均保留回滚首轮验证和相同初始草稿。MTP ON 需要 `rollback_first_verify=True`，防止误把旧的 `C[1:]` 合同当成完整草稿。MTP OFF 仍使用原重接策略，因此这是两套完整后续策略的对照，不是只衡量辅助头 kernel。
+
+### 后台 Prespec 验证回滚后接 MTP
+
+同时升级引擎补丁和服务的 `qwen_asr/inference/streaming_prespec_helpers.py`。若服务复制了 helper 方法，应同步复制更新后的 `_build_stream_request()`，不能只增加 `ascend_mtp=True`：旧版 worker 会直接跳过 legacy 草稿。新版 worker 会先返回一次旧回滚草稿，再在下一次验证返回后转入 MTP。
+
+```python
+self.prespec_mtp_enabled = True   # 默认：后台请求回滚验证后接 MTP
+self.prespec_mtp_enabled = False  # 仅关闭后台 MTP，保留旧回滚验证 + 自回归
+```
+
+该开关独立于正式请求的 `mtp_enabled`。引擎仍须配置 `additional_config["asr_mtp"]`；未加载 MTP 时保留原路径。
+
+- 有旧回滚：目标先采样首 token，worker 提交原来的 `C[1:]` **一次**；接受 0 个、部分或全部之后，均从已确认前缀和修正 / bonus drive 进入 MTP。不会 first-verify `C[1:]`，不会重复拼接回滚草稿。
+- 没有旧回滚：首次目标采样后直接用 MTP，直到候选结束、预算用尽或被取消。
+- shadow 请求从专用 SamplingParams 克隆上清除 formal first-verify/rejoin 标记；原音频、prefix、candidate budget、CUMULATIVE 部分结果、deadline、abort/aclose 流程保持原规则。部分候选仍必须满足已有的长于旧回滚范围等领取条件，正式请求继续验证候选。
+- 容量不足时仍先保留原来的旧回滚验证，后续退回普通自回归；生命周期结束时清理 legacy 已提交标记与辅助缓存。shadow 与 formal 共用 NPU 和缓存池，性能需按同负载分别测试正式 ON / shadow OFF 与正式 ON / shadow ON，尤其检查 deadline 命中率和正式 P95。
 
 ## 4. 执行时序与开销
 
@@ -103,6 +119,7 @@ python -m unittest discover -s research -p 'test_asr_mtp_engine.py' -v
 python -m unittest discover -s research -p 'test_patch_external_draft_mtp.py' -v
 python -m unittest discover -s research -p 'test_build_asr_mtp_patch.py' -v
 python -m unittest discover -s research -p 'test_streaming_prespec_formal_args.py' -v
+python -m unittest discover -s research -p 'test_prespec_mtp.py' -v
 ```
 
 前一组需要 Torch、transformers 4.57.6 及 `SPEC_ASR_TEST_ROOT` 对应的参考源码（当前测试默认使用 `.tmp/asr-mtp-reference`）；这些只用于 CPU 核对，不是线上模块的运行依赖。完整 910B checkpoint 的 BF16/NPU 数值和性能尚未实测。部署后先核对 `ASR_MTP_CONFIG`、正式 `INITIAL_DRAFT` 和后续 `ASR_VERIFY_STEP`，以相同音频 / 并发对照完整目标输出、decode 轮次、commit P50/P95/P99、队列等待和显存；辅助输出匹配或减少 head 计算位置不等于已经提高在线性能。单独 NPU 辅助 kernel 的数值差异可能改变接受率，所有输出仍由目标 verifier 决定。

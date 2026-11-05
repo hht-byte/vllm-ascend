@@ -33,9 +33,9 @@ class AscendExternalDraftMTPProposer(AscendExternalDraftProposer):
             raise RuntimeError('ASR MTP requires synchronous CPU sampled token lists')
         enabled = [request_enabled(self.runner.requests[req_id].sampling_params)
                    for req_id in self.runner.input_batch.req_ids]
-        # Do not consume/rejoin external drafts for MTP-enabled requests. Their
-        # initial draft has already been verified (or safely skipped by scheduler).
-        # Shadow and opt-out formal rows preserve the original proposer behavior.
+        # Formal first-verify rows already consumed their initial draft. Legacy
+        # MTP shadow rows submit theirs once inside online.propose before MTP.
+        # Opt-out shadow/formal rows preserve the original proposer behavior.
         outputs = super().propose([[] if active else row for active, row in zip(enabled, sampled)])
         if any(enabled):
             if self.online is None:

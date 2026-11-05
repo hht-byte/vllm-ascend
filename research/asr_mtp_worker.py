@@ -47,6 +47,7 @@ class MTPWorker:
         self.runner, self.heads, self.arena = runner, heads, arena
         self.embedding, self.logits, self.eos = embedding, logits, set(eos)
         self.states, self.disabled = {}, {}
+        self.legacy_submitted = set()
         self.stats = Counter(target_forwards=0)
 
     def finish(self, request_ids):
@@ -55,12 +56,35 @@ class MTPWorker:
             if state is not None:
                 self.arena.release(state)
             self.disabled.pop(req_id, None)
+            self.legacy_submitted.discard(req_id)
 
     def _fallback(self, req_id, reason):
-        self.finish((req_id,))
+        state = self.states.pop(req_id, None)
+        if state is not None:
+            self.arena.release(state)
         self.disabled[req_id] = reason
         self.stats['fallback_' + reason] += 1
         logger.debug('ASR_MTP_FALLBACK request_id=%s reason=%s', req_id, reason)
+
+    def _legacy_draft(self, req_id, params, sampled, confirmed):
+        extra = params.extra_args or {}
+        if (not sampled or extra.get('ascend_external_draft_first_verify', False)
+                or req_id in self.legacy_submitted):
+            return None
+        self.legacy_submitted.add(req_id)
+        draft = extra.get('ascend_external_draft')
+        if not draft:
+            return None  # No old rollback: MTP may start after the first sample.
+        if (not isinstance(draft, (list, tuple)) or
+                any(type(token) is not int or token < 0 for token in draft)):
+            raise ValueError('legacy external draft must contain nonnegative token IDs')
+        request = self.runner.requests[req_id]
+        limit = min(self.runner.speculative_config.num_speculative_tokens,
+                    self.runner.input_batch.max_model_len - confirmed,
+                    params.max_tokens - len(request.output_token_ids))
+        offered = list(draft[:max(0, limit)])
+        self.stats['legacy_draft_tokens'] += len(offered)
+        return offered
 
     @torch.inference_mode()
     def profile(self):
@@ -93,10 +117,11 @@ class MTPWorker:
         for i, (req_id, tokens) in enumerate(zip(batch.req_ids, sampled)):
             request = runner.requests[req_id]
             params = request.sampling_params
-            if not request_enabled(params) or req_id in self.disabled:
+            if not request_enabled(params):
                 continue
             if params.temperature != 0 or params.n != 1 or req_id in batch.spec_decode_unsupported_reqs:
-                self._fallback(req_id, 'unsupported_sampling')
+                if req_id not in self.disabled:
+                    self._fallback(req_id, 'unsupported_sampling')
                 continue
             stops = stop_ids(params, self.eos)
             previous_output = len(request.output_token_ids) - len(tokens)
@@ -106,11 +131,16 @@ class MTPWorker:
             if any(token in stops and previous_output + j + 1 >= minimum
                    for j, token in enumerate(tokens)):
                 continue
+            confirmed = int(batch.num_tokens_no_spec[i])
+            legacy = self._legacy_draft(req_id, params, tokens, confirmed)
+            if legacy is not None:
+                outputs[i] = legacy
+            if req_id in self.disabled:
+                continue
             start = int(batch.num_computed_tokens_cpu[i])
             count = scheduler_output.num_scheduled_tokens[req_id]
             # Bookkeeping has appended accepted draft IDs + correction/bonus.
             # The last one is a drive token, not yet represented by any hidden row.
-            confirmed = int(batch.num_tokens_no_spec[i])
             end = confirmed - 1 if tokens else start + count
             if end > self.arena.max_context:
                 self._fallback(req_id, 'context_cap')
@@ -136,8 +166,10 @@ class MTPWorker:
             state.target[start:end].copy_(hidden[query_start:query_start + end - start])
             state.length = end
             state.crop_heads(end)
-            if not tokens:
-                continue  # retain chunked prefill rows; no drive token yet
+            if not tokens or legacy is not None:
+                # Keep confirmed prefill hidden while the legacy rollback goes
+                # through the target once. Do not skip it by immediately drafting MTP.
+                continue
             remaining = params.max_tokens - len(request.output_token_ids)
             limit = min(self.heads.num_heads, runner.speculative_config.num_speculative_tokens,
                         batch.max_model_len - confirmed, remaining)
@@ -160,6 +192,7 @@ class MTPWorker:
                     [states[i] for i in group], [inputs[i] for i in group],
                     self.embedding, self.logits, [limits[i] for i in group])
             rows = drafts.tolist()  # One device-to-host boundary for the whole batch.
+            mtp_tokens = 0
             for i, row, limit in zip(indices, rows, limits):
                 row = row[:limit]
                 params = runner.requests[batch.req_ids[i]].sampling_params
@@ -170,12 +203,13 @@ class MTPWorker:
                         row = row[:j + 1]
                         break
                 outputs[i] = row
+                mtp_tokens += len(row)
             self.stats['proposal_batches'] += 1
             self.stats['head_batches'] += len(buckets)
-            self.stats['draft_tokens'] += sum(map(len, outputs))
+            self.stats['draft_tokens'] += mtp_tokens
             self.stats['head_positions'] += self.heads.processed_positions - before
             logger.debug('ASR_MTP_STEP requests=%d draft_tokens=%d new_head_positions=%d',
-                         len(states), sum(map(len, outputs)), self.heads.processed_positions - before)
+                         len(states), mtp_tokens, self.heads.processed_positions - before)
         return outputs
 
 

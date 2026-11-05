@@ -110,6 +110,70 @@ class EngineHeadsTests(unittest.TestCase):
         t.testing.assert_close(worker.states['a'].target[:4], hidden[:4])
         self.assertEqual(worker.stats['target_forwards'], 0)
 
+    def test_shadow_verifies_legacy_rollback_once_then_uses_repaired_state_for_mtp(self):
+        for accepted in (0, 1, 2):
+            with self.subTest(accepted=accepted):
+                worker, runner = self.make_worker()
+                params = runner.requests['a'].sampling_params
+                params.extra_args['ascend_external_draft'] = [20, 21]
+                first_hidden = self.t.randn(4, 8)
+                with self.t.inference_mode():
+                    initial = worker.propose([[7]], SimpleNamespace(num_scheduled_tokens={'a': 4}), first_hidden)
+                self.assertEqual(initial, [[20, 21]])
+                self.assertEqual(worker.stats['proposal_batches'], 0)
+                self.assertEqual(worker.states['a'].length, 4)
+                sampled = [20, 21][:accepted] + [9]
+                full = [3, 4, 5, 6, 7] + sampled
+                runner.input_batch.num_computed_tokens_cpu[0] = 4
+                runner.input_batch.num_tokens_no_spec[0] = len(full)
+                runner.input_batch.token_ids_cpu[0, :len(full)] = full
+                runner.requests['a'].output_token_ids.extend(sampled)
+                hidden = self.t.randn(3, 8)
+                with self.t.inference_mode():
+                    result = worker.propose([sampled], SimpleNamespace(num_scheduled_tokens={'a': 3}), hidden)
+                    state = worker.states['a']
+                    expected = self.reference.propose(
+                        state.target[:state.length].unsqueeze(0), self.t.tensor([full[:-1]]),
+                        self.t.tensor([[9]]), self.embed, self.head, self.rotary, max_heads=3)
+                self.assertEqual(result[0], expected[0, 1:].tolist())
+                self.assertEqual(worker.stats['proposal_batches'], 1)
+                self.assertEqual(state.length, 5 + accepted)
+                worker.finish({'a'})
+                self.assertNotIn('a', worker.legacy_submitted)
+
+    def test_legacy_rollback_survives_auxiliary_context_cap_fallback(self):
+        worker, runner = self.make_worker()
+        runner.requests['a'].sampling_params.extra_args['ascend_external_draft'] = [20, 21]
+        runner.input_batch.token_ids_cpu = self.t.zeros(1, 64, dtype=self.t.long).numpy()
+        runner.input_batch.max_model_len = 64
+        runner.input_batch.num_tokens_no_spec[0] = 34
+        with self.t.inference_mode():
+            result = worker.propose([[7]], SimpleNamespace(num_scheduled_tokens={'a': 33}),
+                                   self.t.randn(33, 8))
+        self.assertEqual(result, [[20, 21]])
+        self.assertEqual(worker.disabled['a'], 'context_cap')
+        with self.t.inference_mode():
+            self.assertEqual(worker.propose([[7]], SimpleNamespace(num_scheduled_tokens={'a': 1}),
+                                            self.t.randn(1, 8)), [[]])
+        worker.finish({'a'})
+        self.assertFalse(worker.legacy_submitted)
+
+    def test_legacy_stage_waits_for_a_drive_after_chunked_prefill(self):
+        worker, runner = self.make_worker()
+        runner.requests['a'].sampling_params.extra_args['ascend_external_draft'] = [20, 21]
+        runner.requests['a'].output_token_ids = []
+        runner.input_batch.num_tokens_no_spec[0] = 4
+        first, second = self.t.randn(2, 8), self.t.randn(2, 8)
+        with self.t.inference_mode():
+            self.assertEqual(worker.propose([[]], SimpleNamespace(num_scheduled_tokens={'a': 2}), first), [[]])
+            self.assertNotIn('a', worker.legacy_submitted)
+            runner.input_batch.num_computed_tokens_cpu[0] = 2
+            runner.input_batch.num_tokens_no_spec[0] = 5
+            runner.requests['a'].output_token_ids = [7]
+            self.assertEqual(worker.propose([[7]], SimpleNamespace(num_scheduled_tokens={'a': 2}), second), [[20, 21]])
+        self.assertEqual(worker.stats['proposal_batches'], 0)
+        self.t.testing.assert_close(worker.states['a'].target[:4], self.t.cat((first, second)))
+
     def test_reordered_batch_partial_acceptance_and_finished_cleanup(self):
         worker, runner = self.make_worker()
         t = self.t
@@ -300,7 +364,7 @@ class EngineHeadsTests(unittest.TestCase):
                 token = self.head(state.last_hidden_state[:, -1]).argmax(-1, keepdim=True)
                 greedy.append(int(token.item()))
                 state = target(input_ids=token, past_key_values=state.past_key_values, use_cache=True)
-            for source in ('rollback', 'prespec'):
+            for source in ('rollback', 'prespec', 'shadow'):
                 for accepted_initial in (0, 1, 3):
                     with self.subTest(source=source, initial_accepted=accepted_initial):
                         batch = SimpleNamespace(req_ids=['a'], num_computed_tokens_cpu=np.array([0]),
@@ -316,11 +380,16 @@ class EngineHeadsTests(unittest.TestCase):
                         arena = CacheArena(self.config, 3, max_context=64, slots=1,
                                            device='cpu', dtype=t.float32)
                         online = MTPWorker(runner, heads, arena, target.embed_tokens, self.head, {99})
-                        external = greedy[:3]
+                        external = greedy[1:4] if source == 'shadow' else greedy[:3]
                         if accepted_initial < 3:
                             external[accepted_initial] = (external[accepted_initial] + 1) % 32
                         full = prompt.copy()
-                        query, drafted, past, start = prompt + external, external, None, 0
+                        if source == 'shadow':
+                            params.extra_args = {'ascend_mtp': True, 'ascend_external_draft': external}
+                            query, drafted = prompt, []
+                        else:
+                            query, drafted = prompt + external, external
+                        past, start = None, 0
                         calls = 0
                         while len(full) - len(prompt) < 12:
                             output = target(input_ids=t.tensor([query]), past_key_values=past, use_cache=True)
@@ -350,6 +419,8 @@ class EngineHeadsTests(unittest.TestCase):
                         self.assertEqual(online.stats['target_forwards'], 0)
                         self.assertGreater(online.stats['proposal_batches'], 0)
                         self.assertLessEqual(calls, 12)
+                        online.finish({'a'})
+                        self.assertFalse(online.legacy_submitted)
 
 
 if __name__ == '__main__':
