@@ -8,6 +8,25 @@ from streaming_prespec import AdmissionPolicy, Candidate, PreSpecCoordinator
 
 
 class FormalArgsTests(unittest.TestCase):
+    def test_online_mtp_marker_applies_to_both_sources_and_empty_formal_draft(self):
+        for candidate, rollback, full in (((10, 20), (), ()), (None, (20,), (10, 20)),
+                                          (None, (), ())):
+            args = formal_external_draft_extra_args(
+                None, candidate_tokens=candidate, rollback_tokens=rollback,
+                rollback_full_tokens=full, kmax=3, mtp_enabled=True)
+            self.assertTrue(args['ascend_mtp'])
+        args = formal_external_draft_extra_args(
+            {'ascend_mtp': True}, candidate_tokens=None, rollback_tokens=(),
+            rollback_full_tokens=(), kmax=3)
+        self.assertNotIn('ascend_mtp', args)
+
+    def test_online_mtp_rejects_ambiguous_legacy_first_token_mode(self):
+        with self.assertRaisesRegex(ValueError, 'rollback_first_verify'):
+            formal_external_draft_extra_args(
+                None, candidate_tokens=None, rollback_tokens=(20,),
+                rollback_full_tokens=(10, 20), kmax=3,
+                mtp_enabled=True, rollback_first_verify=False)
+
     def test_candidate_full_draft_and_budget_contract(self):
         candidate = Candidate("req", "ws", 0, 0, 0, 16000,
                               (10, 20, 30), 0)

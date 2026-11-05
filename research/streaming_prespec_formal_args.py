@@ -39,6 +39,7 @@ def formal_external_draft_extra_args(
     rejoin_policy: RejoinPolicy = "ngram_1",
     rollback_first_verify: bool = True,
     prespec_first_mismatch_ngram: bool = True,
+    mtp_enabled: bool | None = None,
 ) -> dict[str, object]:
     """Select a candidate or rollback draft for the formal request.
 
@@ -56,7 +57,14 @@ def formal_external_draft_extra_args(
         raise TypeError("rollback_first_verify must be a bool")
     if type(prespec_first_mismatch_ngram) is not bool:
         raise TypeError("prespec_first_mismatch_ngram must be a bool")
+    if mtp_enabled is not None and type(mtp_enabled) is not bool:
+        raise TypeError("mtp_enabled must be a bool")
+    if mtp_enabled and not rollback_first_verify:
+        raise ValueError("online MTP requires rollback_first_verify=True")
     args = dict(existing or {})
+    args.pop("ascend_mtp", None)
+    if mtp_enabled is not None:
+        args["ascend_mtp"] = mtp_enabled
     args.pop("ascend_external_draft_first_verify", None)
     args.pop("ascend_external_draft_rejoin", None)
     args.pop("ascend_external_draft_ngram_after_first_mismatch", None)

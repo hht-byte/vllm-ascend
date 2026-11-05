@@ -9,3 +9,5 @@ __pycache__/
 dist/
 build/
 benchmark-results/
+.tmp/asr-mtp-reference/
+.tmp/mtp-test-env/
