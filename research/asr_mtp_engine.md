@@ -76,11 +76,25 @@ base_config["enable_prefix_caching"] = False
 
 初版支持 TP=PP=PCP=DCP=1、无量化 / LoRA 的 Qwen3-ASR、同步调度和贪心 `n=1`。不支持的引擎配置在权重加载时拒绝，不能自动退成另一种投机算法。禁用 prefix caching 是因为仅有命中的目标 KV 无法恢复 MTP 所需的完整目标 hidden 历史；不重新 prefill 来弥补。chunked prefill 可以保留每次已计算的 hidden 行。其他模型或 RoPE scaling 不在此版本范围。
 
-checkpoint 按 supplied `asr-mtp` 的 `{"metadata": ..., "mtp": ...}` 格式读取，只装载所用辅助 heads，严格校验 state_dict 和 backbone `base_signature`。签名沿用训练仓库算法，包含 config、safetensors 文件名、大小、mtime；换目录并修改 mtime 也可能不匹配，不能据此直接绕过 backbone 校验。缓存 arena 在 `load_model` 中按字节预算预分配，纳入引擎目标 KV 定容之前的显存统计；profile 阶段执行最坏辅助 batch 来统计临时内存。`cache_mib` **不包含辅助权重和临时 attention 工作区**，实际总增量显存大于该数值。实际槽数是 `min(max_requests, floor(cache_mib / 每槽字节数))`，启动日志 `ASR_MTP_CONFIG` 给出实际值。
+checkpoint 按 supplied `asr-mtp` 的 `{"metadata": ..., "mtp": ...}` 格式读取，只装载所用辅助 heads，严格校验辅助头 state_dict。**默认关闭主模型的 `base_signature` 指纹校验**；Qwen3-ASR 架构与辅助头参数形状检查保留。MTP 训练冻结主模型，运行时共享服务已加载的目标模型，所有辅助草稿仍交由目标 verifier 验证。
+
+缓存 arena 在 `load_model` 中按字节预算预分配，纳入引擎目标 KV 定容之前的显存统计；profile 阶段执行最坏辅助 batch 来统计临时内存。`cache_mib` **不包含辅助权重和临时 attention 工作区**，实际总增量显存大于该数值。实际槽数是 `min(max_requests, floor(cache_mib / 每槽字节数))`，启动日志 `ASR_MTP_CONFIG` 给出实际值。
 
 用户提供的是葡语训练 checkpoint；其他语言的接受率和净收益需要单独测量，不能从葡语结果外推。
 
 移除 `additional_config["asr_mtp"]` 即恢复原有外部草稿 proposer。不要改成原生 `method="mtp"`：它不会识别这份定制 checkpoint。
+
+### 可选主模型指纹校验
+
+训练仓库的旧签名包含 config 原始字节、safetensors 文件名、大小、mtime，**不包含权重内容哈希或目录路径**；复制时仅 mtime 变化也可能导致相同权重的签名不同。默认 `verify_base_signature=False` 完全跳过该检查，不读取指纹文件。需要严格复现训练环境时，在现有引擎配置中设置：
+
+```python
+base_config["additional_config"]["asr_mtp"]["verify_base_signature"] = True
+```
+
+省略该字段或显式设置 `False` 都表示跳过；字符串 `"false"`、数字等非法值会在启动时报错。此配置通过现有 `additional_config` 传递，不是 `AsyncLLM()` 新形参；服务的 `mtp_engine_config()` 会保留它，CLI checkpoint 覆盖也不会删除该设置。
+
+升级 worker 后重新导出、应用补丁并按原方式重启。`ASR_MTP_CONFIG` 日志记录 `verify_base_signature=False/True`。开启时沿用旧算法，并在不匹配错误中打印训练和服务签名 / 模型路径；该模式也只在启动时执行，不增加 decode 阶段开销。checkpoint 文件保持原样。架构、辅助头 state_dict、引擎并行 / 缓存约束独立检查，关闭指纹校验不会影响这些检查。
 
 ## 3. ASR 请求接线与 A/B
 

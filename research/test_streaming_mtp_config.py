@@ -55,6 +55,7 @@ class MTPServiceConfigTests(unittest.TestCase):
         base['additional_config']['asr_mtp'] = {
             'checkpoint': '/old.pt', 'num_heads': 3, 'cache_mib': 128,
             'max_requests': 20, 'max_context_tokens': 256,
+            'verify_base_signature': True,
         }
         result = mtp_engine_config(base, mtp_enabled=True)
         self.assertEqual(result['additional_config']['asr_mtp'],

@@ -242,7 +242,7 @@
 +        return outputs
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_worker.py
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,303 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Worker-local external draft -> MTP handoff for the v0.23 sync runner."""
 +from collections import Counter
@@ -482,9 +482,27 @@
 +    return value.hexdigest()
 +
 +
++def check_base_signature(metadata, model_path, settings):
++    """Optionally check the training fingerprint, which includes shard mtimes."""
++    verify = settings.get('verify_base_signature', False)
++    if type(verify) is not bool:
++        raise TypeError('asr_mtp.verify_base_signature must be a bool')
++    if not verify:
++        return None
++    actual = base_signature(model_path)
++    saved = metadata.get('base_signature')
++    if saved != actual:
++        raise ValueError('MTP checkpoint backbone signature differs from the target: '
++                         f'saved_signature={saved} target_signature={actual} '
++                         f'training_model={metadata.get("base_model")} target_model={model_path}. '
++                         'The legacy fingerprint includes config bytes, shard names, sizes and mtimes.')
++    return actual
++
++
 +def load_worker(runner, target, settings):
 +    validate_engine(runner)
-+    allowed = {'checkpoint', 'num_heads', 'max_context_tokens', 'cache_mib', 'max_requests'}
++    allowed = {'checkpoint', 'num_heads', 'max_context_tokens', 'cache_mib', 'max_requests',
++               'verify_base_signature'}
 +    if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
 +        raise ValueError('invalid additional_config.asr_mtp settings')
 +    for name, default in (('num_heads', 5), ('max_context_tokens', 512),
@@ -501,8 +519,7 @@
 +    # unused optimizer tensor storage into RAM; no remote download occurs here.
 +    checkpoint = torch.load(settings['checkpoint'], map_location='cpu', mmap=True, weights_only=False)
 +    metadata, weights = checkpoint['metadata'], checkpoint['mtp']
-+    if metadata.get('base_signature') != base_signature(runner.model_config.model):
-+        raise ValueError('MTP checkpoint backbone signature differs from the target')
++    check_base_signature(metadata, runner.model_config.model, settings)
 +    trained = metadata['num_heads']
 +    if type(trained) is not int or trained < 1:
 +        raise ValueError('invalid checkpoint num_heads')
@@ -524,9 +541,10 @@
 +    eos = getattr(text, 'eos_token_id', None)
 +    eos = set(eos if isinstance(eos, (tuple, list)) else [eos]) - {None}
 +    worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits, eos)
-+    logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s',
++    logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
++                'verify_base_signature=%s',
 +                heads, cap, slots, arena.storage.numel() * arena.storage.element_size() / 1024 ** 2,
-+                settings['checkpoint'])
++                settings['checkpoint'], settings.get('verify_base_signature', False))
 +    return worker
 --- /dev/null
 +++ b/vllm_ascend/patch/worker/patch_external_draft_mtp.py

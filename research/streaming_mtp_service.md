@@ -60,6 +60,8 @@ kwargs = mtp_engine_config(
 - 总开关 ON：保留已有 `asr_mtp` 中的 head / cache 参数，CLI checkpoint 可覆盖原路径；未提供 CLI 路径时复用字典中的 checkpoint。没有 checkpoint 或外部草稿 `custom_class` 配置会在启动时报错。
 - ON 时缺省补 `async_scheduling=False`、`enable_prefix_caching=False`；如果显式配置了不兼容值，则报错，避免静默改变实验配置。其余 TP / PP / 量化限制仍由 worker 加载校验。
 
+主模型的旧式文件指纹默认不校验；如需严格校验，在 `additional_config["asr_mtp"]` 中设置 [verify_base_signature=True](asr_mtp_engine.md#可选主模型指纹校验)。`mtp_engine_config()` 保留该字段；它不作为新的 `AsyncLLM()` 关键字传入。默认关闭时，架构与辅助头参数形状检查仍保留。
+
 引擎的外部草稿配置保持为：
 
 ```python

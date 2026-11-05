@@ -5,12 +5,71 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+from copy import deepcopy
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 ROOT = Path(os.environ.get('SPEC_ASR_TEST_ROOT',
                           Path(__file__).resolve().parents[1] / '.tmp/asr-mtp-reference'))
 AVAILABLE = (importlib.util.find_spec('torch') is not None and
              importlib.util.find_spec('transformers') is not None and
              (ROOT / 'spec_asr/mtp.py').is_file())
+
+
+@unittest.skipUnless(importlib.util.find_spec('torch'), 'requires CPU Torch')
+class BackboneSignatureTests(unittest.TestCase):
+    def setUp(self):
+        from asr_mtp_worker import base_signature
+        self.directory = TemporaryDirectory(dir=Path(__file__).resolve().parent)
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / 'config.json').write_bytes(b'{}')
+        self.shard = self.root / 'model.safetensors'
+        self.shard.write_bytes(b'identical weights')
+        self.saved = base_signature(self.root)
+        self.metadata = {'base_signature': self.saved, 'base_model': '/old/training/model'}
+
+    def migrate_mtime(self):
+        from asr_mtp_worker import base_signature
+        original = self.shard.stat()
+        os.utime(self.shard, ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000_000))
+        self.assertEqual(self.shard.read_bytes(), b'identical weights')
+        actual = base_signature(self.root)
+        self.assertNotEqual(actual, self.saved)
+        return actual
+
+    def test_default_skips_fingerprint_files_entirely(self):
+        from asr_mtp_worker import check_base_signature
+        with patch('asr_mtp_worker.base_signature', side_effect=AssertionError('must not read files')):
+            self.assertIsNone(check_base_signature(self.metadata, '/unavailable/model', {}))
+
+    def test_opt_in_strict_match_is_unchanged(self):
+        from asr_mtp_worker import check_base_signature
+        self.assertEqual(check_base_signature(
+            self.metadata, self.root, {'verify_base_signature': True}), self.saved)
+
+    def test_opt_in_mismatch_fails_with_diagnostic_signatures(self):
+        from asr_mtp_worker import check_base_signature
+        actual = self.migrate_mtime()
+        with self.assertRaises(ValueError) as raised:
+            check_base_signature(self.metadata, self.root, {'verify_base_signature': True})
+        self.assertIn(self.saved, str(raised.exception))
+        self.assertIn(actual, str(raised.exception))
+        self.assertIn('/old/training/model', str(raised.exception))
+
+    def test_explicit_false_accepts_migration_without_mutating_metadata(self):
+        from asr_mtp_worker import check_base_signature
+        self.migrate_mtime()
+        settings = {'verify_base_signature': False}
+        before = deepcopy((settings, self.metadata))
+        self.assertIsNone(check_base_signature(self.metadata, self.root, settings))
+        self.assertEqual((settings, self.metadata), before)
+
+    def test_signature_option_requires_a_real_bool(self):
+        from asr_mtp_worker import check_base_signature
+        for value in (None, 0, 1, 'false', 'true', [], {}):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                check_base_signature(self.metadata, self.root, {'verify_base_signature': value})
 
 
 @unittest.skipUnless(AVAILABLE, 'requires CPU Torch, transformers and supplied MTP source')
@@ -317,7 +376,7 @@ class EngineHeadsTests(unittest.TestCase):
         t.testing.assert_close(worker.states['a'].target[4:6], second[4:6])
         t.testing.assert_close(worker.states['b'].target[4:6], second[:2])
 
-    def test_loads_only_auxiliary_checkpoint_and_rejects_wrong_target(self):
+    def test_auxiliary_load_has_optional_fingerprint_and_strict_head_shapes(self):
         import tempfile
         from asr_mtp_worker import load_worker, base_signature
         t = self.t
@@ -343,7 +402,22 @@ class EngineHeadsTests(unittest.TestCase):
             self.assertEqual(worker.arena.storage.shape[0], 2)
             self.assertIs(worker.embedding, self.embed)
             (root / 'config.json').write_text('{"changed":true}', encoding='utf-8')
+            self.assertEqual(load_worker(runner, target, settings).heads.num_heads, 2)
+            settings['verify_base_signature'] = True
             with self.assertRaisesRegex(ValueError, 'signature'):
+                load_worker(runner, target, settings)
+            settings['verify_base_signature'] = False
+            self.assertEqual(load_worker(runner, target, settings).heads.num_heads, 2)
+            hf.model_type = 'other'
+            with self.assertRaisesRegex(ValueError, 'architecture'):
+                load_worker(runner, target, settings)
+            hf.model_type = 'qwen3_asr'
+            saved = t.load(checkpoint, weights_only=False)
+            saved['mtp'].pop(next(iter(saved['mtp'])))
+            invalid_checkpoint = root / 'missing-head-weight.pt'
+            t.save(saved, invalid_checkpoint)
+            settings['checkpoint'] = str(invalid_checkpoint)
+            with self.assertRaisesRegex(RuntimeError, 'Missing key'):
                 load_worker(runner, target, settings)
             runner.use_async_scheduling = True
             with self.assertRaisesRegex(ValueError, 'async_scheduling'):
