@@ -4,11 +4,11 @@
 
 - `commit_overlap.py` 用现有逐 commit JSONL/CSV 检查前一条正式 commit 的重叠；若提供服务 DEBUG 日志，还检查**同一段内流式 chunk 推理与 commit 等待**的重叠。
 - `streaming_prespec.py` 管理中点 shadow 请求、低负载 admission、候选版本、正式边界取消和 shadow 候选质量评估。
-- `streaming_prespec_helpers.py` 提供三个模型 helper 的实现；服务只需接入原有请求打包代码，并映射本地音频/token 字段，见第四节。
+- `streaming_prespec_helpers.py` 提供模型 helper 和启动配置的实现；服务只需接入原有请求打包代码，并映射本地音频/token 字段，见第四节。
 - `streaming_prespec_formal_args.py` 为正式 chunk/finish 打包完整候选或从首 token 开始的完整回滚草稿；引擎首次验证补丁见 [实施说明](external_draft_first_verify_v023.md)。
 - `mtp_rollback_handoff.py` 等文件提供 [回滚首次验证后接力 spec-asr MTP 的参考穿刺](mtp_rollback_handoff.md)，可逐 chunk 对照 greedy 输出。
 
-前三个服务接入文件可以复制到 910B 服务项目，模块导入不依赖 vLLM/Ascend；MTP 参考穿刺额外依赖 spec-asr 模型环境。当前仓库没有运行中的 `realtime_connection.py` 和 `qwen3_asr_async.py`，实际请求打包仍需接到服务已有的回滚投机实现；**只有协调器、没有模型接线时不会发送任何伪请求**。
+服务接入模块可以复制到 910B 服务项目，模块导入不依赖 vLLM/Ascend；MTP 参考穿刺额外依赖 spec-asr 模型环境。在线 worker 和服务开关见 [MTP 接入](asr_mtp_engine.md)。当前仓库没有运行中的 `realtime_connection.py` 和 `qwen3_asr_async.py`，实际请求打包仍需接到服务已有的回滚投机实现；**只有协调器、没有模型接线时不会发送任何伪请求**。
 
 ## 先验证“上一轮推理尚未完成”的解释
 
@@ -36,7 +36,7 @@ python commit_overlap.py --commits baseline-c20-commits.jsonl \
 
 #### 步骤 1：复制模块并添加 import
 
-把本仓库的 `research/streaming_prespec.py`、`research/streaming_prespec_helpers.py` 和 `research/streaming_prespec_formal_args.py` 一起复制到服务项目的 `qwen_asr/inference/`。在 `qwen3_asr_async.py` 顶部新增：
+把本仓库的 `research/streaming_prespec.py`、`research/streaming_prespec_helpers.py`、`research/streaming_prespec_formal_args.py` 和 `research/streaming_mtp_config.py` 一起复制到服务项目的 `qwen_asr/inference/`。在 `qwen3_asr_async.py` 顶部新增：
 
 ```python
 from qwen_asr.inference.streaming_prespec import (
@@ -55,52 +55,18 @@ from qwen_asr.inference.streaming_prespec_formal_args import (
 
 把现有类声明改为 `class Qwen3ASRModelAsync(PreSpecModelHelpers, Qwen3ASRModel):`，原有类体保留。这个 mixin 没有构造函数，提供第四节的模型方法及完整音频快照函数；若此前自行添加过同名占位方法，应替换它们，避免覆盖 mixin 的实现。
 
-下面的代码分为两类：**新增代码**可放入指定位置；**原代码形态**只用于定位，因为没有你的函数原文。原有变量、构造参数不能用示例中的省略号替换。
+下面的代码分为两类：**新增代码**可放入指定位置；**原代码形态**只用于定位，因为没有你的函数原文。原有变量、构造参数不能用示例中的省略号替换。服务级 MTP 总开关与后台开关见 [MTP 服务接线](streaming_mtp_service.md)，必须从 parser 传到工厂，再写入模型实例。
 
 #### 步骤 2：在模型类中新增 `enable_prespec()` 方法
 
-放在 `class Qwen3ASRModelAsync` 内，与 `async_streaming_transcribe()` 同一级缩进。这是本方案新增的方法，不是现有 API：
+更新后的 mixin 已实现此方法。若模型类没有同名方法，直接继承即可；若此前复制了旧实现，放在 `class Qwen3ASRModelAsync` 内、与 `async_streaming_transcribe()` 同一级缩进，替换为以下转调，避免旧实现覆盖 mixin：
 
 ```python
-def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
-                   launch_sec=1.6, candidate_tokens=None, on_probe=None,
-                   admission_mode="force", shadow_only=True,
-                   max_active_shadows=0, rejoin_policy="ngram_1"):
-    # 仅在服务启动、连接尚未创建时调用一次。
-    self.prespec = None
-    if not enabled:
-        return
-    if kmax <= 0 or chunk_size_sec <= 0:
-        raise ValueError("prespec requires positive kmax, budget and chunk size")
-    if candidate_tokens is None:
-        candidate_tokens = kmax
-    if candidate_tokens < 3:
-        raise ValueError("candidate budget needs first token, draft and continuation")
-    if candidate_tokens > kmax:
-        raise ValueError("candidate budget must fit engine kmax")
-    if rejoin_policy not in ("aligned", "ngram_1", "ngram_2", "ngram_3"):
-        raise ValueError("invalid prespec rejoin policy")
-    self.prespec_rejoin_policy = rejoin_policy
-    midpoint_samples = launch_samples_for_window(launch_sec, chunk_size_sec)
-    if engine is None or not callable(getattr(self, "_pack_stream_request", None)):
-        raise ValueError("prespec requires engine and the existing request packer")
-    self.prespec_engine = engine  # 引用已创建的同一个 engine，不创建第二个
-
-    self.prespec = PreSpecCoordinator(
-        producer=self._run_prespec,
-        policy=AdmissionPolicy(
-            admission_mode=admission_mode,
-            midpoint_samples=midpoint_samples,
-            max_rollback_draft_tokens=kmax,
-            max_candidate_tokens=candidate_tokens,
-            max_active_shadows=max_active_shadows,
-        ),
-        shadow_only=shadow_only,
-        on_probe=on_probe,
-    )
+def enable_prespec(self, **options):
+    return PreSpecModelHelpers.enable_prespec(self, **options)
 ```
 
-这个方法创建协调器并保存 engine 引用。`launch_samples_for_window()` 从本仓复制的 `streaming_prespec.py` 导入；默认 2 秒窗口在 1.6 秒（25,600 个 16 kHz 样本）启动，距正式边界剩 0.4 秒。`midpoint_samples` 保留旧字段名以兼容现有 helper，其含义现在是可配置启动阈值。正式请求选中的完整预投机候选或完整回滚草稿 `C[0:]` 都在目标首次执行前进入 verifier，首 token 占一个 `kmax` 槽位，因此候选预算默认等于 `kmax`，显式值也不能超过它。旧草稿加候选首 token、至少一个续写 token 放不下时跳过。仅 shadow 旧草稿仍沿用跳首 token 合同。引擎补丁与服务调用见 [首次验证实施说明](external_draft_first_verify_v023.md)。
+这个方法仅在服务启动时调用，创建协调器并保存 engine 引用。它显式接收 `mtp_enabled=False` 和 `prespec_mtp_enabled=True`，在预投机关闭时也保存 MTP 配置；`producer` 默认 `_run_prespec`，日志 wrapper 应通过参数传入。内部调用 `launch_samples_for_window()`；默认 2 秒窗口在 1.6 秒（25,600 个 16 kHz 样本）启动，距正式边界剩 0.4 秒。`midpoint_samples` 保留旧字段名以兼容现有 helper，其含义现在是可配置启动阈值。正式请求选中的完整预投机候选或完整回滚草稿 `C[0:]` 都在目标首次执行前进入 verifier，首 token 占一个 `kmax` 槽位，因此候选预算默认等于 `kmax`，显式值也不能超过它。旧草稿加候选首 token、至少一个续写 token 放不下时跳过。仅 shadow 旧草稿仍沿用跳首 token 合同。引擎补丁与服务调用见 [首次验证实施说明](external_draft_first_verify_v023.md)。
 
 `max_active_shadows=0` 表示协调器不设进程级候选并发上限，各连接可同时运行候选；实际调度和容量仍由共享 engine 决定。正整数是可选的进程级上限，负数非法。不要保留旧接线中的 `max_active_shadows=1`，否则替换协调器后仍会把所有连接串行化。
 
@@ -267,10 +233,11 @@ new_audio_samples = current_audio_end_samples - last_formal_audio_end_samples
 
 #### 4.2 哪些已提供，哪些必须从你的函数搬出
 
-三个完整方法已放在同目录 [streaming_prespec_helpers.py](streaming_prespec_helpers.py)，第一节的 mixin 导入后即可使用：
+完整方法已放在同目录 [streaming_prespec_helpers.py](streaming_prespec_helpers.py)，第一节的 mixin 导入后即可使用：
 
 | 方法 | 已实现的代码 | 你需要修改的部分 |
 |---|---|---|
+| `enable_prespec(...)` | 协调器创建、engine 引用、MTP 总开关和后台开关初始化 | 工厂显式传入启动参数，日志 wrapper 通过 `producer` 传入 |
 | `try_start_prespec(...)` | 中点/队列检查、独立输入快照、截止时间、`maybe_start` | 调用处用 `audio_accum + buffer` 形成快照，按 L486–518 取得下次前缀和草稿，见 4.5 |
 | `_build_stream_request(request, budget)` | 请求级采样参数副本、完整旧草稿、独立 request ID；提交前再次检查预算 | 提供下面的 `_pack_stream_request` |
 | `_run_prespec(request, budget)` | `generate`、累计输出收集、截止时间、异常/取消时 abort 与关闭迭代器 | 初始化时传入已有 engine；若本地 fork 改了输出接口，按 4.6 核对 |
@@ -334,6 +301,8 @@ request_kwargs["sampling_params"].extra_args = formal_external_draft_extra_args(
     rollback_full_tokens=rollback_full_token_ids,
     kmax=self.kmax,
     rejoin_policy=self.prespec_rejoin_policy,
+    rollback_first_verify=self.rollback_first_verify,
+    mtp_enabled=self.mtp_enabled,
 )
 stream = engine.generate(**request_kwargs, request_id=formal_request_id)
 # yield ChunkInferenceEvent 后，stream 交回原有 _yield_delta_text 迭代；
@@ -342,184 +311,9 @@ stream = engine.generate(**request_kwargs, request_id=formal_request_id)
 
 上述局部变量映射到原函数已有值，`deepcopy` 来自 `copy`。保留前缀/回滚草稿的拆分规则也沿用原代码：检查 `unfixed_chunk_num` 预热、`unfixed_token_num` 与 `kmax`，在中点按“下次正式请求”规则只读计算，不能为获得草稿先执行一次正式状态回滚。
 
-#### 4.3 请求快照与三个 helper 的完整函数体
+#### 4.3 请求快照与 helper 实现
 
-下面直接展示 `streaming_prespec_helpers.py` 的实现。使用第一节的 mixin 时不必再复制这些函数到模型类。
-
-```python
-import asyncio
-import logging
-from copy import deepcopy
-from dataclasses import dataclass
-from typing import Any
-import numpy as np
-
-logger = logging.getLogger(__name__)
-
-if __package__:
-    from .streaming_prespec import LaunchDecision, ShadowRequest
-else:
-    from streaming_prespec import LaunchDecision, ShadowRequest
-
-
-@dataclass(frozen=True, kw_only=True)
-class ModelShadowRequest(ShadowRequest):
-    # Private copies of small request settings, never the live ASR state/engine.
-    prefix_text: str
-    model_context: dict[str, Any]
-    sampling_params: Any
-
-
-def snapshot_stream_audio(audio_accum, buffer) -> tuple[bytes, int, int]:
-    """Snapshot all consumed full chunks plus the unconsumed audio tail.
-
-    Returns complete 16 kHz float32 LE PCM, its sample count, and the last
-    formal chunk cutoff. Both counts use segment-relative sample coordinates.
-    """
-    consumed = np.asarray(audio_accum, dtype=np.float32).reshape(-1)
-    pending = np.asarray(buffer, dtype=np.float32).reshape(-1)
-    complete = np.concatenate((consumed, pending)).astype("<f4", copy=False)
-    return complete.tobytes(), int(complete.size), int(consumed.size)
-
-
-class PreSpecModelHelpers:
-    """Mixin for Qwen3ASRModelAsync, or copy these three methods into that class.
-
-    Set ``prespec_engine`` to the existing shared engine before enabling.
-    Supply ``_pack_stream_request`` as documented; it must not mutate live state.
-    ``prespec`` is the existing PreSpecCoordinator, or None when disabled.
-    """
-
-    def try_start_prespec(
-        self, *, ws_id, seg_id, window_id, prefix_version, full_audio_pcm_f32le,
-        current_audio_end_samples, last_formal_audio_end_samples,
-        chunk_size_samples, prefix_text, stable_prefix_token_ids,
-        rollback_draft_token_ids,
-        model_context, sampling_params, committed, audio_queue_empty,
-        load=None, predicted_draft_ms=0.0,
-    ):
-        coordinator = getattr(self, "prespec", None)
-        if coordinator is None:
-            return LaunchDecision(False, "disabled")
-        if committed:
-            return LaunchDecision(False, "committed")
-        if not audio_queue_empty:
-            return LaunchDecision(False, "audio_backlog")
-        new_samples = current_audio_end_samples - last_formal_audio_end_samples
-        if chunk_size_samples <= 0 or new_samples < 0:
-            raise ValueError("invalid chunk size or audio cutoffs")
-        if new_samples < coordinator.policy.midpoint_samples:
-            return LaunchDecision(False, "before_midpoint")
-        if new_samples >= chunk_size_samples:
-            return LaunchDecision(False, "formal_chunk_due")
-        draft_len = len(rollback_draft_token_ids)
-        if draft_len > coordinator.policy.max_rollback_draft_tokens:
-            if coordinator.should_log_budget_skip(
-                    ws_id, seg_id, window_id, "rollback_draft_exceeds_kmax"):
-                logger.info(
-                    "PRESPEC_SKIP ws_id=%s seg=%s window=%s reason=rollback_draft_exceeds_kmax "
-                    "draft_tokens=%s kmax=%s",
-                    ws_id, seg_id, window_id, draft_len,
-                    coordinator.policy.max_rollback_draft_tokens,
-                )
-            return LaunchDecision(False, "rollback_draft_exceeds_kmax")
-        if draft_len + 2 > coordinator.policy.max_candidate_tokens:
-            if coordinator.should_log_budget_skip(
-                    ws_id, seg_id, window_id, "candidate_budget_insufficient"):
-                logger.info(
-                    "PRESPEC_SKIP ws_id=%s seg=%s window=%s reason=candidate_budget_insufficient "
-                    "draft_tokens=%s candidate_budget=%s required=%s",
-                    ws_id, seg_id, window_id, draft_len,
-                    coordinator.policy.max_candidate_tokens, draft_len + 2,
-                )
-            return LaunchDecision(False, "candidate_budget_insufficient")
-        # Take the time before copying so snapshot overhead consumes the budget.
-        deadline_ns = coordinator.clock() + int(
-            (chunk_size_samples - new_samples) / 16000 * 1e9)
-        audio_bytes = bytes(full_audio_pcm_f32le)
-        if not audio_bytes or len(audio_bytes) % 4:
-            raise ValueError("audio must be complete mono float32 LE PCM")
-        if len(audio_bytes) // 4 != current_audio_end_samples:
-            raise ValueError("audio bytes and sample cutoff disagree")
-        request = ModelShadowRequest(
-            session_id=ws_id, audio_epoch=seg_id, window_id=window_id,
-            base_prefix_version=prefix_version,
-            visible_audio_end_samples=current_audio_end_samples,
-            window_audio_samples=new_samples,
-            audio_pcm_f32le=audio_bytes,
-            stable_prefix_tokens=tuple(stable_prefix_token_ids),
-            rollback_tokens=tuple(rollback_draft_token_ids),
-            deadline_ns=deadline_ns,
-            prefix_text=prefix_text,
-            model_context=deepcopy(model_context),
-            sampling_params=deepcopy(sampling_params),
-        )
-        return coordinator.maybe_start(request, load, predicted_draft_ms)
-
-    def _build_stream_request(self, request, budget):
-        if len(request.rollback_tokens) > self.prespec.policy.max_rollback_draft_tokens:
-            raise ValueError("rollback draft exceeds engine kmax")
-        if len(request.rollback_tokens) + 2 > budget:
-            raise ValueError("candidate budget cannot cover first token, old draft and extension")
-        params = deepcopy(request.sampling_params)
-        params.max_tokens = budget
-        params.min_tokens = 0
-        params.n = 1
-        if getattr(params, "best_of", None) is not None:
-            params.best_of = 1
-        # Use the service's installed vLLM enum, without a vLLM import here.
-        params.output_kind = type(params.output_kind).CUMULATIVE
-        kwargs = self._pack_stream_request(
-            full_audio_pcm_f32le=request.audio_pcm_f32le,
-            prefix_text=request.prefix_text,
-            stable_prefix_token_ids=list(request.stable_prefix_tokens),
-            draft_token_ids=list(request.rollback_tokens),
-            model_context=deepcopy(request.model_context),
-            sampling_params=params,
-        )
-        if "prompt" not in kwargs or kwargs.get("sampling_params") is not params:
-            raise ValueError("packer must return prompt and supplied sampling_params")
-        kwargs = dict(kwargs)
-        kwargs["request_id"] = request.request_id
-        return kwargs
-
-    async def _run_prespec(self, request, budget):
-        kwargs = self._build_stream_request(request, budget)
-        # Let an already-ready formal/commit callback cancel before submission.
-        await asyncio.sleep(0)
-        remaining_seconds = (request.deadline_ns - self.prespec.clock()) / 1e9
-        if remaining_seconds <= 0:
-            raise TimeoutError("prespec deadline passed during request preparation")
-        stream = self.prespec_engine.generate(**kwargs)
-        finished = False
-        candidate_token_ids = ()
-        try:
-            async with asyncio.timeout(remaining_seconds):
-                async for output in stream:
-                    if output.outputs:
-                        if len(output.outputs) != 1:
-                            raise ValueError("prespec requires one output sequence")
-                        completion = output.outputs[0]
-                        # Cumulative IDs replace the previous snapshot.
-                        candidate_token_ids = tuple(completion.token_ids)
-                        if completion.finish_reason == "abort":
-                            raise RuntimeError("prespec engine request aborted")
-                        # 已输出的 token 是 shadow 自己确认过的前缀。同步保存快照；
-                        # commit 即使紧接着取消任务，正式请求也可验证该前缀。
-                        self.prespec.publish_partial(request, candidate_token_ids)
-                    finished = output.finished
-            if not finished or not candidate_token_ids:
-                raise RuntimeError("prespec stream ended without a completed candidate")
-            if len(candidate_token_ids) > budget:
-                raise ValueError("engine output exceeds the candidate token budget")
-            return candidate_token_ids
-        finally:
-            try:
-                if not finished:
-                    await self.prespec_engine.abort(request.request_id)
-            finally:
-                await stream.aclose()
-```
+完整实现以 [streaming_prespec_helpers.py](streaming_prespec_helpers.py) 为准，直接使用第一节的 mixin。这里不再保留一份代码摘录，避免旧的 `_build_stream_request()` 覆盖 MTP 标记处理。若服务此前复制过三个方法，应整体同步当前文件中的方法，并按第一节接入 `enable_prespec()`。
 
 这份代码明确完成了此前需要自行补写的部分：
 

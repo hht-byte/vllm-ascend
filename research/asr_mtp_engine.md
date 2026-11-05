@@ -32,6 +32,8 @@ git apply /tmp/asr-mtp.patch
 
 ## 2. 引擎配置
 
+服务启动开关的完整接线见 [服务 MTP 开关](streaming_mtp_service.md)：`--mtp / --no-mtp` 控制是否加载 MTP 及正式请求，`--prespec-mtp / --no-prespec-mtp` 控制后台请求。默认总开关关闭；仅配置引擎字典并不能代替服务参数传递。以下是开启时的底层配置。
+
 在服务构造 `AsyncEngineArgs` 的 `base_config` 中合并以下配置。checkpoint 是已在服务器上的训练产物路径，不是 HF 仓库 URL；运行时不会下载权重，也不需要安装 `spec_asr`。
 
 ```python
@@ -78,22 +80,17 @@ request_kwargs["sampling_params"].extra_args = formal_external_draft_extra_args(
     rejoin_policy=self.prespec_rejoin_policy,
     rollback_first_verify=True,
     prespec_first_mismatch_ngram=self.prespec_first_mismatch_ngram,
-    mtp_enabled=True,
+    mtp_enabled=self.mtp_enabled,
 )
 ```
 
-`mtp_enabled=True` 注入 `ascend_mtp=True`；`False` 注入显式 opt-out；默认 `None` 不注入，由 first-verify 标记决定。此参数仅在正式 helper 中传值，**不要在 `_pack_stream_request()` 全局注入，也不要把正式 first-verify helper 用于 shadow**。A/B 可沿已有配置链保存 `self.mtp_enabled`，两处都传 `mtp_enabled=self.mtp_enabled`；OFF/ON 均保留回滚首轮验证和相同初始草稿。MTP ON 需要 `rollback_first_verify=True`，防止误把旧的 `C[1:]` 合同当成完整草稿。MTP OFF 仍使用原重接策略，因此这是两套完整后续策略的对照，不是只衡量辅助头 kernel。
+`mtp_enabled=True` 注入 `ascend_mtp=True`；`False` 注入显式 opt-out；helper 自身的兼容默认值 `None` 不注入，由 first-verify 标记决定。服务必须按 [启动接线](streaming_mtp_service.md) 显式保存并传入 `self.mtp_enabled`。此参数仅在正式 helper 中传值，**不要在 `_pack_stream_request()` 全局注入，也不要把正式 first-verify helper 用于 shadow**。OFF/ON 均保留回滚首轮验证和相同初始草稿。MTP ON 需要 `rollback_first_verify=True`，防止误把旧的 `C[1:]` 合同当成完整草稿。MTP OFF 仍使用原重接策略，因此这是两套完整后续策略的对照，不是只衡量辅助头 kernel。
 
 ### 后台 Prespec 验证回滚后接 MTP
 
 同时升级引擎补丁和服务的 `qwen_asr/inference/streaming_prespec_helpers.py`。若服务复制了 helper 方法，应同步复制更新后的 `_build_stream_request()`，不能只增加 `ascend_mtp=True`：旧版 worker 会直接跳过 legacy 草稿。新版 worker 会先返回一次旧回滚草稿，再在下一次验证返回后转入 MTP。
 
-```python
-self.prespec_mtp_enabled = True   # 默认：后台请求回滚验证后接 MTP
-self.prespec_mtp_enabled = False  # 仅关闭后台 MTP，保留旧回滚验证 + 自回归
-```
-
-该开关独立于正式请求的 `mtp_enabled`。引擎仍须配置 `additional_config["asr_mtp"]`；未加载 MTP 时保留原路径。
+通过 [完整服务接线](streaming_mtp_service.md) 将 `args.prespec_mtp_enabled` 传到 `AsyncLLM()`，再传到 `enable_prespec()`，初始化 `self.prespec_mtp_enabled = mtp_enabled and prespec_mtp_enabled`。不能只依赖请求 builder 的 `getattr(..., True)`，也不能只修改实例中的一处赋值。`--mtp --no-prespec-mtp` 仅关闭后台 MTP，保留正式 MTP；`--no-mtp` 会同时关闭两者并移除引擎 MTP 配置。
 
 - 有旧回滚：目标先采样首 token，worker 提交原来的 `C[1:]` **一次**；接受 0 个、部分或全部之后，均从已确认前缀和修正 / bonus drive 进入 MTP。不会 first-verify `C[1:]`，不会重复拼接回滚草稿。
 - 没有旧回滚：首次目标采样后直接用 MTP，直到候选结束、预算用尽或被取消。
@@ -120,6 +117,7 @@ python -m unittest discover -s research -p 'test_patch_external_draft_mtp.py' -v
 python -m unittest discover -s research -p 'test_build_asr_mtp_patch.py' -v
 python -m unittest discover -s research -p 'test_streaming_prespec_formal_args.py' -v
 python -m unittest discover -s research -p 'test_prespec_mtp.py' -v
+python -m unittest discover -s research -p 'test_streaming_mtp_config.py' -v
 ```
 
 前一组需要 Torch、transformers 4.57.6 及 `SPEC_ASR_TEST_ROOT` 对应的参考源码（当前测试默认使用 `.tmp/asr-mtp-reference`）；这些只用于 CPU 核对，不是线上模块的运行依赖。完整 910B checkpoint 的 BF16/NPU 数值和性能尚未实测。部署后先核对 `ASR_MTP_CONFIG`、正式 `INITIAL_DRAFT` 和后续 `ASR_VERIFY_STEP`，以相同音频 / 并发对照完整目标输出、decode 轮次、commit P50/P95/P99、队列等待和显存；辅助输出匹配或减少 head 计算位置不等于已经提高在线性能。单独 NPU 辅助 kernel 的数值差异可能改变接受率，所有输出仍由目标 verifier 决定。

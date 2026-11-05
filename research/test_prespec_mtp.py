@@ -1,13 +1,18 @@
 """Prespec request metadata and cancellation with optional worker MTP."""
+import argparse
 import asyncio
 from copy import deepcopy
 from enum import Enum
 from types import SimpleNamespace
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 
 from streaming_prespec_helpers import PreSpecModelHelpers
 from streaming_prespec_helpers import ModelShadowRequest
 from streaming_prespec import AdmissionPolicy, PreSpecCoordinator
+from streaming_mtp_config import EXTERNAL_DRAFT_CLASS, add_mtp_args, mtp_engine_config
+from streaming_prespec_formal_args import formal_external_draft_extra_args
 
 
 class OutputKind(Enum):
@@ -67,6 +72,123 @@ class ShadowMTPArgsTests(unittest.TestCase):
         model.prespec_mtp_enabled = 'false'
         with self.assertRaises(TypeError):
             model._build_stream_request(self.request(), 5)
+
+    def test_master_off_also_overrides_stale_shadow_setting_at_request_build(self):
+        model = Model()
+        model.mtp_enabled = False
+        model.prespec_mtp_enabled = True
+        params = model._build_stream_request(self.request(), 5)['sampling_params']
+        self.assertIs(params.extra_args['ascend_mtp'], False)
+
+
+class ShadowMTPStartupTests(unittest.TestCase):
+    def test_cli_to_coordinator_and_request_preserves_explicit_false(self):
+        for argv, expected in (([], True), (['--prespec-mtp'], True),
+                               (['--no-prespec-mtp'], False)):
+            with self.subTest(argv=argv):
+                parser = argparse.ArgumentParser()
+                add_mtp_args(parser)
+                args = parser.parse_args(argv)
+                model, engine = Model(), object()
+                with self.assertLogs('streaming_prespec_helpers', level='INFO') as logs:
+                    model.enable_prespec(
+                        enabled=True, kmax=5, engine=engine,
+                        mtp_enabled=True,
+                        prespec_mtp_enabled=args.prespec_mtp_enabled,
+                    )
+                self.assertIs(model.prespec_mtp_enabled, expected)
+                self.assertIs(model.prespec_engine, engine)
+                self.assertEqual(model.prespec.policy.midpoint_samples, 25_600)
+                self.assertEqual(model.prespec.policy.max_candidate_tokens, 5)
+                params = model._build_stream_request(
+                    ShadowMTPArgsTests().request(), 5)['sampling_params']
+                self.assertIs(params.extra_args['ascend_mtp'], expected)
+                self.assertTrue(model.mtp_enabled)
+                self.assertIn(f'prespec_mtp_enabled={expected}', logs.output[0])
+
+    def test_cli_boolean_flag_rejects_string_value(self):
+        parser = argparse.ArgumentParser()
+        add_mtp_args(parser)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(['--prespec-mtp', 'false'])
+
+    def test_disabled_prespec_still_initializes_setting(self):
+        model = Model()
+        model.enable_prespec(enabled=False, kmax=0, prespec_mtp_enabled=False)
+        self.assertIsNone(model.prespec)
+        self.assertFalse(model.mtp_enabled)
+        self.assertIs(model.prespec_mtp_enabled, False)
+        for value in ('false', 0, 1, None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(TypeError, 'prespec_mtp_enabled'):
+                    model.enable_prespec(enabled=False, kmax=0, prespec_mtp_enabled=value)
+
+    def test_master_off_overrides_shadow_on_and_is_saved_with_prespec_off(self):
+        model = Model()
+        model.enable_prespec(enabled=True, kmax=5, engine=object(),
+                             mtp_enabled=False, prespec_mtp_enabled=True)
+        params = model._build_stream_request(
+            ShadowMTPArgsTests().request(), 5)['sampling_params']
+        self.assertFalse(model.mtp_enabled)
+        self.assertFalse(model.prespec_mtp_enabled)
+        self.assertIs(params.extra_args['ascend_mtp'], False)
+        model.enable_prespec(enabled=False, kmax=0, mtp_enabled=True,
+                             prespec_mtp_enabled=False)
+        self.assertTrue(model.mtp_enabled)
+        self.assertFalse(model.prespec_mtp_enabled)
+        for value in ('false', 0, 1, None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(TypeError, 'mtp_enabled'):
+                    model.enable_prespec(enabled=False, kmax=0, mtp_enabled=value)
+
+    def test_startup_flags_control_engine_formal_chunk_finish_and_shadow(self):
+        for argv, master, shadow in (
+            ([], False, False), (['--no-mtp', '--prespec-mtp'], False, False),
+            (['--mtp', '--no-prespec-mtp'], True, False),
+            (['--mtp', '--prespec-mtp'], True, True),
+        ):
+            with self.subTest(argv=argv):
+                parser = argparse.ArgumentParser()
+                add_mtp_args(parser)
+                args = parser.parse_args(argv + ['--mtp-checkpoint', '/heads.pt'])
+                engine_kwargs = mtp_engine_config(
+                    {'speculative_config': {'method': 'custom_class',
+                                            'model': EXTERNAL_DRAFT_CLASS}},
+                    mtp_enabled=args.mtp_enabled, mtp_checkpoint=args.mtp_checkpoint)
+                self.assertEqual('asr_mtp' in engine_kwargs.get('additional_config', {}), master)
+                model = Model()
+                model.enable_prespec(enabled=True, kmax=5, engine=object(),
+                                     mtp_enabled=args.mtp_enabled,
+                                     prespec_mtp_enabled=args.prespec_mtp_enabled)
+                for boundary, candidate in (('chunk', (10, 20, 21)), ('finish', None)):
+                    params = formal_external_draft_extra_args(
+                        {'ascend_mtp': not master}, candidate_tokens=candidate,
+                        rollback_tokens=(20, 21), rollback_full_tokens=(10, 20, 21),
+                        kmax=5, rollback_first_verify=True, mtp_enabled=model.mtp_enabled)
+                    self.assertIs(params['ascend_mtp'], master, boundary)
+                params = model._build_stream_request(
+                    ShadowMTPArgsTests().request(), 5)['sampling_params']
+                self.assertIs(params.extra_args['ascend_mtp'], shadow)
+
+    def test_startup_keeps_logged_producer_and_existing_policy(self):
+        model, engine = Model(), object()
+        async def logged(request, budget):
+            return ()
+        model.enable_prespec(
+            enabled=True, kmax=5, engine=engine, prespec_mtp_enabled=False,
+            producer=logged, candidate_tokens=4, launch_sec=1.0,
+            admission_mode='gated', max_active_shadows=2,
+            shadow_only=False, rejoin_policy='aligned',
+        )
+        self.assertIs(model.prespec.producer, logged)
+        self.assertFalse(model.prespec.shadow_only)
+        self.assertEqual(model.prespec.policy.midpoint_samples, 16_000)
+        self.assertEqual(model.prespec.policy.max_candidate_tokens, 4)
+        self.assertEqual(model.prespec.policy.max_active_shadows, 2)
+        self.assertEqual(model.prespec.policy.admission_mode, 'gated')
+        self.assertEqual(model.prespec_rejoin_policy, 'aligned')
+        model.enable_prespec(enabled=True, kmax=5, engine=engine)
+        self.assertEqual(model.prespec.producer, model._run_prespec)
 
 
 class WaitingEngine:

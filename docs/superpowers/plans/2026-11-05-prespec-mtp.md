@@ -25,3 +25,12 @@
 - Broader suite: 211 tests at the full-run checkpoint had the same pre-existing 1 assertion failure + 19 errors, no new failing IDs. The subsequently added chunked-prefill regression passes in the final 46-test scoped run.
 - Independent review found no concrete issue. It also verified chunked prefill -> legacy -> zero accepted -> MTP -> finish -> reused ID. No additional target forward or target/scheduler source changes were introduced.
 - Not deployed, committed or pushed in this task. Full 910B checkpoint/kernel execution, deadline readiness and competition with formal P95 remain unmeasured. Earlier unrelated local reference edits are preserved.
+
+## Service switch follow-up (2026-11-05)
+
+- Found the reported gap: the shadow builder read prespec_mtp_enabled with a default, but there was no executable startup initializer or CLI registration in this repository. The real server factory / parser source is not present here.
+- Added streaming_mtp_config.py: --mtp / --no-mtp master defaults OFF; --prespec-mtp / --no-prespec-mtp controls shadow under that master; checkpoint override is service-only. OFF removes asr_mtp before engine creation while preserving other settings. ON validates the existing external-draft backend and checkpoint, and sets compatible scheduling/cache defaults without overriding explicit incompatible values.
+- Moved enable_prespec initialization into the copyable mixin. It saves formal and effective shadow settings even with prespec disabled, preserves an explicitly supplied logged producer, and logs the settings. The request builder also enforces master OFF over a stale shadow ON setting.
+- Added complete server integration instructions (parser -> explicit AsyncLLM arguments -> engine config before construction -> model initialization -> both formal helper call sites). Removed the stale duplicate helper code block from the general guide to avoid copy/paste drift.
+- RED reproduced missing startup methods and a stale-shadow override; final scoped service / engine / launch suite passes 63 tests. compileall and diff checks pass. Independent review and a separate check of the final defensive master override found no concrete issue.
+- Server source is not present; no server changes, deployment or service restart performed. User subsequently requested a scoped commit/push of the service-switch changes; earlier independent reference-script edits remain local.

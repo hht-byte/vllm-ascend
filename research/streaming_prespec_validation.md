@@ -51,6 +51,8 @@ parser.add_argument(
     "--prespec-launch-sec", type=float, default=1.6,
     help="audio seconds within each formal chunk before launching a shadow",
 )
+from qwen_asr.inference.streaming_mtp_config import add_mtp_args
+add_mtp_args(parser)  # --mtp/--no-mtp；--prespec-mtp/--no-prespec-mtp；checkpoint
 ```
 
 这里候选预算的 `default=None` 是“未显式指定”的标记：parser 阶段尚未取得引擎 `kmax`。启动时将 `None` 传给 `AsyncLLM()`、`enable_prespec()`；启用预投机后解析为 `kmax`。完整候选含首 token，必须满足 `candidate_tokens <= kmax`；原先 `kmax=15, candidate_budget=16` 的配置应改为预算 15 或提高引擎 `kmax`。启动时间默认 1.6 秒；在 16 kHz、2 秒 chunk 下为 25,600 样本，距正式边界仅 400 ms。实际触发是首个已处理音频达到阈值、队列为空且准入通过的 append，不保证墙钟恰好 1.600 秒。
@@ -66,6 +68,9 @@ model = Qwen3ASRModelAsync.AsyncLLM(
     prespec_max_active_shadows=args.prespec_max_active_shadows,
     prespec_rejoin_policy=args.prespec_rejoin_policy,
     prespec_launch_sec=args.prespec_launch_sec,
+    mtp_enabled=args.mtp_enabled,
+    prespec_mtp_enabled=args.prespec_mtp_enabled,
+    mtp_checkpoint=args.mtp_checkpoint,
 )
 ```
 
@@ -80,9 +85,12 @@ prespec_candidate_tokens: int | None = None,
 prespec_max_active_shadows: int = 0,
 prespec_rejoin_policy: str = "ngram_1",
 prespec_launch_sec: float = 1.6,
+mtp_enabled: bool = False,
+prespec_mtp_enabled: bool = True,
+mtp_checkpoint: str | None = None,
 ```
 
-这里假定现有入口用 `argparse` 且解析结果名为 `args`；若名字不同，只替换该局部变量名。服务启动脚本不在本仓库，无法填写其余既有 CLI 选项。
+这里假定现有入口用 `argparse` 且解析结果名为 `args`；若名字不同，只替换该局部变量名。服务启动脚本不在本仓库，无法填写其余既有 CLI 选项。MTP 的总开关必须在创建引擎前通过 `mtp_engine_config()` 处理，再在正式 chunk/finish 两处传 `mtp_enabled=self.mtp_enabled`，完整代码见 [服务 MTP 开关](streaming_mtp_service.md)。
 
 先在 910B 服务项目根目录核对当前实际签名：
 
@@ -90,36 +98,11 @@ prespec_launch_sec: float = 1.6,
 rg -n -A 35 'def enable_prespec' qwen_asr/inference/qwen3_asr_async.py
 ```
 
-这里的 `enable_prespec()` **不是上游已有 API**，而是 [主接入文档步骤 2](streaming_prespec.md) 要在 `Qwen3ASRModelAsync` 中新增的方法。从 `qwen_asr.inference.streaming_prespec` 导入 `launch_samples_for_window`，同步 `admission_mode`、`shadow_only`、`max_active_shadows` 和 `launch_sec` 形参，并把旧的 `max_active_shadows=1` 改为传入参数，否则更换协调器后仍只允许一个候选运行。为记录 shadow 请求生命周期，再把其中的 `producer=self._run_prespec` 替换为 `producer=self._logged_prespec_producer`。完整的关键行是：
+这里的 `enable_prespec()` **不是上游已有 API**。更新后的 `PreSpecModelHelpers` 已提供该方法，包含两个 MTP 开关的校验与实例赋值。服务类若保留旧同名方法会覆盖 mixin，应改成以下转调；保留 `AsyncLLM()` 原有配置传递，不再另写一份初始化函数：
 
 ```python
-def enable_prespec(self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
-                   launch_sec=1.6, candidate_tokens=None, on_probe=None,
-                   admission_mode="force", shadow_only=True,
-                   max_active_shadows=0, rejoin_policy="ngram_1"):
-    # 保留主接入文档中已有的 enabled/kmax/engine 校验。
-    if candidate_tokens is None:
-        candidate_tokens = kmax
-    if candidate_tokens < 3:
-        raise ValueError("candidate budget needs first token, draft and continuation")
-    if candidate_tokens > kmax:
-        raise ValueError("candidate budget must fit engine kmax")
-    if rejoin_policy not in ("aligned", "ngram_1", "ngram_2", "ngram_3"):
-        raise ValueError("invalid prespec rejoin policy")
-    self.prespec_rejoin_policy = rejoin_policy
-    midpoint_samples = launch_samples_for_window(launch_sec, chunk_size_sec)
-    self.prespec = PreSpecCoordinator(
-        producer=self._logged_prespec_producer,
-        policy=AdmissionPolicy(
-            admission_mode=admission_mode,
-            midpoint_samples=midpoint_samples,
-            max_rollback_draft_tokens=kmax,
-            max_candidate_tokens=candidate_tokens,
-            max_active_shadows=max_active_shadows,
-        ),
-        shadow_only=shadow_only,
-        on_probe=on_probe,
-    )
+def enable_prespec(self, **options):
+    return PreSpecModelHelpers.enable_prespec(self, **options)
 ```
 
 先在 `qwen3_asr_async.py` 顶部加入 `import asyncio`、`import logging`、`import time` 和模块级 `logger = logging.getLogger(__name__)`（已有同名导入或 logger 时不要重复）。然后在 `AsyncLLM()` 创建 `model` 后、返回它之前，替换原来的 `model.enable_prespec(...)` 调用。`kmax`、`engine` 和 `chunk_size_sec` 继续使用本函数现有的实际变量；下面代码中的这三个名字要按你的函数局部变量映射：
@@ -149,6 +132,9 @@ model.enable_prespec(
     rejoin_policy=prespec_rejoin_policy,
     shadow_only=(prespec_mode != "consume"),
     on_probe=log_prespec_probe if prespec_mode != "off" else None,
+    producer=model._logged_prespec_producer,
+    mtp_enabled=mtp_enabled,
+    prespec_mtp_enabled=prespec_mtp_enabled,
 )
 logger.info(
     "PRESPEC_CONFIG mode=%s admission=%s kmax=%s candidate_budget=%s "
@@ -161,6 +147,8 @@ logger.info(
 ```
 
 `on_probe` 是同步回调；这里只做一条格式化日志，不做阻塞采样或文件读写。回调异常被协调器吞掉并计入 `probe_error_count`，因此每轮结束要检查该计数是否为 0。
+
+即使 `prespec_mode="off"`，仍须调用上面的初始化方法，以便正式请求读取 `self.mtp_enabled`。总开关默认 OFF；更新后的 helper 额外记录 `PRESPEC_MTP_CONFIG`，ON 时还须看到 worker 的 `ASR_MTP_CONFIG`。
 
 ### 1.2 `qwen3_asr_async.py`：记录 shadow 请求生命周期
 

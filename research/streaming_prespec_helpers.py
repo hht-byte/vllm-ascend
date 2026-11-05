@@ -17,9 +17,15 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 if __package__:
-    from .streaming_prespec import LaunchDecision, ShadowRequest
+    from .streaming_prespec import (
+        AdmissionPolicy, LaunchDecision, PreSpecCoordinator, ShadowRequest,
+        launch_samples_for_window,
+    )
 else:
-    from streaming_prespec import LaunchDecision, ShadowRequest
+    from streaming_prespec import (
+        AdmissionPolicy, LaunchDecision, PreSpecCoordinator, ShadowRequest,
+        launch_samples_for_window,
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -43,14 +49,62 @@ def snapshot_stream_audio(audio_accum, buffer) -> tuple[bytes, int, int]:
 
 
 class PreSpecModelHelpers:
-    """Mixin for Qwen3ASRModelAsync, or copy these three methods into that class.
+    """Mixin for Qwen3ASRModelAsync, including startup configuration.
 
-    Set ``prespec_engine`` to the existing shared engine before enabling.
+    Pass the existing shared engine to ``enable_prespec`` before accepting connections.
     Supply ``_pack_stream_request`` as documented; it must not mutate live state.
     ``prespec`` is the existing PreSpecCoordinator, or None when disabled.
-    ``prespec_mtp_enabled`` defaults to True; the engine must separately load
-    the MTP extension. False keeps shadow on its existing one-shot rollback path.
+    The service MTP master defaults off. ``prespec_mtp_enabled`` takes effect
+    only with that master on and the engine MTP extension loaded.
     """
+
+    def enable_prespec(
+        self, *, enabled, kmax, engine=None, chunk_size_sec=2.0,
+        launch_sec=1.6, candidate_tokens=None, on_probe=None,
+        admission_mode="force", shadow_only=True, max_active_shadows=0,
+        rejoin_policy="ngram_1", mtp_enabled=False, prespec_mtp_enabled=True,
+        producer=None,
+    ):
+        """Configure once before accepting connections, using the shared engine.
+
+        AsyncLLM must explicitly consume prespec_mtp_enabled, then pass it here.
+        A service with a logged producer can pass that bound method as producer.
+        """
+        if type(mtp_enabled) is not bool:
+            raise TypeError("mtp_enabled must be a bool")
+        if type(prespec_mtp_enabled) is not bool:
+            raise TypeError("prespec_mtp_enabled must be a bool")
+        if rejoin_policy not in ("aligned", "ngram_1", "ngram_2", "ngram_3"):
+            raise ValueError("invalid prespec rejoin policy")
+        self.mtp_enabled = mtp_enabled
+        self.prespec_mtp_enabled = mtp_enabled and prespec_mtp_enabled
+        self.prespec_rejoin_policy = rejoin_policy
+        self.prespec = None
+        if enabled:
+            if kmax <= 0 or chunk_size_sec <= 0:
+                raise ValueError("prespec requires positive kmax and chunk size")
+            if candidate_tokens is None:
+                candidate_tokens = kmax
+            if candidate_tokens < 3 or candidate_tokens > kmax:
+                raise ValueError("candidate budget must be between 3 and engine kmax")
+            if engine is None or not callable(getattr(self, "_pack_stream_request", None)):
+                raise ValueError("prespec requires engine and the existing request packer")
+            self.prespec_engine = engine
+            self.prespec = PreSpecCoordinator(
+                producer=self._run_prespec if producer is None else producer,
+                policy=AdmissionPolicy(
+                    admission_mode=admission_mode,
+                    midpoint_samples=launch_samples_for_window(launch_sec, chunk_size_sec),
+                    max_rollback_draft_tokens=kmax,
+                    max_candidate_tokens=candidate_tokens,
+                    max_active_shadows=max_active_shadows,
+                ),
+                shadow_only=shadow_only, on_probe=on_probe,
+            )
+        logger.info(
+            "PRESPEC_MTP_CONFIG prespec_enabled=%s mtp_enabled=%s prespec_mtp_enabled=%s",
+            enabled, self.mtp_enabled, self.prespec_mtp_enabled,
+        )
 
     def try_start_prespec(
         self, *, ws_id, seg_id, window_id, prefix_version, full_audio_pcm_f32le,
@@ -120,8 +174,14 @@ class PreSpecModelHelpers:
 
     def _build_stream_request(self, request, budget):
         shadow_mtp = getattr(self, "prespec_mtp_enabled", True)
+        # Preserve older copied helpers that only had the shadow flag, while
+        # ensuring an explicitly disabled service master always wins.
+        master_mtp = getattr(self, "mtp_enabled", True)
+        if type(master_mtp) is not bool:
+            raise TypeError("mtp_enabled must be a bool")
         if type(shadow_mtp) is not bool:
             raise TypeError("prespec_mtp_enabled must be a bool")
+        shadow_mtp = master_mtp and shadow_mtp
         if len(request.rollback_tokens) > self.prespec.policy.max_rollback_draft_tokens:
             raise ValueError("rollback draft exceeds engine kmax")
         if len(request.rollback_tokens) + 2 > budget:
