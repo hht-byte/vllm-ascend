@@ -74,6 +74,12 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
+# Install after the runner definition to avoid patch-package circular imports.
+if vllm_version_is("0.23.0"):
+    from vllm_ascend.patch.worker.patch_full_graph_spec_buckets import install_full_graph_spec_buckets
+
+    install_full_graph_spec_buckets(NPUModelRunner)
+
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402

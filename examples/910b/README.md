@@ -125,6 +125,57 @@ A baseline with fallback is marked explicitly; it is not a pure FULL replay comp
 The prefill/decode labels denote generation workloads, not isolated attention kernel
 timings. Repeat runs in fresh output directories to assess timing variability.
 
+### Native FULL with mixed prefill and variable-length custom drafts
+
+The production path for a prefill request and decode requests in the same batch
+is native `FULL`, with chunked prefill enabled and the existing scheduler. Keep
+the actual `custom_class` proposer and its draft budget, e.g. 15. Different
+requests can have different scheduled query lengths: `[59, 1, 4]` means one
+59-token prefill plus a one-token decode and a drive-plus-three-draft verification.
+Their total is 64; native FULL selects the 64-token graph. Per-request query
+boundaries, context lengths and block tables still come from normal attention
+metadata and FIA task updates. Do not rewrite each request to a fixed `K+1`.
+
+The small startup patch `patch_full_graph_spec_buckets.py` preserves configured
+total-token buckets for `custom_class` when the final mixed FULL path is supported
+by every attention backend (`ALWAYS`). It is installed after `NPUModelRunner` is
+imported, is idempotent and restricted to v0.23. It temporarily resolves graphs
+with query length 1, then restores the real runner length even on error. Runtime
+draft counts remain unchanged. The scheduler, model forward, attention kernels,
+upstream vLLM files and per-iteration execution are not patched. Lower-capability
+backends and all other modes/methods keep their original setup and downgrade rules.
+This optimization is restricted to TP=PP=DP=PCP=DCP=1. Distributed configurations
+retain their original bucket rounding, including sequence-parallel alignment.
+Runners overriding native dispatch (such as the 310P and token PA runners) also
+retain their own setup policies; this patch does not change those graph paths.
+
+For the reported 31 capture sizes with draft budget 15, this avoids the previous
+rounding to 17 multiples of 16: a six-token batch can use bucket 6 instead of 16.
+More configured buckets also mean more startup captures and graph memory. Size
+the largest bucket to observed mixed total tokens; batches beyond it still use
+the original fallback. Mixing occurs when both types of requests are available;
+this patch adds no batching wait and does not force the scheduler to delay work.
+
+This path does **not** require `token_graph_910b.enabled=true`. That experimental
+PA path remains an independent alternative. Decoder FULL does not capture an
+ASR audio encoder or a separate custom MTP proposer automatically. Their eager
+work can still contribute to application prefill/decode latency.
+
+CPU source contracts can be run without importing NPU kernels:
+
+```bash
+python tests/ut/_310p/test_native_full_spec_buckets.py --vllm-root /path/to/vllm -v
+```
+
+The contracts execute the real native runner dispatch method and core dispatcher
+with Ascend's descriptor patch. They cover fresh/chunked prefill mixed with
+different verification lengths, small buckets, unchanged request query lengths,
+default paths, backend downgrade protection and setup failure. They do not execute
+device graph capture or validate NPU numerical equivalence. On the service,
+validate real mixed iterations, identical final tokens, graph replay, memory and
+commit latency. An aggregate `CUDAGraph Stats` row alone has no request-phase
+labels and cannot prove that an iteration contained both prefill and decode.
+
 ## Isolating eager Setup failures
 
 `PagedAttentionOperation setup failed` before capture is not evidence of a graph
