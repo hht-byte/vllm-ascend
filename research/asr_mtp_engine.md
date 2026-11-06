@@ -28,7 +28,7 @@ git apply /tmp/asr-mtp.patch
 | `patch_external_draft_mtp.py` | `vllm_ascend/patch/worker/patch_external_draft_mtp.py` |
 | 注册 import | `vllm_ascend/worker/worker.py`，紧接 `NPUModelRunner` 的导入；受 0.23 版本条件保护 |
 
-三个 monkey patch 分别负责 drafter 选择、带 hidden states 的提案分派、finished/abort 状态清理。重复 import 幂等。未配置 MTP 时委托原方法。
+四个 monkey patch 分别负责 drafter 选择、带 hidden states 的提案分派、finished/abort 状态清理，以及 FULL 图初始化时保留原始 token buckets。重复 import 幂等。未配置 MTP 时委托原方法。
 
 ### 已安装版本出现循环导入
 
@@ -73,6 +73,20 @@ base_config["additional_config"] = {
 base_config["async_scheduling"] = False
 base_config["enable_prefix_caching"] = False
 ```
+
+### FULL 图与 token bucket 归并
+
+启用上述 MTP 扩展并使用 `compilation_config.cudagraph_mode="FULL"` 时，图初始化按用户配置的总 token buckets 建图。实现参考 `310P-graph` 的 [46fa2fb8f](https://github.com/hht-byte/vllm-ascend/commit/46fa2fb8f558845cb07748a7e440e148fcd691b1)：仅在 `_check_and_update_cudagraph_mode()` 内临时使用 query length 1，初始化结束或异常时恢复真实值。`num_speculative_tokens=15`、运行时 query length 16、实际逐请求草稿长度均保留；不修改 scheduler、采样或目标 attention 实现。
+
+原生 Ascend FULL dispatcher 使用 mixed descriptor，并动态更新各请求的 attention metadata；不同长度的草稿仍可同批验证。此前上游按 `K+1=16` 向上取整并去重，会把用户这组 31 个 capture sizes 归并为 17 个，导致 `6→16`、`2→16` 等 padding。保留小 bucket 后，这组配置的 6-token batch 可匹配 bucket 6，2-token batch 可匹配 bucket 2。FULL 的对齐规则与每条草稿实际长度是两个不同的概念。
+
+此初始化 hook 仅对本扩展的 MTP drafter、精确的 `FULL` 模式及全部 attention 后端均报告 `ALWAYS` 图支持时生效。后端能力不足时，requested FULL 可能降级为 decode-only；这类情况继续使用真实的 `K+1` 进行原始安全检查和 bucket 归并。关闭 MTP 或使用 `FULL_DECODE_ONLY`、`FULL_AND_PIECEWISE`、`PIECEWISE`、`NONE` 时也沿用原始配置解析。导出器会检查图初始化 API，防止把 hook 安装到不支持的 runner 上。整个修改不在每次 decode 中执行，也不增加设备同步。
+
+用户提供的 12:37:25 聚合表中，30 次目标执行合计 1152 个有效 token、1440 个 padded token，padding 占执行 token 的 20%；所列各行均为 FULL。这支持减少 padding 的方向，不能换算为同比例时延收益，也不能用该聚合表逐条判定请求的 prefill 阶段。更多 bucket 会增加启动捕获数量和图内存，部署后须对照实际 bucket、峰值内存及完整服务时延。
+
+这只优化**目标 decoder 图的粒度**。当前辅助 MTP heads 仍在目标采样后以 eager 执行，音频 encoder 也不会因为 decoder 设置 FULL 自动入图。MTP/encoder 图捕获仍需各自实现和设备验证。
+
+### 支持范围与缓存
 
 初版支持 TP=PP=PCP=DCP=1、无量化 / LoRA 的 Qwen3-ASR、同步调度和贪心 `n=1`。不支持的引擎配置在权重加载时拒绝，不能自动退成另一种投机算法。禁用 prefix caching 是因为仅有命中的目标 KV 无法恢复 MTP 所需的完整目标 hidden 历史；不重新 prefill 来弥补。chunked prefill 可以保留每次已计算的 hidden 行。其他模型或 RoPE scaling 不在此版本范围。
 

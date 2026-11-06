@@ -548,7 +548,7 @@
 +    return worker
 --- /dev/null
 +++ b/vllm_ascend/patch/worker/patch_external_draft_mtp.py
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,128 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Optional worker hooks; import from worker.py AFTER its NPUModelRunner import.
 +
@@ -578,7 +578,7 @@
 +        self.online = load_worker(self.runner, target, self.settings)
 +
 +    def dummy_run(self, *args, is_profile=False, **kwargs):
-+        # Target graphs stay unchanged; auxiliary heads run outside capture.
++        # Target capture covers the decoder; auxiliary heads remain eager.
 +        if is_profile and self.online is not None:
 +            self.online.profile()
 +
@@ -608,12 +608,16 @@
 +    original_get = cls._get_drafter
 +    original_propose = cls.propose_draft_token_ids
 +    original_update = cls._update_states
++    original_graph_setup = getattr(cls, '_check_and_update_cudagraph_mode', None)
 +    expected = ('self', 'valid_sampled_token_ids', 'sampling_metadata', 'scheduler_output',
 +                'spec_decode_metadata', 'spec_decode_common_attn_metadata', 'positions',
 +                'num_scheduled_tokens', 'hidden_states', 'aux_hidden_states',
 +                'sample_hidden_states', 'target_model_batch_desc')
 +    if tuple(inspect.signature(original_propose).parameters) != expected:
 +        raise RuntimeError('ASR MTP patch requires the supported v0.23 proposal dispatch API')
++    if (original_graph_setup is None or tuple(inspect.signature(original_graph_setup).parameters) !=
++            ('self', 'attention_backends', 'kv_cache_groups')):
++        raise RuntimeError('ASR MTP patch requires the supported v0.23 graph setup API')
 +
 +    def get_drafter(self):
 +        additional = self.vllm_config.additional_config
@@ -644,9 +648,31 @@
 +            drafter.online.finish(scheduler_output.finished_req_ids)
 +        return original_update(self, scheduler_output)
 +
++    def graph_setup(self, attention_backends, kv_cache_groups):
++        if (not isinstance(self.drafter, AscendExternalDraftMTPProposer) or
++                self.compilation_config.cudagraph_mode.name != 'FULL'):
++            return original_graph_setup(self, attention_backends, kv_cache_groups)
++        # A requested FULL mode can resolve to uniform decode-only graphs.
++        # Preserve upstream capability checks and K+1 rounding on that path.
++        for backends, group in zip(attention_backends, kv_cache_groups):
++            if any(backend.get_builder_cls().get_cudagraph_support(
++                    self.vllm_config, group.kv_cache_spec).name != 'ALWAYS' for backend in backends):
++                return original_graph_setup(self, attention_backends, kv_cache_groups)
++        # As in 310P token graph commit 46fa2fb8f: FULL uses mixed total-token
++        # buckets, so setup must not round every size to K+1. This overrides
++        # only initialization; the actual draft budget and runtime query length
++        # are unchanged. Decode-only modes still need their uniform K+1 sizes.
++        previous = self.uniform_decode_query_len
++        self.uniform_decode_query_len = 1
++        try:
++            return original_graph_setup(self, attention_backends, kv_cache_groups)
++        finally:
++            self.uniform_decode_query_len = previous
++
 +    cls._get_drafter = get_drafter
 +    cls.propose_draft_token_ids = propose
 +    cls._update_states = update
++    cls._check_and_update_cudagraph_mode = graph_setup
 +    cls._asr_mtp_patch_installed = True
 +
 +

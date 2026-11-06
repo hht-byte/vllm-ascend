@@ -138,6 +138,24 @@ class PatchExportTests(unittest.TestCase):
             self.skipTest('local engine reference unavailable')
         check_runner(path.read_text(encoding='utf-8'))
 
+    def test_export_rejects_missing_or_changed_graph_setup_api(self):
+        from build_asr_mtp_patch import check_runner
+        fixture = ast.parse(Path(__file__).with_name('test_patch_external_draft_mtp.py').read_text(encoding='utf-8'))
+        cls = next(node for node in ast.walk(fixture)
+                   if isinstance(node, ast.ClassDef) and node.name == 'Runner')
+        cls.name = 'NPUModelRunner'
+        cls.body.extend(ast.parse(
+            'def _bookkeeping_sync(self):\n self.input_batch.num_tokens_no_spec[req_idx] = end_idx\n'
+            'def sample_tokens(self):\n self._bookkeeping_sync()\n propose_draft_token_ids(tokens)\n'
+        ).body)
+        setup = next(node for node in cls.body if node.name == '_check_and_update_cudagraph_mode')
+        setup.args.args.append(ast.arg(arg='new_required_argument'))
+        with self.assertRaisesRegex(ValueError, 'graph setup API'):
+            check_runner(ast.unparse(cls))
+        cls.body.remove(setup)
+        with self.assertRaisesRegex(ValueError, 'graph setup API'):
+            check_runner(ast.unparse(cls))
+
     def test_exported_release_modules_are_current(self):
         directory = Path(__file__).resolve().parent
         lines = (directory / 'asr_mtp_v023.patch').read_text(encoding='utf-8').splitlines(keepends=True)

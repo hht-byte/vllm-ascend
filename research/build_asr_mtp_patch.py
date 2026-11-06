@@ -49,6 +49,11 @@ def check_runner(source):
     required = ('_get_drafter', '_update_states', 'propose_draft_token_ids', '_bookkeeping_sync', 'sample_tokens')
     if any(name not in methods for name in required):
         raise ValueError('unsupported runner: missing MTP hook or bookkeeping method')
+    graph_setup = methods.get('_check_and_update_cudagraph_mode')
+    if (graph_setup is None or tuple(arg.arg for arg in graph_setup.args.args) !=
+            ('self', 'attention_backends', 'kv_cache_groups') or graph_setup.args.kwonlyargs or
+            graph_setup.args.vararg or graph_setup.args.kwarg):
+        raise ValueError('unsupported runner graph setup API; inspect the current worker before applying')
     actual = tuple(arg.arg for arg in methods['propose_draft_token_ids'].args.args)
     expected = ('self', 'valid_sampled_token_ids', 'sampling_metadata', 'scheduler_output',
                 'spec_decode_metadata', 'spec_decode_common_attn_metadata', 'positions',

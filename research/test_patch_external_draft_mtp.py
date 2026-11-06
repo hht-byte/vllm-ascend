@@ -7,6 +7,25 @@ import unittest
 from unittest.mock import patch
 
 
+CAPTURE_SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 32,
+                 40, 48, 64, 80, 96, 128, 144, 160, 180, 200, 256, 300,
+                 384, 512, 768, 1024]
+
+
+def graph_inputs(support='ALWAYS'):
+    class Builder:
+        @staticmethod
+        def get_cudagraph_support(config, cache_spec):
+            return SimpleNamespace(name=support)
+
+    class Backend:
+        @staticmethod
+        def get_builder_cls():
+            return Builder
+
+    return [{Backend}], [SimpleNamespace(kv_cache_spec=object())]
+
+
 class WorkerPatchTests(unittest.TestCase):
     def load(self):
         external = ModuleType('vllm_ascend.spec_decode.external_draft_proposer')
@@ -22,6 +41,21 @@ class WorkerPatchTests(unittest.TestCase):
                 return 'original'
             def _update_states(self, scheduler_output):
                 return 'deferred'
+            def _check_and_update_cudagraph_mode(self, attention_backends, kv_cache_groups):
+                # Model upstream resolution: round total-token buckets to K+1,
+                # then initialize the dispatcher with the setup query length.
+                self.setup_inputs = (attention_backends, kv_cache_groups)
+                self.setup_query_len = multiple = self.uniform_decode_query_len
+                config = self.compilation_config
+                if multiple > 1:
+                    config.cudagraph_capture_sizes = sorted({
+                        (size + multiple - 1) // multiple * multiple
+                        for size in config.cudagraph_capture_sizes
+                        if (size + multiple - 1) // multiple * multiple <= config.max_cudagraph_capture_size
+                    })
+                if getattr(self, 'fail_graph_setup', False):
+                    raise RuntimeError('graph setup failed')
+                return 'graphs_ready'
             def propose_draft_token_ids(self, valid_sampled_token_ids, sampling_metadata,
                                        scheduler_output, spec_decode_metadata,
                                        spec_decode_common_attn_metadata, positions,
@@ -39,6 +73,65 @@ class WorkerPatchTests(unittest.TestCase):
         with patch.dict(sys.modules, modules):
             exec(Path(__file__).with_name('patch_external_draft_mtp.py').read_text(encoding='utf-8'), namespace)
         return Runner, namespace
+
+    def graph_runner(self, *, mtp=True, mode='FULL'):
+        Runner, namespace = self.load()
+        runner = Runner()
+        runner.vllm_config = SimpleNamespace(additional_config={'asr_mtp': {}} if mtp else {})
+        runner.speculative_config = SimpleNamespace(
+            method='custom_class', model=namespace['EXTERNAL_CLASS'], num_speculative_tokens=15)
+        runner.drafter = runner._get_drafter()
+        runner.uniform_decode_query_len = 16
+        runner.compilation_config = SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(name=mode), cudagraph_capture_sizes=CAPTURE_SIZES.copy(),
+            max_cudagraph_capture_size=1024)
+        return runner, namespace
+
+    def test_full_graph_preserves_small_buckets_and_real_draft_budget(self):
+        runner, _ = self.graph_runner()
+        backends, groups = graph_inputs()
+        self.assertEqual(runner._check_and_update_cudagraph_mode(backends, groups), 'graphs_ready')
+        self.assertEqual(runner.compilation_config.cudagraph_capture_sizes, CAPTURE_SIZES)
+        self.assertEqual(runner.setup_query_len, 1)
+        self.assertEqual(runner.setup_inputs, (backends, groups))
+        self.assertEqual(runner.uniform_decode_query_len, 16)
+        self.assertEqual(runner.speculative_config.num_speculative_tokens, 15)
+
+    def test_graph_setup_failure_restores_runtime_query_length(self):
+        runner, _ = self.graph_runner()
+        runner.fail_graph_setup = True
+        with self.assertRaisesRegex(RuntimeError, 'graph setup failed'):
+            runner._check_and_update_cudagraph_mode([], [])
+        self.assertEqual(runner.uniform_decode_query_len, 16)
+        self.assertEqual(runner.speculative_config.num_speculative_tokens, 15)
+        self.assertEqual(runner.compilation_config.cudagraph_capture_sizes, CAPTURE_SIZES)
+
+    def test_disabled_mtp_and_other_graph_modes_keep_upstream_resolution(self):
+        for mtp, mode in [(False, 'FULL'), (True, 'NONE'), (True, 'PIECEWISE'),
+                          (True, 'FULL_DECODE_ONLY'), (True, 'FULL_AND_PIECEWISE')]:
+            with self.subTest(mtp=mtp, mode=mode):
+                runner, _ = self.graph_runner(mtp=mtp, mode=mode)
+                self.assertEqual(runner._check_and_update_cudagraph_mode([], []), 'graphs_ready')
+                self.assertEqual(runner.setup_query_len, 16)
+                self.assertEqual(len(runner.compilation_config.cudagraph_capture_sizes), 17)
+                self.assertEqual(runner.uniform_decode_query_len, 16)
+
+    def test_backend_downgrades_keep_real_query_length_and_uniform_buckets(self):
+        for support in ('UNIFORM_BATCH', 'UNIFORM_SINGLE_TOKEN_DECODE', 'NEVER'):
+            with self.subTest(support=support):
+                runner, _ = self.graph_runner()
+                runner._check_and_update_cudagraph_mode(*graph_inputs(support))
+                # Upstream may downgrade requested FULL to a decode-only mode;
+                # it must see the real K+1 for safety checks and bucket rounding.
+                self.assertEqual(runner.setup_query_len, 16)
+                self.assertEqual(len(runner.compilation_config.cudagraph_capture_sizes), 17)
+                self.assertEqual(runner.uniform_decode_query_len, 16)
+
+    def test_graph_hook_install_is_idempotent(self):
+        runner, namespace = self.graph_runner()
+        installed = type(runner)._check_and_update_cudagraph_mode
+        namespace['install']()
+        self.assertIs(type(runner)._check_and_update_cudagraph_mode, installed)
 
     def test_disabled_engine_is_unchanged_and_install_is_idempotent(self):
         Runner, namespace = self.load()
