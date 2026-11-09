@@ -8,13 +8,15 @@ The installed target runner, sampler, rejection sampler and paged KV are not
 replaced. Without additional_config.asr_mtp, every original method is retained.
 """
 import inspect
+import logging
 
+from vllm_ascend.spec_decode.asr_mtp_worker import load_worker, request_enabled
 from vllm_ascend.spec_decode.external_draft_proposer import AscendExternalDraftProposer
-from vllm_ascend.spec_decode.asr_mtp_worker import request_enabled, load_worker
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 EXTERNAL_CLASS = ('vllm_ascend.spec_decode.external_draft_proposer.'
                   'AscendExternalDraftProposer')
+logger = logging.getLogger(__name__)
 
 
 class AscendExternalDraftMTPProposer(AscendExternalDraftProposer):
@@ -27,7 +29,8 @@ class AscendExternalDraftMTPProposer(AscendExternalDraftProposer):
         self.online = load_worker(self.runner, target, self.settings)
 
     def dummy_run(self, *args, is_profile=False, **kwargs):
-        # Target capture covers the decoder; auxiliary heads remain eager.
+        # Independent MTP graphs are prepared once during memory profiling,
+        # before target KV sizing. Never capture inside target graph dummy runs.
         if is_profile and self.online is not None:
             self.online.profile()
 
@@ -123,6 +126,36 @@ def install():
     cls._update_states = update
     cls._check_and_update_cudagraph_mode = graph_setup
     cls._asr_mtp_patch_installed = True
+
+
+def install_worker_memory_hook(cls):
+    """Called after NPUWorker is defined; only changes startup KV accounting."""
+    if getattr(cls, '_asr_mtp_graph_memory_installed', False):
+        return
+    original = cls.determine_available_memory
+    if tuple(inspect.signature(original).parameters) != ('self',):
+        raise RuntimeError('ASR MTP graph memory hook requires the v0.23 worker API')
+
+    def determine(self):
+        available = original(self)
+        drafter = getattr(self.model_runner, 'drafter', None)
+        online = drafter.online if isinstance(drafter, AscendExternalDraftMTPProposer) else None
+        graphs = getattr(online, 'graphs', None)
+        if graphs is None or not graphs.ready:
+            return available
+        reserve = graphs.reserved_bytes
+        manual = bool(self.cache_config.kv_cache_memory_bytes)
+        logger.info('ASR_MTP_GRAPH_MEMORY reserved_mib=%.2f manual_kv=%s',
+                    reserve / 1024 ** 2, manual)
+        if manual:
+            return available  # Explicit user KV bytes remain authoritative.
+        if available <= reserve:
+            raise ValueError('insufficient automatic KV budget after reserving ASR MTP graphs')
+        self.available_kv_cache_memory_bytes = available - reserve
+        return self.available_kv_cache_memory_bytes
+
+    cls.determine_available_memory = determine
+    cls._asr_mtp_graph_memory_installed = True
 
 
 install()

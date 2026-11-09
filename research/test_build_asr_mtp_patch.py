@@ -1,14 +1,24 @@
 import ast
 import importlib
-from pathlib import Path
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 
 class PatchExportTests(unittest.TestCase):
+    def test_memory_hook_is_registered_after_worker_class_and_checks_its_api(self):
+        from build_asr_mtp_patch import worker_memory_entry
+        source = ('class NPUWorker:\n'
+                  '    def determine_available_memory(self): return 1000\n')
+        rewritten = worker_memory_entry(source)
+        self.assertEqual(worker_memory_entry(rewritten), rewritten)
+        self.assertGreater(rewritten.index('install_worker_memory_hook(NPUWorker)'),
+                           rewritten.index('class NPUWorker'))
+        with self.assertRaisesRegex(ValueError, 'memory'):
+            worker_memory_entry('class NPUWorker: pass\n')
     def test_registry_removes_eager_mtp_import_and_is_idempotent(self):
         from build_asr_mtp_patch import registry
         source = ('if vllm_version_is("0.23.0"):\n'
@@ -22,7 +32,7 @@ class PatchExportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'first-verify'):
             registry('')
 
-    def test_export_contains_three_modules_and_late_worker_import(self):
+    def test_export_contains_graph_dependency_and_late_worker_import(self):
         from build_asr_mtp_patch import make_patch
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
             root = Path(directory)
@@ -34,7 +44,9 @@ class PatchExportTests(unittest.TestCase):
             worker = root / 'vllm_ascend/worker/worker.py'
             worker.write_text(
                 'from vllm_ascend.utils import vllm_version_is\n'
-                'from vllm_ascend.worker.model_runner_v1 import NPUModelRunner\n',
+                'from vllm_ascend.worker.model_runner_v1 import NPUModelRunner\n'
+                'class NPUWorker:\n'
+                '    def determine_available_memory(self): return 1000\n',
                 encoding='utf-8')
             fixture = Path(__file__).with_name('test_patch_external_draft_mtp.py').read_text(encoding='utf-8')
             tree = ast.parse(fixture)
@@ -46,7 +58,8 @@ class PatchExportTests(unittest.TestCase):
             with runner.open('a', encoding='utf-8') as stream:
                 stream.write('\n    def sample_tokens(self):\n        self._bookkeeping_sync()\n        propose_draft_token_ids(valid_sampled_token_ids)\n')
             patch = make_patch(root)
-            self.assertEqual(patch.count('--- /dev/null'), 3)
+            self.assertIn('+++ b/vllm_ascend/spec_decode/asr_mtp_graph.py', patch)
+            self.assertEqual(patch.count('--- /dev/null'), 4)
             self.assertNotIn('+++ b/vllm_ascend/worker/model_runner_v1.py', patch)
             self.assertIn('+++ b/vllm_ascend/worker/worker.py', patch)
             self.assertNotIn('+++ b/vllm_ascend/patch/worker/__init__.py', patch)
@@ -68,7 +81,7 @@ class PatchExportTests(unittest.TestCase):
             worker_entry('from vllm_ascend.worker.model_runner_v1 import NPUModelRunner\n')
 
     def test_real_import_order_no_longer_reads_partially_initialized_runner(self):
-        from build_asr_mtp_patch import registry, worker_entry
+        from build_asr_mtp_patch import registry, worker_entry, worker_memory_entry
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
             root = Path(directory)
             package = root / 'vllm_ascend'
@@ -94,9 +107,11 @@ class PatchExportTests(unittest.TestCase):
                              '# The class is defined only after the patch package has loaded.\n'
                              + ast.unparse(cls) + '\n')
             (package / 'worker/model_runner_v1.py').write_text(runner_source, encoding='utf-8')
-            (package / 'worker/worker.py').write_text(worker_entry(
+            (package / 'worker/worker.py').write_text(worker_memory_entry(worker_entry(
                 'from vllm_ascend.utils import vllm_version_is\n'
-                'from vllm_ascend.worker.model_runner_v1 import NPUModelRunner\n'), encoding='utf-8')
+                'from vllm_ascend.worker.model_runner_v1 import NPUModelRunner\n'
+                'class NPUWorker:\n'
+                '    def determine_available_memory(self): return 1024\n')), encoding='utf-8')
             external = ModuleType('vllm_ascend.spec_decode.external_draft_proposer')
             class Base:
                 def __init__(self, config, runner):
@@ -124,6 +139,11 @@ class PatchExportTests(unittest.TestCase):
                         runner = module.NPUModelRunner()
                         runner.vllm_config = SimpleNamespace(additional_config={})
                         self.assertEqual(runner._get_drafter(), 'original')
+                        instance = module.NPUWorker()
+                        instance.model_runner = runner
+                        self.assertEqual(instance.determine_available_memory(), 1024)
+                        self.assertEqual(getattr(module.NPUWorker,
+                            '_asr_mtp_graph_memory_installed', False), supported)
                         if supported:
                             registration = sys.modules['vllm_ascend.patch.worker.patch_external_draft_mtp']
                             runner.vllm_config.additional_config['asr_mtp'] = {'checkpoint': '/heads.pt'}
@@ -160,7 +180,8 @@ class PatchExportTests(unittest.TestCase):
         directory = Path(__file__).resolve().parent
         lines = (directory / 'asr_mtp_v023.patch').read_text(encoding='utf-8').splitlines(keepends=True)
         self.assertNotIn(' \n', lines)
-        for name in ('asr_mtp_heads.py', 'asr_mtp_worker.py', 'patch_external_draft_mtp.py'):
+        for name in ('asr_mtp_heads.py', 'asr_mtp_worker.py', 'asr_mtp_graph.py',
+                     'patch_external_draft_mtp.py'):
             start = next(i for i, line in enumerate(lines) if line.startswith('+++ b/') and line.rstrip().endswith('/' + name))
             section = []
             for line in lines[start + 1:]:

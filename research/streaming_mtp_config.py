@@ -6,7 +6,6 @@ two service booleans separately to model.enable_prespec after engine creation.
 from collections.abc import Mapping
 from os import fspath
 
-
 EXTERNAL_DRAFT_CLASS = (
     'vllm_ascend.spec_decode.external_draft_proposer.AscendExternalDraftProposer'
 )
@@ -29,9 +28,14 @@ def add_mtp_args(parser):
         '--mtp-checkpoint', default=None,
         help='local checkpoint path; overrides additional_config.asr_mtp.checkpoint',
     )
+    parser.add_argument(
+        '--mtp-graph-mode', choices=('off', 'full'), default=None,
+        help='auxiliary MTP graph mode; default inherits asr_mtp.graph_mode (off)',
+    )
 
 
-def mtp_engine_config(base_config, *, mtp_enabled=False, mtp_checkpoint=None):
+def mtp_engine_config(base_config, *, mtp_enabled=False, mtp_checkpoint=None,
+                      mtp_graph_mode=None):
     """Return engine kwargs with MTP loaded only when the master switch is on.
 
     Preserve the external-draft speculative backend and unrelated extensions.
@@ -40,6 +44,8 @@ def mtp_engine_config(base_config, *, mtp_enabled=False, mtp_checkpoint=None):
     """
     if type(mtp_enabled) is not bool:
         raise TypeError('mtp_enabled must be a bool')
+    if mtp_graph_mode is not None and mtp_graph_mode not in ('off', 'full'):
+        raise ValueError('mtp_graph_mode must be off or full')
     result = dict(base_config)
     additional = result.get('additional_config')
     if additional is not None and not isinstance(additional, Mapping):
@@ -59,6 +65,8 @@ def mtp_engine_config(base_config, *, mtp_enabled=False, mtp_checkpoint=None):
     if settings is not None and not isinstance(settings, Mapping):
         raise TypeError('additional_config.asr_mtp must be a mapping')
     settings = dict(settings or {})
+    if mtp_graph_mode is not None:
+        settings['graph_mode'] = mtp_graph_mode
     if mtp_checkpoint is not None:
         settings['checkpoint'] = mtp_checkpoint
     checkpoint = settings.get('checkpoint')

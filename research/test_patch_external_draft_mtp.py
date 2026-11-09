@@ -1,11 +1,9 @@
 """Test worker registration/dispatch without importing vLLM/NPU kernels."""
-import importlib.util
-from pathlib import Path
 import sys
-from types import ModuleType, SimpleNamespace
 import unittest
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
-
 
 CAPTURE_SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 32,
                  40, 48, 64, 80, 96, 128, 144, 160, 180, 200, 256, 300,
@@ -27,6 +25,32 @@ def graph_inputs(support='ALWAYS'):
 
 
 class WorkerPatchTests(unittest.TestCase):
+    def test_auxiliary_graph_reservation_reduces_only_automatic_kv_budget(self):
+        runner, namespace = self.graph_runner()
+        graphs = SimpleNamespace(ready=True, reserved_bytes=200)
+        runner.drafter.online = SimpleNamespace(graphs=graphs)
+        class Worker:
+            def determine_available_memory(self):
+                self.available_kv_cache_memory_bytes = self.base_budget
+                return self.base_budget
+        install_memory = namespace.get('install_worker_memory_hook')
+        self.assertIsNotNone(install_memory, 'startup graph-pool memory accounting is missing')
+        install_memory(Worker)
+        install_memory(Worker)
+        worker = Worker()
+        worker.model_runner, worker.base_budget = runner, 1000
+        worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=None)
+        self.assertEqual(worker.determine_available_memory(), 800)
+        self.assertEqual(worker.available_kv_cache_memory_bytes, 800)
+        worker.cache_config.kv_cache_memory_bytes = 1000
+        self.assertEqual(worker.determine_available_memory(), 1000)
+        worker.cache_config.kv_cache_memory_bytes = None
+        worker.base_budget = 100
+        with self.assertRaisesRegex(ValueError, 'graph'):
+            worker.determine_available_memory()
+        runner.drafter.online.graphs = None
+        self.assertEqual(worker.determine_available_memory(), 100)
+
     def load(self):
         external = ModuleType('vllm_ascend.spec_decode.external_draft_proposer')
         worker = ModuleType('vllm_ascend.spec_decode.asr_mtp_worker')

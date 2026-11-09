@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Worker-local external draft -> MTP handoff for the v0.23 sync runner."""
-from collections import Counter
 import hashlib
 import logging
+from collections import Counter
 from pathlib import Path
 
 import torch
 
 try:
+    from .asr_mtp_graph import MTPGraphs, graph_options, validate_graph_runner
     from .asr_mtp_heads import BatchedMTPHeads, CacheArena
 except ImportError:
+    from asr_mtp_graph import MTPGraphs, graph_options, validate_graph_runner
     from asr_mtp_heads import BatchedMTPHeads, CacheArena
 
 logger = logging.getLogger(__name__)
@@ -24,11 +26,14 @@ def request_enabled(params):
     return marker
 
 
-def query_buckets(states, limits):
+def query_buckets(states, limits, graphs=None):
     buckets = {}
     for i, (state, limit) in enumerate(zip(states, limits)):
         span = max(state.length - head.valid for head in state.heads[:limit])
-        buckets.setdefault((span - 1).bit_length(), []).append(i)
+        graph_query = (next((q for q in graphs.options.queries if span <= q), None)
+                       if graphs is not None and state.length <= graphs.options.context else None)
+        key = ('graph', graph_query) if graph_query is not None else ('eager', (span - 1).bit_length())
+        buckets.setdefault(key, []).append(i)
     return buckets
 
 
@@ -43,12 +48,13 @@ def stop_ids(params, model_eos):
 
 
 class MTPWorker:
-    def __init__(self, runner, heads, arena, embedding, logits, eos):
+    def __init__(self, runner, heads, arena, embedding, logits, eos, *, graphs=None):
         self.runner, self.heads, self.arena = runner, heads, arena
         self.embedding, self.logits, self.eos = embedding, logits, set(eos)
         self.states, self.disabled = {}, {}
         self.legacy_submitted = set()
         self.stats = Counter(target_forwards=0)
+        self.graphs, self.profiled = graphs, False
 
     def finish(self, request_ids):
         for req_id in request_ids:
@@ -90,6 +96,13 @@ class MTPWorker:
     def profile(self):
         if self.states or self.arena.leased:
             raise RuntimeError('MTP memory profiling must precede live requests')
+        if self.profiled:
+            return
+        # Graph buffers must already be resident when the eager fallback's
+        # activation peak is measured. Private pool reservation is accounted
+        # separately by the startup-only worker memory hook.
+        if self.graphs is not None:
+            self.graphs.prepare()
         before = self.heads.processed_positions, self.heads.reused_positions
         states = []
         try:
@@ -108,6 +121,7 @@ class MTPWorker:
             for state in states:
                 self.arena.release(state)
             self.heads.processed_positions, self.heads.reused_positions = before
+        self.profiled = True
 
     @torch.inference_mode()
     def propose(self, sampled, scheduler_output, hidden):
@@ -184,13 +198,22 @@ class MTPWorker:
             indices.append(i)
         if states:
             before = self.heads.processed_positions
-            buckets = query_buckets(states, limits)
+            buckets = query_buckets(states, limits, self.graphs)
             drafts = torch.zeros((len(states), self.heads.num_heads),
                                  device=states[0].target.device, dtype=torch.long)
             for group in buckets.values():
-                drafts[group] = self.heads.propose(
-                    [states[i] for i in group], [inputs[i] for i in group],
-                    self.embedding, self.logits, [limits[i] for i in group])
+                batch_states = [states[i] for i in group]
+                batch_inputs = [inputs[i] for i in group]
+                batch_limits = [limits[i] for i in group]
+                proposal = (None if self.graphs is None else
+                            self.graphs.propose(batch_states, batch_inputs, batch_limits))
+                if proposal is None:
+                    proposal = self.heads.propose(batch_states, batch_inputs,
+                        self.embedding, self.logits, batch_limits)
+                    self.stats['eager_head_batches'] += 1
+                else:
+                    self.stats['graph_head_batches'] += 1
+                drafts[group] = proposal
             rows = drafts.tolist()  # One device-to-host boundary for the whole batch.
             mtp_tokens = 0
             for i, row, limit in zip(indices, rows, limits):
@@ -208,8 +231,11 @@ class MTPWorker:
             self.stats['head_batches'] += len(buckets)
             self.stats['draft_tokens'] += mtp_tokens
             self.stats['head_positions'] += self.heads.processed_positions - before
-            logger.debug('ASR_MTP_STEP requests=%d draft_tokens=%d new_head_positions=%d',
-                         len(states), mtp_tokens, self.heads.processed_positions - before)
+            logger.debug('ASR_MTP_STEP requests=%d draft_tokens=%d new_head_positions=%d '
+                         'graph_batches_total=%d eager_batches_total=%d graph_stats=%s',
+                         len(states), mtp_tokens, self.heads.processed_positions - before,
+                         self.stats['graph_head_batches'], self.stats['eager_head_batches'],
+                         self.graphs.stats if self.graphs is not None else {})
         return outputs
 
 
@@ -257,7 +283,8 @@ def check_base_signature(metadata, model_path, settings):
 def load_worker(runner, target, settings):
     validate_engine(runner)
     allowed = {'checkpoint', 'num_heads', 'max_context_tokens', 'cache_mib', 'max_requests',
-               'verify_base_signature'}
+               'verify_base_signature', 'graph_mode', 'graph_context_tokens',
+               'graph_query_sizes', 'graph_max_batch_size'}
     if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
         raise ValueError('invalid additional_config.asr_mtp settings')
     for name, default in (('num_heads', 5), ('max_context_tokens', 512),
@@ -290,14 +317,25 @@ def load_worker(runner, target, settings):
     slots = min(settings.get('max_requests', 64), settings.get('cache_mib', 512) * 1024 ** 2 // per_slot)
     if slots < 1:
         raise ValueError('asr_mtp.cache_mib cannot hold one request slot')
+    options = graph_options(settings, context=cap, slots=slots,
+                            max_batch=getattr(runner, 'max_num_reqs', slots))
+    if options is not None:
+        validate_graph_runner(runner)
     arena = CacheArena(text, heads, max_context=cap, slots=slots,
-                       device=runner.device, dtype=runner.dtype)
+                       device=runner.device, dtype=runner.dtype,
+                       scratch_elements=options.scratch_elements(text) if options else 0)
     language = target.get_language_model() if hasattr(target, 'get_language_model') else target.language_model
     eos = getattr(text, 'eos_token_id', None)
     eos = set(eos if isinstance(eos, (tuple, list)) else [eos]) - {None}
-    worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits, eos)
+    graphs = (MTPGraphs(options, model, arena, language.embed_input_ids, language.compute_logits)
+              if options is not None else None)
+    worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits,
+                       eos, graphs=graphs)
     logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
-                'verify_base_signature=%s',
+                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f',
                 heads, cap, slots, arena.storage.numel() * arena.storage.element_size() / 1024 ** 2,
-                settings['checkpoint'], settings.get('verify_base_signature', False))
+                settings['checkpoint'], settings.get('verify_base_signature', False),
+                settings.get('graph_mode', 'off'),
+                (arena.graph_storage.numel() - arena.scratch_offset) *
+                arena.storage.element_size() / 1024 ** 2)
     return worker

@@ -41,12 +41,18 @@ class CacheArena:
         return ((heads + 1) * config.hidden_size +
                 2 * heads * config.num_key_value_heads * config.head_dim)
 
-    def __init__(self, config, heads, *, max_context, slots, device, dtype):
+    def __init__(self, config, heads, *, max_context, slots, device, dtype,
+                 scratch_elements=0):
         if min(max_context, slots, heads) < 1:
             raise ValueError('cache dimensions must be positive')
         self.config, self.num_heads = config, heads
         width = self.elements_per_position(config, heads)
-        self.storage = torch.empty((slots, max_context * width), device=device, dtype=dtype)
+        if type(scratch_elements) is not int or scratch_elements < 0:
+            raise ValueError('scratch_elements must be a nonnegative integer')
+        self.scratch_offset = slots * max_context * width
+        self.graph_storage = torch.empty(self.scratch_offset + scratch_elements,
+                                         device=device, dtype=dtype)
+        self.storage = self.graph_storage[:self.scratch_offset].view(slots, max_context * width)
         self.max_context = max_context
         self.free = list(reversed(range(slots)))
         self.leased = set()

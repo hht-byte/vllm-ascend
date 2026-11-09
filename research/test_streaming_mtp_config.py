@@ -1,12 +1,29 @@
 """Service master switch must control engine loading as well as request flags."""
 import argparse
-from copy import deepcopy
 import unittest
+from copy import deepcopy
 
 from streaming_mtp_config import add_mtp_args, mtp_engine_config
 
 
 class MTPServiceConfigTests(unittest.TestCase):
+    def test_graph_switch_reaches_engine_without_changing_master_or_base(self):
+        parser = argparse.ArgumentParser()
+        add_mtp_args(parser)
+        args = parser.parse_args(['--mtp', '--mtp-checkpoint', '/heads.pt',
+                                  '--mtp-graph-mode', 'full'])
+        base = self.base()
+        saved = deepcopy(base)
+        result = mtp_engine_config(base, mtp_enabled=args.mtp_enabled,
+            mtp_checkpoint=args.mtp_checkpoint, mtp_graph_mode=args.mtp_graph_mode)
+        self.assertEqual(result['additional_config']['asr_mtp']['graph_mode'], 'full')
+        self.assertEqual(base, saved)
+        self.assertNotIn('mtp_graph_mode', result)
+        result = mtp_engine_config(result, mtp_enabled=True, mtp_graph_mode='off')
+        self.assertEqual(result['additional_config']['asr_mtp']['graph_mode'], 'off')
+        disabled = mtp_engine_config(result, mtp_enabled=False, mtp_graph_mode='full')
+        self.assertNotIn('asr_mtp', disabled['additional_config'])
+
     def base(self):
         return dict(
             model='/target', max_num_seqs=20,

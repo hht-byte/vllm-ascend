@@ -72,6 +72,24 @@ def check_runner(source):
         raise ValueError('unsupported runner: MTP requires proposal after confirmed-token bookkeeping')
 
 
+def worker_memory_entry(source):
+    block = ('\n# Account for optional auxiliary graph pools after the worker class is defined.\n'
+             'if vllm_version_is("0.23.0"):\n'
+             '    from vllm_ascend.patch.worker.patch_external_draft_mtp import install_worker_memory_hook\n'
+             '    install_worker_memory_hook(NPUWorker)\n')
+    tree = ast.parse(source)
+    cls = next((n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'NPUWorker'), None)
+    method = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and
+                   n.name == 'determine_available_memory'), None) if cls else None
+    if method is None or tuple(a.arg for a in method.args.args) != ('self',):
+        raise ValueError('unsupported worker memory API; inspect before applying MTP graphs')
+    if source.count(block) == 1:
+        return source
+    if 'install_worker_memory_hook' in source:
+        raise ValueError('ambiguous worker memory hook registration')
+    return source.rstrip() + '\n' + block
+
+
 def make_patch(root):
     root = Path(root)
     check_runner((root / 'vllm_ascend/worker/model_runner_v1.py').read_text(encoding='utf-8'))
@@ -80,6 +98,7 @@ def make_patch(root):
         'vllm_ascend/patch/worker/__init__.py': None,
         'vllm_ascend/worker/worker.py': None,
         'vllm_ascend/spec_decode/asr_mtp_heads.py': directory / 'asr_mtp_heads.py',
+        'vllm_ascend/spec_decode/asr_mtp_graph.py': directory / 'asr_mtp_graph.py',
         'vllm_ascend/spec_decode/asr_mtp_worker.py': directory / 'asr_mtp_worker.py',
         'vllm_ascend/patch/worker/patch_external_draft_mtp.py': directory / 'patch_external_draft_mtp.py',
     }
@@ -88,8 +107,8 @@ def make_patch(root):
         target = root / name
         old = target.read_text(encoding='utf-8').replace('\r\n', '\n') if target.exists() else ''
         if source is None:
-            transform = registry if name.endswith('/__init__.py') else worker_entry
-            new = transform(old)
+            new = (registry(old) if name.endswith('/__init__.py') else
+                   worker_memory_entry(worker_entry(old)))
         else:
             new = source.read_text(encoding='utf-8').replace('\r\n', '\n')
         diff = difflib.unified_diff(

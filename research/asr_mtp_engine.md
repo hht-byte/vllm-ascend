@@ -24,11 +24,12 @@ git apply /tmp/asr-mtp.patch
 | 本仓文件 | 安装位置 |
 |---|---|
 | `asr_mtp_heads.py` | `vllm_ascend/spec_decode/asr_mtp_heads.py` |
+| `asr_mtp_graph.py` | `vllm_ascend/spec_decode/asr_mtp_graph.py` |
 | `asr_mtp_worker.py` | `vllm_ascend/spec_decode/asr_mtp_worker.py` |
 | `patch_external_draft_mtp.py` | `vllm_ascend/patch/worker/patch_external_draft_mtp.py` |
 | 注册 import | `vllm_ascend/worker/worker.py`，紧接 `NPUModelRunner` 的导入；受 0.23 版本条件保护 |
 
-四个 monkey patch 分别负责 drafter 选择、带 hidden states 的提案分派、finished/abort 状态清理，以及 FULL 图初始化时保留原始 token buckets。重复 import 幂等。未配置 MTP 时委托原方法。
+runner 的四个 monkey patch 分别负责 drafter 选择、带 hidden states 的提案分派、finished/abort 状态清理，以及 FULL 图初始化时保留原始 token buckets。另在 `NPUWorker` 类定义结束后注册一次启动显存计量 hook，预留辅助图池；不修改运行时目标 forward。重复 import 幂等。未配置 MTP 时委托原方法。
 
 ### 已安装版本出现循环导入
 
@@ -84,7 +85,49 @@ base_config["enable_prefix_caching"] = False
 
 用户提供的 12:37:25 聚合表中，30 次目标执行合计 1152 个有效 token、1440 个 padded token，padding 占执行 token 的 20%；所列各行均为 FULL。这支持减少 padding 的方向，不能换算为同比例时延收益，也不能用该聚合表逐条判定请求的 prefill 阶段。更多 bucket 会增加启动捕获数量和图内存，部署后须对照实际 bucket、峰值内存及完整服务时延。
 
-这只优化**目标 decoder 图的粒度**。当前辅助 MTP heads 仍在目标采样后以 eager 执行，音频 encoder 也不会因为 decoder 设置 FULL 自动入图。MTP/encoder 图捕获仍需各自实现和设备验证。
+这只优化**目标 decoder 图的粒度**。辅助 MTP 默认仍为 eager；下面的独立开关才会启用辅助图。音频 encoder 和目标模型自身的 LM head 不在本次辅助图范围内。
+
+### 独立 MTP 整图执行
+
+本次支持 910B 的 `NPUWorker` 显存定容路径。`310P-graph` 是交付分支名；310P 的 `NPUWorker310` 覆盖了显存计量方法，当前会显式拒绝其辅助 `graph_mode=full`，避免漏计图池。其原有 MTP eager 路径不受影响。
+
+在原有 `additional_config["asr_mtp"]` 中追加：
+
+```python
+"graph_mode": "full",          # 默认 off；off 恢复原 MTP eager 实现
+"graph_max_batch_size": 8,      # 精确 batch 1..8，避免 padding LM head
+"graph_query_sizes": [8, 64],   # 分开处理增量 fresh query 与首次 hidden 历史
+"graph_context_tokens": 128,   # KV/hidden 容量，不是当前真实序列长度
+```
+
+完整辅助链在一张图中执行：逐 head 的 shifted embedding、融合、attention/MLP、共享目标 LM head、argmax，以及辅助 KV/hidden 回写。目标 verifier、目标 KV、音频 encoder 和 scheduler 保持原流程。不同请求的真实长度、每层有效前缀、drive token 和草稿预算都是设备输入，不会按 request ID 或精确序列长度建图。
+
+只在启动 `profile_run` 中预捕获，最多 64 张，运行时只 replay。默认配置为 8 种精确 batch × 2 种 query 容量，共 16 张（受实际辅助槽数和 `max_num_seqs` 限制）。同 query 图档位的请求合并执行，首次长 query 与增量 query 分开。batch 超过上限、context 超过 128、fresh query 超过 64，或者所有请求的剩余 head 预算不足完整深度时，直接走原 eager。不会在线建图或让请求等待其他 batch。`enforce_eager=True` 与显式 `graph_mode=full` 冲突，会在启动报错。
+
+辅助 arena 追加有限 scratch 区，padding 写入独立地址，不会覆盖 live cache 的最后一行。辅助 token 仍在 worker 末尾统一执行一次 batch D2H。共享图池只容纳临时中间张量，输入、输出、arena 和共享权重均在池外；replay 与输出消费保持同一当前流上的顺序。
+
+显存：先捕获，再运行最坏 eager profile。worker 的启动计量额外从自动 KV 预算扣除捕获前后保留的 reserved memory 增量，包含私有图池和静态缓冲；这是保守预留，部分静态缓冲可能已计入 activation peak，因此可用 KV 会略少。`cache_mib` 不包含该图池、scratch 和辅助权重。显式指定 `kv_cache_memory_bytes` 时保留用户手工预算，需自行为图池留出空间。捕获失败直接报启动错误；运行时图已执行部分操作后不会冒险重试 eager。
+
+启动和首次实际命中应看到：
+
+```text
+ASR_MTP_CONFIG ... graph_mode=full graph_scratch_mib=...
+ASR_MTP_GRAPH_READY graphs=16 ... reserved_mib=...
+ASR_MTP_GRAPH_MEMORY reserved_mib=... manual_kv=False
+ASR_MTP_GRAPH_REPLAY batch=... query=... context=... heads=...
+```
+
+`ASR_MTP_STEP` DEBUG 日志另给出累计 graph/eager batch 数和 `miss_batch`、`miss_query`、`miss_context`、`miss_budget`。辅助图不会加入目标 decoder 的 `CUDAGraph Stats` 统计；应结合这些日志和 profiling 的辅助 LM head / attention static 事件确认。图能减少下发开销，不会消除 LM head 的矩阵计算。
+
+服务侧新可选参数为 `--mtp-graph-mode full/off`，完整转发见 [服务启动接线](streaming_mtp_service.md)。不更新服务器工厂签名时，也可直接修改上面的既有引擎 `additional_config`，无需新增服务形参。MTP 总开关 OFF 始终移除整个辅助配置。
+
+CPU 检查覆盖数学路径和生命周期，不能证明 NPU 捕获和时延。设备上的集成测试会实际调用 `torch.npu.NPUGraph`，可在已安装 Torch-NPU 的环境执行：
+
+```bash
+python -m unittest discover -s research -p 'test_asr_mtp_graph.py' -v
+```
+
+NPU 用例不得显示 skipped；之后按相同 checkpoint、head 数、Prespec、并发与负载对照 `graph_mode=off/full`，比较完整目标输出、接受率、commit P95/P99、prefill/decode 和峰值显存。这里没有本地 NPU 性能验收结果。
 
 ### 支持范围与缓存
 
