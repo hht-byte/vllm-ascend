@@ -1,0 +1,732 @@
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -1062,3 +1062,8 @@
+             if line.split(":")[-1].strip() != "OK":
+                 raise RuntimeError("NPU card health status is not OK")
+     return
++
++# Account for optional auxiliary graph pools after the worker class is defined.
++if vllm_version_is("0.23.0"):
++    from vllm_ascend.patch.worker.patch_external_draft_mtp import install_worker_memory_hook
++    install_worker_memory_hook(NPUWorker)
+--- a/vllm_ascend/spec_decode/asr_mtp_heads.py
++++ b/vllm_ascend/spec_decode/asr_mtp_heads.py
+@@ -41,12 +41,18 @@
+         return ((heads + 1) * config.hidden_size +
+                 2 * heads * config.num_key_value_heads * config.head_dim)
+
+-    def __init__(self, config, heads, *, max_context, slots, device, dtype):
++    def __init__(self, config, heads, *, max_context, slots, device, dtype,
++                 scratch_elements=0):
+         if min(max_context, slots, heads) < 1:
+             raise ValueError('cache dimensions must be positive')
+         self.config, self.num_heads = config, heads
+         width = self.elements_per_position(config, heads)
+-        self.storage = torch.empty((slots, max_context * width), device=device, dtype=dtype)
++        if type(scratch_elements) is not int or scratch_elements < 0:
++            raise ValueError('scratch_elements must be a nonnegative integer')
++        self.scratch_offset = slots * max_context * width
++        self.graph_storage = torch.empty(self.scratch_offset + scratch_elements,
++                                         device=device, dtype=dtype)
++        self.storage = self.graph_storage[:self.scratch_offset].view(slots, max_context * width)
+         self.max_context = max_context
+         self.free = list(reversed(range(slots)))
+         self.leased = set()
+--- /dev/null
++++ b/vllm_ascend/spec_decode/asr_mtp_graph.py
+@@ -0,0 +1,475 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Bounded, independent auxiliary graphs; target forward/verification is untouched."""
++
++import logging
++from collections import Counter
++from dataclasses import dataclass
++from time import perf_counter
++
++import torch
++from torch.nn import functional as F
++
++try:
++    from .asr_mtp_heads import rotate_half
++except ImportError:
++    from asr_mtp_heads import rotate_half
++
++logger = logging.getLogger(__name__)
++MAX_MTP_GRAPHS = 64
++
++
++def validate_graph_runner(runner):
++    if getattr(runner.model_config, "enforce_eager", False):
++        raise ValueError("asr_mtp.graph_mode=full conflicts with enforce_eager=True")
++    if any(
++        cls.__module__.startswith("vllm_ascend._310p") for cls in type(runner).__mro__
++    ):
++        raise ValueError(
++            "ASR MTP full graphs require the 910B worker memory path; "
++            "310P auxiliary graph memory accounting is not supported"
++        )
++
++
++@dataclass(frozen=True)
++class GraphOptions:
++    max_batch: int
++    queries: tuple[int, ...]
++    context: int
++
++    def scratch_elements(self, config):
++        return (
++            self.max_batch
++            * max(self.queries)
++            * max(config.hidden_size, config.num_key_value_heads * config.head_dim)
++        )
++
++
++def graph_options(settings, *, context, slots, max_batch):
++    mode = settings.get("graph_mode", "off")
++    if mode not in ("off", "full"):
++        raise ValueError("asr_mtp.graph_mode must be off or full")
++    if mode == "off":
++        return None
++    capacity = settings.get("graph_context_tokens", min(128, context))
++    batch = settings.get("graph_max_batch_size", 8)
++    if type(capacity) is not int or not 0 < capacity <= context:
++        raise ValueError(
++            "asr_mtp.graph_context_tokens exceeds the auxiliary context capacity"
++        )
++    queries = settings.get("graph_query_sizes", (min(8, capacity), min(64, capacity)))
++    if type(batch) is not int or batch < 1:
++        raise ValueError("asr_mtp.graph_max_batch_size must be a positive integer")
++    if (
++        not isinstance(queries, (list, tuple))
++        or not queries
++        or any(type(q) is not int or not 0 < q <= capacity for q in queries)
++    ):
++        raise ValueError(
++            "asr_mtp.graph_query_sizes must contain positive query capacities"
++        )
++    queries = tuple(sorted(set(queries)))
++    batch = min(batch, slots, max_batch)
++    if batch < 1 or batch * len(queries) > MAX_MTP_GRAPHS:
++        raise ValueError(f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}")
++    return GraphOptions(batch, queries, capacity)
++
++
++class FixedMTPProgram:
++    """Fixed B/Q/K tensor program with device-side lengths and cache addresses.
++
++    Persistent inputs/outputs/arena are allocated outside graph pools. Invalid
++    query writes have unique scratch addresses, including at the context cap;
++    clamping padded writes onto the last live position would corrupt that row.
++    """
++
++    def __init__(
++        self, heads, arena, embedding, logits, *, batch_size, query_size, context_size
++    ):
++        cfg = heads.config
++        if not 0 < query_size <= context_size <= arena.max_context:
++            raise ValueError("invalid fixed MTP query/context capacity")
++        if not 0 < batch_size <= arena.storage.shape[0]:
++            raise ValueError("invalid fixed MTP batch capacity")
++        needed = (
++            batch_size
++            * query_size
++            * max(cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim)
++        )
++        if arena.graph_storage.numel() - arena.scratch_offset < needed:
++            raise ValueError("MTP arena lacks the graph scratch suffix")
++        self.heads, self.arena = heads, arena
++        self.embedding, self.logits = embedding, logits
++        self.batch, self.queries, self.context = batch_size, query_size, context_size
++        device = arena.storage.device
++        self.metadata = torch.zeros(
++            (batch_size, 3 + heads.num_heads + context_size + heads.num_heads + 1),
++            device=device,
++            dtype=torch.long,
++        )
++        self.output = torch.empty(
++            (batch_size, heads.num_heads), device=device, dtype=torch.long
++        )
++        self.query_index = torch.arange(query_size, device=device)
++        self.key_index = torch.arange(context_size, device=device)
++        self.hidden_index = torch.arange(cfg.hidden_size, device=device)
++        self.kv_head_index = torch.arange(cfg.num_key_value_heads, device=device)
++        self.dim_index = torch.arange(cfg.head_dim, device=device)
++        self.hidden_sink = (
++            arena.scratch_offset
++            + torch.arange(batch_size * query_size * cfg.hidden_size, device=device)
++        ).view(batch_size, query_size, cfg.hidden_size)
++        self.kv_sink = (
++            arena.scratch_offset
++            + torch.arange(
++                batch_size * cfg.num_key_value_heads * query_size * cfg.head_dim,
++                device=device,
++            )
++        ).view(batch_size, cfg.num_key_value_heads, query_size, cfg.head_dim)
++        self.inverse = 1.0 / (
++            cfg.rope_theta
++            ** (
++                torch.arange(0, cfg.head_dim, 2, device=device, dtype=torch.float32)
++                / cfg.head_dim
++            )
++        )
++
++    def stage(self, states, inputs, limits):
++        if not len(states) == len(inputs) == len(limits) == self.batch:
++            raise ValueError("fixed MTP requires the exact captured batch size")
++        slots = [state.slot for state in states]
++        if len(set(slots)) != len(slots) or any(
++            not 0 <= slot < self.arena.storage.shape[0] for slot in slots
++        ):
++            raise ValueError("fixed MTP requires distinct live arena slots")
++        rows = []
++        depth = self.heads.num_heads
++        for state, tokens, limit in zip(states, inputs, limits):
++            if (
++                type(limit) is not int
++                or not 0 < limit <= depth
++                or not 0 < state.length <= self.context
++                or len(tokens) != state.length + 1
++            ):
++                raise ValueError("fixed MTP history/drive/budget mismatch")
++            starts = [head.valid for head in state.heads]
++            if any(
++                not 0 <= start < state.length or state.length - start > self.queries
++                for start in starts[:limit]
++            ):
++                raise ValueError("fixed MTP fresh queries exceed captured capacity")
++            rows.append(
++                [
++                    state.slot,
++                    state.length,
++                    *starts,
++                    limit,
++                    *tokens,
++                    *([0] * (self.context + depth + 1 - len(tokens))),
++                ]
++            )
++        # Fresh pinned storage per upload: never mutate a staging buffer whose
++        # asynchronous H2D might still be pending from an earlier replay.
++        host = torch.tensor(
++            rows, dtype=torch.long, pin_memory=self.metadata.device.type == "npu"
++        )
++        self.metadata.copy_(host, non_blocking=True)
++
++    def _hidden_indices(self, base, positions):
++        return (
++            base[:, None, None]
++            + positions[:, :, None] * self.heads.config.hidden_size
++            + self.hidden_index[None, None, :]
++        )
++
++    def _kv_indices(self, base, positions):
++        cfg = self.heads.config
++        return (
++            base[:, None, None, None]
++            + self.kv_head_index[None, :, None, None]
++            * self.arena.max_context
++            * cfg.head_dim
++            + positions[:, None, :, None] * cfg.head_dim
++            + self.dim_index[None, None, None, :]
++        )
++
++    def _read(self, indices):
++        return self.arena.graph_storage.index_select(0, indices.reshape(-1)).view(
++            indices.shape
++        )
++
++    def _write(self, indices, value, valid, sink):
++        addresses = torch.where(valid, indices, sink)
++        self.arena.graph_storage.scatter_(0, addresses.reshape(-1), value.reshape(-1))
++
++    @torch.inference_mode()
++    def run(self):
++        cfg, heads = self.heads.config, self.heads.num_heads
++        cap, width = self.arena.max_context, cfg.hidden_size
++        kv_width = cfg.num_key_value_heads * cap * cfg.head_dim
++        metadata = self.metadata
++        base = metadata[:, 0] * self.arena.storage.shape[1]
++        lengths, limits = metadata[:, 1], metadata[:, 2 + heads]
++        sequence = metadata[:, 3 + heads :].clone()
++        for depth, block in enumerate(self.heads.blocks, 1):
++            starts = metadata[:, 1 + depth]
++            active = limits >= depth
++            anchors = starts[:, None] + self.query_index[None, :]
++            valid = active[:, None] & (anchors < lengths[:, None])
++            positions = anchors.clamp(0, cap - 1)
++            source_offset = (
++                0
++                if depth == 1
++                else cap * width + (depth - 2) * (cap * width + 2 * kv_width)
++            )
++            source = self._read(self._hidden_indices(base + source_offset, positions))
++            source = torch.where(valid[:, :, None], source, 0)
++            indices = (anchors + depth).clamp(0, sequence.shape[1] - 1)
++            shifted = sequence.gather(1, indices)
++            token_embeddings = self.embedding(shifted.reshape(-1)).view(
++                self.batch, self.queries, width
++            )
++            fused = block.fusion(
++                torch.cat(
++                    (block.hidden_norm(source), block.token_norm(token_embeddings)), -1
++                )
++            )
++            normed = block.decoder.input_layernorm(fused)
++            attn = block.decoder.self_attn
++            q = attn.q_norm(
++                attn.q_proj(normed).view(
++                    self.batch, self.queries, cfg.num_attention_heads, cfg.head_dim
++                )
++            ).transpose(1, 2)
++            k = attn.k_norm(
++                attn.k_proj(normed).view(
++                    self.batch, self.queries, cfg.num_key_value_heads, cfg.head_dim
++                )
++            ).transpose(1, 2)
++            v = (
++                attn.v_proj(normed)
++                .view(self.batch, self.queries, cfg.num_key_value_heads, cfg.head_dim)
++                .transpose(1, 2)
++            )
++            frequencies = (anchors + depth).float().unsqueeze(-1) * self.inverse
++            angles = torch.cat((frequencies, frequencies), -1)
++            cos = angles.cos().to(fused.dtype)[:, None]
++            sin = angles.sin().to(fused.dtype)[:, None]
++            q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
++            hidden_base = (
++                base + cap * width + (depth - 1) * (cap * width + 2 * kv_width)
++            )
++            key_base, value_base = (
++                hidden_base + cap * width,
++                hidden_base + cap * width + kv_width,
++            )
++            for offset, value in ((key_base, k), (value_base, v)):
++                self._write(
++                    self._kv_indices(offset, positions),
++                    value,
++                    valid[:, None, :, None],
++                    self.kv_sink,
++                )
++            key_positions = self.key_index[None, :].expand(self.batch, -1)
++            cache_valid = active[:, None] & (key_positions < lengths[:, None])
++            past_k = torch.where(
++                cache_valid[:, None, :, None],
++                self._read(self._kv_indices(key_base, key_positions)),
++                0,
++            )
++            past_v = torch.where(
++                cache_valid[:, None, :, None],
++                self._read(self._kv_indices(value_base, key_positions)),
++                0,
++            )
++            allowed = (self.key_index[None, None, :] <= anchors[:, :, None]) & (
++                self.key_index[None, None, :] < lengths[:, None, None]
++            )
++            # Inactive/padded queries still execute fixed-shape kernels. Give
++            # them one finite key; never depend on backend all-masked behavior.
++            allowed = torch.where(
++                valid[:, :, None], allowed, self.key_index[None, None, :] == 0
++            )
++            groups = cfg.num_attention_heads // cfg.num_key_value_heads
++            attended = F.scaled_dot_product_attention(
++                q,
++                past_k.repeat_interleave(groups, 1),
++                past_v.repeat_interleave(groups, 1),
++                attn_mask=allowed[:, None],
++                dropout_p=0.0,
++                scale=cfg.head_dim**-0.5,
++            )
++            residual = fused + attn.o_proj(
++                attended.transpose(1, 2).reshape(self.batch, self.queries, width)
++            )
++            fresh = block.output_norm(
++                residual
++                + block.decoder.mlp(block.decoder.post_attention_layernorm(residual))
++            )
++            last_index = (lengths - starts - 1).clamp(0, self.queries - 1)
++            last = fresh.gather(
++                1, last_index[:, None, None].expand(-1, 1, width)
++            ).squeeze(1)
++            predicted = torch.where(active, self.logits(last).argmax(-1), 0)
++            self.output[:, depth - 1].copy_(predicted)
++            sequence.scatter_(1, (lengths + depth)[:, None], predicted[:, None])
++            self._write(
++                self._hidden_indices(hidden_base, positions),
++                fresh,
++                valid[:, :, None],
++                self.hidden_sink,
++            )
++        return self.output
++
++    def commit(self, states, limits):
++        # CPU bookkeeping only, after the replay was successfully enqueued.
++        for state, limit in zip(states, limits):
++            for head in state.heads[:limit]:
++                self.heads.processed_positions += state.length - head.valid
++                self.heads.reused_positions += head.valid
++                head.valid = state.length
++
++
++class NPUCapture:
++    """One serial auxiliary pool, independent of target ACLGraphWrapper state.
++
++    Graphs have no persistent intermediates in this pool: metadata, outputs,
++    weights and arena all live outside it. A replay's output must be consumed on
++    the current stream before another replay. No cross-stream graph execution.
++    """
++
++    def __init__(self):
++        self.pool = torch.npu.graph_pool_handle()
++
++    def capture(self, program):
++        # Startup only; warm lazy Torch/NPU kernels before graph recording.
++        stream = torch.npu.Stream()
++        stream.wait_stream(torch.npu.current_stream())
++        with torch.npu.stream(stream):
++            for _ in range(2):
++                program.run()
++        torch.npu.current_stream().wait_stream(stream)
++        torch.npu.synchronize()
++        graph = torch.npu.NPUGraph()
++        with torch.npu.graph(graph, pool=self.pool):
++            program.run()
++        torch.npu.synchronize()
++        # Hold the graph itself; its bound replay method keeps it alive.
++        return graph.replay
++
++
++class MTPGraphs:
++    def __init__(self, options, heads, arena, embedding, logits):
++        self.options, self.heads, self.arena = options, heads, arena
++        self.embedding, self.logits = embedding, logits
++        self.entries, self.stats = {}, Counter()
++        self.ready = False
++        self.capture_backend = None
++        self.reserved_bytes = 0
++
++    @torch.inference_mode()
++    def prepare(self, capture=None):
++        if self.ready:
++            return
++        if self.arena.leased:
++            raise RuntimeError("MTP graph capture must precede live requests")
++        if capture is None:
++            if self.arena.storage.device.type != "npu":
++                raise RuntimeError("MTP full graph capture requires an NPU worker")
++            capture = NPUCapture()
++        self.capture_backend = capture
++        is_npu = self.arena.storage.device.type == "npu"
++        if is_npu:
++            torch.npu.synchronize()
++            torch.npu.empty_cache()
++        reserved_before = torch.npu.memory_reserved() if is_npu else 0
++        before = self.heads.processed_positions, self.heads.reused_positions
++        start_time = perf_counter()
++        self.arena.storage.zero_()
++        states = []
++        try:
++            for _ in range(self.options.max_batch):
++                states.append(self.arena.acquire())
++            # Largest first to reuse temporary pool allocations. Live graph
++            # inputs/outputs are deliberately outside that shared pool.
++            for queries in reversed(self.options.queries):
++                for count in range(self.options.max_batch, 0, -1):
++                    warm = states[:count]
++                    for state in warm:
++                        state.length = self.options.context
++                        for head in state.heads:
++                            head.valid = self.options.context - queries
++                    program = FixedMTPProgram(
++                        self.heads,
++                        self.arena,
++                        self.embedding,
++                        self.logits,
++                        batch_size=count,
++                        query_size=queries,
++                        context_size=self.options.context,
++                    )
++                    program.stage(
++                        warm,
++                        [[0] * (state.length + 1) for state in warm],
++                        [self.heads.num_heads] * count,
++                    )
++                    replay = capture.capture(program)
++                    self.entries[count, queries] = program, replay
++        finally:
++            for state in states:
++                self.arena.release(state)
++            self.heads.processed_positions, self.heads.reused_positions = before
++        self.ready = True
++        if is_npu:
++            torch.npu.synchronize()
++            # Release ordinary warmup cache, retaining the live private pool
++            # and graph buffers. Reserve their full delta conservatively.
++            torch.npu.empty_cache()
++            self.reserved_bytes = max(0, torch.npu.memory_reserved() - reserved_before)
++        logger.info(
++            "ASR_MTP_GRAPH_READY graphs=%d max_batch=%d query_sizes=%s context=%d "
++            "capture_ms=%.2f reserved_mib=%.2f",
++            len(self.entries),
++            self.options.max_batch,
++            self.options.queries,
++            self.options.context,
++            (perf_counter() - start_time) * 1000,
++            self.reserved_bytes / 1024**2,
++        )
++
++    @torch.inference_mode()
++    def propose(self, states, inputs, limits):
++        if not self.ready:
++            raise RuntimeError("MTP graphs were not prepared during startup profiling")
++        if not states or len(states) > self.options.max_batch:
++            self.stats["miss_batch"] += 1
++            return None
++        if max(limits) != self.heads.num_heads:
++            self.stats["miss_budget"] += 1
++            return None
++        if max(state.length for state in states) > self.options.context:
++            self.stats["miss_context"] += 1
++            return None
++        fresh = max(
++            state.length - head.valid
++            for state, limit in zip(states, limits)
++            for head in state.heads[:limit]
++        )
++        queries = next((q for q in self.options.queries if fresh <= q), None)
++        if queries is None:
++            self.stats["miss_query"] += 1
++            return None
++        program, replay = self.entries[len(states), queries]
++        program.stage(states, inputs, limits)
++        replay()
++        program.commit(states, limits)
++        self.stats["replays"] += 1
++        self.stats["requests"] += len(states)
++        if self.stats["replays"] == 1:
++            logger.info(
++                "ASR_MTP_GRAPH_REPLAY batch=%d query=%d context=%d heads=%d",
++                len(states),
++                queries,
++                self.options.context,
++                self.heads.num_heads,
++            )
++        return program.output
+--- a/vllm_ascend/spec_decode/asr_mtp_worker.py
++++ b/vllm_ascend/spec_decode/asr_mtp_worker.py
+@@ -1,15 +1,17 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """Worker-local external draft -> MTP handoff for the v0.23 sync runner."""
+-from collections import Counter
+ import hashlib
+ import logging
++from collections import Counter
+ from pathlib import Path
+
+ import torch
+
+ try:
++    from .asr_mtp_graph import MTPGraphs, graph_options, validate_graph_runner
+     from .asr_mtp_heads import BatchedMTPHeads, CacheArena
+ except ImportError:
++    from asr_mtp_graph import MTPGraphs, graph_options, validate_graph_runner
+     from asr_mtp_heads import BatchedMTPHeads, CacheArena
+
+ logger = logging.getLogger(__name__)
+@@ -24,11 +26,14 @@
+     return marker
+
+
+-def query_buckets(states, limits):
++def query_buckets(states, limits, graphs=None):
+     buckets = {}
+     for i, (state, limit) in enumerate(zip(states, limits)):
+         span = max(state.length - head.valid for head in state.heads[:limit])
+-        buckets.setdefault((span - 1).bit_length(), []).append(i)
++        graph_query = (next((q for q in graphs.options.queries if span <= q), None)
++                       if graphs is not None and state.length <= graphs.options.context else None)
++        key = ('graph', graph_query) if graph_query is not None else ('eager', (span - 1).bit_length())
++        buckets.setdefault(key, []).append(i)
+     return buckets
+
+
+@@ -43,12 +48,13 @@
+
+
+ class MTPWorker:
+-    def __init__(self, runner, heads, arena, embedding, logits, eos):
++    def __init__(self, runner, heads, arena, embedding, logits, eos, *, graphs=None):
+         self.runner, self.heads, self.arena = runner, heads, arena
+         self.embedding, self.logits, self.eos = embedding, logits, set(eos)
+         self.states, self.disabled = {}, {}
+         self.legacy_submitted = set()
+         self.stats = Counter(target_forwards=0)
++        self.graphs, self.profiled = graphs, False
+
+     def finish(self, request_ids):
+         for req_id in request_ids:
+@@ -90,6 +96,13 @@
+     def profile(self):
+         if self.states or self.arena.leased:
+             raise RuntimeError('MTP memory profiling must precede live requests')
++        if self.profiled:
++            return
++        # Graph buffers must already be resident when the eager fallback's
++        # activation peak is measured. Private pool reservation is accounted
++        # separately by the startup-only worker memory hook.
++        if self.graphs is not None:
++            self.graphs.prepare()
+         before = self.heads.processed_positions, self.heads.reused_positions
+         states = []
+         try:
+@@ -108,6 +121,7 @@
+             for state in states:
+                 self.arena.release(state)
+             self.heads.processed_positions, self.heads.reused_positions = before
++        self.profiled = True
+
+     @torch.inference_mode()
+     def propose(self, sampled, scheduler_output, hidden):
+@@ -184,13 +198,22 @@
+             indices.append(i)
+         if states:
+             before = self.heads.processed_positions
+-            buckets = query_buckets(states, limits)
++            buckets = query_buckets(states, limits, self.graphs)
+             drafts = torch.zeros((len(states), self.heads.num_heads),
+                                  device=states[0].target.device, dtype=torch.long)
+             for group in buckets.values():
+-                drafts[group] = self.heads.propose(
+-                    [states[i] for i in group], [inputs[i] for i in group],
+-                    self.embedding, self.logits, [limits[i] for i in group])
++                batch_states = [states[i] for i in group]
++                batch_inputs = [inputs[i] for i in group]
++                batch_limits = [limits[i] for i in group]
++                proposal = (None if self.graphs is None else
++                            self.graphs.propose(batch_states, batch_inputs, batch_limits))
++                if proposal is None:
++                    proposal = self.heads.propose(batch_states, batch_inputs,
++                        self.embedding, self.logits, batch_limits)
++                    self.stats['eager_head_batches'] += 1
++                else:
++                    self.stats['graph_head_batches'] += 1
++                drafts[group] = proposal
+             rows = drafts.tolist()  # One device-to-host boundary for the whole batch.
+             mtp_tokens = 0
+             for i, row, limit in zip(indices, rows, limits):
+@@ -208,8 +231,11 @@
+             self.stats['head_batches'] += len(buckets)
+             self.stats['draft_tokens'] += mtp_tokens
+             self.stats['head_positions'] += self.heads.processed_positions - before
+-            logger.debug('ASR_MTP_STEP requests=%d draft_tokens=%d new_head_positions=%d',
+-                         len(states), mtp_tokens, self.heads.processed_positions - before)
++            logger.debug('ASR_MTP_STEP requests=%d draft_tokens=%d new_head_positions=%d '
++                         'graph_batches_total=%d eager_batches_total=%d graph_stats=%s',
++                         len(states), mtp_tokens, self.heads.processed_positions - before,
++                         self.stats['graph_head_batches'], self.stats['eager_head_batches'],
++                         self.graphs.stats if self.graphs is not None else {})
+         return outputs
+
+
+@@ -257,7 +283,8 @@
+ def load_worker(runner, target, settings):
+     validate_engine(runner)
+     allowed = {'checkpoint', 'num_heads', 'max_context_tokens', 'cache_mib', 'max_requests',
+-               'verify_base_signature'}
++               'verify_base_signature', 'graph_mode', 'graph_context_tokens',
++               'graph_query_sizes', 'graph_max_batch_size'}
+     if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
+         raise ValueError('invalid additional_config.asr_mtp settings')
+     for name, default in (('num_heads', 5), ('max_context_tokens', 512),
+@@ -290,14 +317,25 @@
+     slots = min(settings.get('max_requests', 64), settings.get('cache_mib', 512) * 1024 ** 2 // per_slot)
+     if slots < 1:
+         raise ValueError('asr_mtp.cache_mib cannot hold one request slot')
++    options = graph_options(settings, context=cap, slots=slots,
++                            max_batch=getattr(runner, 'max_num_reqs', slots))
++    if options is not None:
++        validate_graph_runner(runner)
+     arena = CacheArena(text, heads, max_context=cap, slots=slots,
+-                       device=runner.device, dtype=runner.dtype)
++                       device=runner.device, dtype=runner.dtype,
++                       scratch_elements=options.scratch_elements(text) if options else 0)
+     language = target.get_language_model() if hasattr(target, 'get_language_model') else target.language_model
+     eos = getattr(text, 'eos_token_id', None)
+     eos = set(eos if isinstance(eos, (tuple, list)) else [eos]) - {None}
+-    worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits, eos)
++    graphs = (MTPGraphs(options, model, arena, language.embed_input_ids, language.compute_logits)
++              if options is not None else None)
++    worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits,
++                       eos, graphs=graphs)
+     logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
+-                'verify_base_signature=%s',
++                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f',
+                 heads, cap, slots, arena.storage.numel() * arena.storage.element_size() / 1024 ** 2,
+-                settings['checkpoint'], settings.get('verify_base_signature', False))
++                settings['checkpoint'], settings.get('verify_base_signature', False),
++                settings.get('graph_mode', 'off'),
++                (arena.graph_storage.numel() - arena.scratch_offset) *
++                arena.storage.element_size() / 1024 ** 2)
+     return worker
+--- a/vllm_ascend/patch/worker/patch_external_draft_mtp.py
++++ b/vllm_ascend/patch/worker/patch_external_draft_mtp.py
+@@ -8,13 +8,15 @@
+ replaced. Without additional_config.asr_mtp, every original method is retained.
+ """
+ import inspect
++import logging
+
++from vllm_ascend.spec_decode.asr_mtp_worker import load_worker, request_enabled
+ from vllm_ascend.spec_decode.external_draft_proposer import AscendExternalDraftProposer
+-from vllm_ascend.spec_decode.asr_mtp_worker import request_enabled, load_worker
+ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+ EXTERNAL_CLASS = ('vllm_ascend.spec_decode.external_draft_proposer.'
+                   'AscendExternalDraftProposer')
++logger = logging.getLogger(__name__)
+
+
+ class AscendExternalDraftMTPProposer(AscendExternalDraftProposer):
+@@ -27,7 +29,8 @@
+         self.online = load_worker(self.runner, target, self.settings)
+
+     def dummy_run(self, *args, is_profile=False, **kwargs):
+-        # Target capture covers the decoder; auxiliary heads remain eager.
++        # Independent MTP graphs are prepared once during memory profiling,
++        # before target KV sizing. Never capture inside target graph dummy runs.
+         if is_profile and self.online is not None:
+             self.online.profile()
+
+@@ -125,4 +128,34 @@
+     cls._asr_mtp_patch_installed = True
+
+
++def install_worker_memory_hook(cls):
++    """Called after NPUWorker is defined; only changes startup KV accounting."""
++    if getattr(cls, '_asr_mtp_graph_memory_installed', False):
++        return
++    original = cls.determine_available_memory
++    if tuple(inspect.signature(original).parameters) != ('self',):
++        raise RuntimeError('ASR MTP graph memory hook requires the v0.23 worker API')
++
++    def determine(self):
++        available = original(self)
++        drafter = getattr(self.model_runner, 'drafter', None)
++        online = drafter.online if isinstance(drafter, AscendExternalDraftMTPProposer) else None
++        graphs = getattr(online, 'graphs', None)
++        if graphs is None or not graphs.ready:
++            return available
++        reserve = graphs.reserved_bytes
++        manual = bool(self.cache_config.kv_cache_memory_bytes)
++        logger.info('ASR_MTP_GRAPH_MEMORY reserved_mib=%.2f manual_kv=%s',
++                    reserve / 1024 ** 2, manual)
++        if manual:
++            return available  # Explicit user KV bytes remain authoritative.
++        if available <= reserve:
++            raise ValueError('insufficient automatic KV budget after reserving ASR MTP graphs')
++        self.available_kv_cache_memory_bytes = available - reserve
++        return self.available_kv_cache_memory_bytes
++
++    cls.determine_available_memory = determine
++    cls._asr_mtp_graph_memory_installed = True
++
++
+ install()
