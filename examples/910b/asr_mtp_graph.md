@@ -92,6 +92,41 @@ rg -n 'ASR_MTP_CONFIG|ASR_MTP_GRAPH_READY|ASR_MTP_GRAPH_MEMORY|ASR_MTP_GRAPH_REP
 `ASR_MTP_STEP` reports cumulative graph/eager batches and shape/budget misses.
 Auxiliary replays are not included in the target decoder `CUDAGraph Stats`.
 
+## Collect context miss lengths
+
+For a service that already installed the auxiliary graph version, the focused
+diagnostic upgrade changes only `vllm_ascend/spec_decode/asr_mtp_graph.py`:
+
+```bash
+git apply --check examples/910b/asr_mtp_context_diagnostics_v023.patch
+git apply examples/910b/asr_mtp_context_diagnostics_v023.patch
+```
+
+The cumulative `asr_mtp_graph_v023.patch` above already includes this diagnostic;
+do not apply both patches consecutively. If a patch check fails, regenerate
+against the actual installed source using the exporter. Restart workers normally
+after updating; no new service parameter is needed.
+
+Each context fallback emits an INFO record:
+
+```text
+ASR_MTP_CONTEXT_MISS batch_size=2 max_context=180 context_limit=128 max_fresh_query=79 query_limit=128 miss_count=57
+```
+
+`max_context` is the largest hidden-history length in this auxiliary batch,
+including prompt positions. `max_fresh_query` is the largest newly required span
+over active heads; it may come from a different row. `batch_size` counts requests
+in the batch, and `miss_count` matches this worker's cumulative context-miss
+counter. The limits report the current graph capacities.
+
+```bash
+rg -n 'ASR_MTP_GRAPH_READY|ASR_MTP_CONTEXT_MISS' "$LOG"
+```
+
+Only existing CPU integer metadata is read, without tensor-to-host copies or
+device synchronization. No graph selection, cache state or fallback precedence
+changes. If INFO is disabled, the extra diagnostic query scan is skipped.
+
 ## Device test
 
 After applying the patch, run the unit/integration tests against the installed
