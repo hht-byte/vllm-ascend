@@ -446,8 +446,27 @@ class MTPGraphs:
         if max(limits) != self.heads.num_heads:
             self.stats["miss_budget"] += 1
             return None
-        if max(state.length for state in states) > self.options.context:
+        max_context = max(state.length for state in states)
+        if max_context > self.options.context:
             self.stats["miss_context"] += 1
+            if logger.isEnabledFor(logging.INFO):
+                # CPU metadata only; do not fetch tensor values or synchronize
+                # the device just to diagnose an eager fallback.
+                max_fresh_query = max(
+                    state.length - head.valid
+                    for state, limit in zip(states, limits)
+                    for head in state.heads[:limit]
+                )
+                logger.info(
+                    "ASR_MTP_CONTEXT_MISS batch_size=%d max_context=%d context_limit=%d "
+                    "max_fresh_query=%d query_limit=%d miss_count=%d",
+                    len(states),
+                    max_context,
+                    self.options.context,
+                    max_fresh_query,
+                    max(self.options.queries),
+                    self.stats["miss_context"],
+                )
             return None
         fresh = max(
             state.length - head.valid

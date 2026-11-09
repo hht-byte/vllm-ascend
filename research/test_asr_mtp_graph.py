@@ -184,11 +184,16 @@ class GraphDispatchTests(TinyMTPFixture, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "310P"):
             validate_graph_runner(runner)
 
-    def make_graphs(self):
+    def make_graphs(self, *, context=16):
         from asr_mtp_graph import MTPGraphs, graph_options
 
         options = graph_options(
-            {"graph_mode": "full", "graph_query_sizes": [8], "graph_max_batch_size": 2},
+            {
+                "graph_mode": "full",
+                "graph_query_sizes": [8],
+                "graph_max_batch_size": 2,
+                "graph_context_tokens": context,
+            },
             context=16,
             slots=3,
             max_batch=3,
@@ -196,6 +201,41 @@ class GraphDispatchTests(TinyMTPFixture, unittest.TestCase):
         graphs = MTPGraphs(options, self.fixed, self.new, self.embed, self.logits)
         graphs.prepare(CPUCapture())
         return graphs
+
+    def test_context_miss_reports_batch_envelope_without_mutating_cache(self):
+        for state in self.b:
+            self.new.release(state)
+        graphs = self.make_graphs(context=8)
+        states = [self.new.acquire(), self.new.acquire()]
+        # Largest context and largest active fresh query come from different
+        # rows. Inactive heads on the second row must not inflate the query.
+        for state, length, starts in zip(states, [12, 15], [[8, 7, 6], [12, 0, 0]]):
+            state.length = length
+            for head, start in zip(state.heads, starts):
+                head.valid = start
+        before = self.new.storage.clone()
+        for count in (1, 2):
+            with self.assertLogs("asr_mtp_graph", level="INFO") as caught:
+                self.assertIsNone(graphs.propose(states, [[3] * 13, [4] * 16], [3, 1]))
+            fields = caught.records[0].getMessage().split()
+            self.assertEqual(fields[0], "ASR_MTP_CONTEXT_MISS")
+            self.assertEqual(
+                dict(part.split("=", 1) for part in fields[1:]),
+                {
+                    "batch_size": "2",
+                    "max_context": "15",
+                    "context_limit": "8",
+                    "max_fresh_query": "6",
+                    "query_limit": "8",
+                    "miss_count": str(count),
+                },
+            )
+        self.t.testing.assert_close(self.new.storage, before, equal_nan=True)
+        self.assertEqual([h.valid for h in states[0].heads], [8, 7, 6])
+        self.assertEqual([h.valid for h in states[1].heads], [12, 0, 0])
+        self.assertEqual(graphs.stats["miss_context"], 2)
+        self.assertEqual(graphs.stats["replays"], 0)
+        self.assertEqual(graphs.stats["miss_query"], 0)
 
     def test_prepared_replay_matches_eager_with_reordered_arena_slots(self):
         # Capture is startup-only and refuses to overwrite leased live slots.

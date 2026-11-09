@@ -128,6 +128,22 @@ ASR_MTP_GRAPH_REPLAY batch=... query=... context=... heads=...
 
 `ASR_MTP_STEP` DEBUG 日志另给出累计 graph/eager batch 数和 `miss_batch`、`miss_query`、`miss_context`、`miss_budget`。辅助图不会加入目标 decoder 的 `CUDAGraph Stats` 统计；应结合这些日志和 profiling 的辅助 LM head / attention static 事件确认。图能减少下发开销，不会消除 LM head 的矩阵计算。
 
+每次由 context 超限回退时，新增一条 INFO 日志，无需打开 DEBUG：
+
+```text
+ASR_MTP_CONTEXT_MISS batch_size=2 max_context=180 context_limit=128 max_fresh_query=79 query_limit=128 miss_count=57
+```
+
+`max_context` 是本批最大 hidden 历史长度，`max_fresh_query` 是本批有效 head 的最大新增补算长度，两者可能来自不同请求；`batch_size` 是该辅助批次的请求数。`context_limit` / `query_limit` 给出当前图上限，`miss_count` 与同一 worker 的累计 `miss_context` 对应。历史长度包含 prompt；新增 query 不是输出草稿数量，也不是 `new_head_positions` 的跨 head 总和。
+
+该日志只在原有 context miss 分支记录，长度与 head 有效前缀均为已有 CPU 整数，不读取设备张量、不新增设备同步，也不改变图选择、回退优先级或缓存。INFO 被禁用时不额外计算诊断用的最大 query。
+
+```bash
+rg -n 'ASR_MTP_GRAPH_READY|ASR_MTP_CONTEXT_MISS' "$LOG"
+```
+
+已部署辅助图的服务可更新单个 `vllm_ascend/spec_decode/asr_mtp_graph.py`，或针对实际安装目录使用前述导出器生成升级差异。按原方式重启 worker 后生效，不需要修改服务参数。
+
 若使用 `--mtp-graph-mode full/off`，在入口先将其值写入上述 `graph_mode` 字段，再走原来的工厂和 `mtp_engine_config()` 调用；不向这些调用新增图参数。入口映射示例见 [服务启动接线](streaming_mtp_service.md)。
 
 CPU 检查覆盖数学路径和生命周期，不能证明 NPU 捕获和时延。设备上的集成测试会实际调用 `torch.npu.NPUGraph`，可在已安装 Torch-NPU 的环境执行：
