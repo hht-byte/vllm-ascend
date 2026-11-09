@@ -14,32 +14,46 @@ from qwen_asr.inference.streaming_mtp_config import add_mtp_args
 add_mtp_args(parser)
 ```
 
-得到四个参数：`args.mtp_enabled` 默认 `False`；`args.prespec_mtp_enabled` 默认 `True`；`args.mtp_checkpoint` 和 `args.mtp_graph_mode` 默认 `None`。后者继承引擎字典的图设置（缺省 off），可用 `--mtp-graph-mode full/off` 显式覆盖。使用 `--no-mtp`、`--no-prespec-mtp` 关闭，不能写 `--mtp false`。如果入口已有这些参数，应替换旧定义，避免重复注册。
+三个原有服务参数保持不变：`args.mtp_enabled` 默认 `False`；`args.prespec_mtp_enabled` 默认 `True`；`args.mtp_checkpoint` 默认 `None`。使用 `--no-mtp`、`--no-prespec-mtp` 关闭，不能写 `--mtp false`。如果入口已有这些参数，沿用已有定义，避免重复注册。
 
-在现有工厂调用中追加，原有参数保留：
+辅助图开关统一写入既有的 `base_config["additional_config"]["asr_mtp"]`，不新增 `AsyncLLM()` 参数。需要开启时，在现有工厂调用之前合并配置；其余参数保留：
 
 ```python
+additional_config = dict(base_config.get("additional_config") or {})
+mtp_settings = dict(additional_config.get("asr_mtp") or {})
+mtp_settings["graph_mode"] = "full"  # "off" 关闭辅助图；省略时默认 off
+additional_config["asr_mtp"] = mtp_settings
+base_config["additional_config"] = additional_config
+
 model = Qwen3ASRModelAsync.AsyncLLM(
     **base_config,
     # 保留现有 prespec_mode、prespec_launch_sec 等关键字。
     mtp_enabled=args.mtp_enabled,
     prespec_mtp_enabled=args.prespec_mtp_enabled,
     mtp_checkpoint=args.mtp_checkpoint,
-    mtp_graph_mode=args.mtp_graph_mode,
 )
 ```
 
 这三个关键字不能同时存在于 `base_config` 中；不要把 `vars(args)` 整体传给引擎。
 
+如果使用新版 parser 已注册的 `--mtp-graph-mode full/off`，将上例的 `mtp_settings["graph_mode"] = "full"` 这一行替换为：
+
+```python
+mtp_graph_mode = getattr(args, "mtp_graph_mode", None)
+if mtp_graph_mode is not None:
+    mtp_settings["graph_mode"] = mtp_graph_mode
+```
+
+未提供 CLI 值时保留字典中的设置；没有已有设置时，由 worker 使用默认 off。图参数到此就转成字典字段，不再向下增加形参。
+
 ## 2. AsyncLLM 显式接收参数，在创建引擎前处理配置
 
-在 `Qwen3ASRModelAsync.AsyncLLM()` 的现有签名中、`**kwargs` 之前增加：
+`Qwen3ASRModelAsync.AsyncLLM()` 继续显式接收原有三个服务参数；已有定义时沿用，不重复增加：
 
 ```python
 mtp_enabled: bool = False,
 prespec_mtp_enabled: bool = True,
 mtp_checkpoint: str | None = None,
-mtp_graph_mode: str | None = None,
 ```
 
 在原来的 `AsyncEngineArgs(...)` **之前**加入：
@@ -53,7 +67,6 @@ kwargs = mtp_engine_config(
     kwargs,
     mtp_enabled=mtp_enabled,
     mtp_checkpoint=mtp_checkpoint,
-    mtp_graph_mode=mtp_graph_mode,
 )
 ```
 
@@ -75,7 +88,7 @@ base_config["speculative_config"] = {
 }
 ```
 
-`mtp_graph_mode` 只在这条启动链路传给 `mtp_engine_config()`，由它写入 `additional_config["asr_mtp"]["graph_mode"]`；不要继续作为 `AsyncEngineArgs`、请求 SamplingParams 或 `enable_prespec()` 的关键字传入。若不便修改服务器工厂签名，可仅在现有引擎字典中设置 `graph_mode="full"`。只增加 parser 参数而未完成上述工厂转发，不会开启辅助图。
+本文统一使用现有接口 `mtp_engine_config(base_config, *, mtp_enabled=False, mtp_checkpoint=None)`。它会复制并保留 `asr_mtp` 中已有的 `graph_mode`、query/batch 容量等字段，因此你当前的函数可以保持原样。不要新增 `mtp_graph_mode` 工厂参数，也不要把该参数单独传给 `AsyncEngineArgs`、请求 SamplingParams 或 `enable_prespec()`。只增加 parser 参数而未先写入配置字典，不会开启辅助图。
 
 ## 3. 实例初始化：包括 prespec-mode off
 

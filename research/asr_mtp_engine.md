@@ -91,14 +91,23 @@ base_config["enable_prefix_caching"] = False
 
 本次支持 910B 的 `NPUWorker` 显存定容路径。`310P-graph` 是交付分支名；310P 的 `NPUWorker310` 覆盖了显存计量方法，当前会显式拒绝其辅助 `graph_mode=full`，避免漏计图池。其原有 MTP eager 路径不受影响。
 
-在原有 `additional_config["asr_mtp"]` 中追加：
+沿用现有 `mtp_engine_config(base_config, *, mtp_enabled=False, mtp_checkpoint=None)` 接口。前文已初始化 `base_config["additional_config"]["asr_mtp"]`；在调用该函数之前追加图配置：
 
 ```python
-"graph_mode": "full",          # 默认 off；off 恢复原 MTP eager 实现
-"graph_max_batch_size": 8,      # 精确 batch 1..8，避免 padding LM head
-"graph_query_sizes": [8, 64],   # 分开处理增量 fresh query 与首次 hidden 历史
-"graph_context_tokens": 128,   # KV/hidden 容量，不是当前真实序列长度
+base_config["additional_config"]["asr_mtp"].update({
+    "graph_mode": "full",          # 默认 off；off 恢复原 MTP eager 实现
+    "graph_max_batch_size": 8,      # 精确 batch 1..8，避免 padding LM head
+    "graph_query_sizes": [8, 64],   # 分开处理增量 fresh query 与首次 hidden 历史
+    "graph_context_tokens": 128,   # KV/hidden 容量，不是当前真实序列长度
+})
+base_config = mtp_engine_config(
+    base_config,
+    mtp_enabled=mtp_enabled,
+    mtp_checkpoint=mtp_checkpoint,
+)
 ```
+
+现有函数会保留这些字典字段，CLI checkpoint 仍只覆盖路径，MTP 总开关 OFF 仍移除整个 `asr_mtp`。无需修改函数签名，也无需给服务工厂增加 `mtp_graph_mode`。
 
 完整辅助链在一张图中执行：逐 head 的 shifted embedding、融合、attention/MLP、共享目标 LM head、argmax，以及辅助 KV/hidden 回写。目标 verifier、目标 KV、音频 encoder 和 scheduler 保持原流程。不同请求的真实长度、每层有效前缀、drive token 和草稿预算都是设备输入，不会按 request ID 或精确序列长度建图。
 
@@ -119,7 +128,7 @@ ASR_MTP_GRAPH_REPLAY batch=... query=... context=... heads=...
 
 `ASR_MTP_STEP` DEBUG 日志另给出累计 graph/eager batch 数和 `miss_batch`、`miss_query`、`miss_context`、`miss_budget`。辅助图不会加入目标 decoder 的 `CUDAGraph Stats` 统计；应结合这些日志和 profiling 的辅助 LM head / attention static 事件确认。图能减少下发开销，不会消除 LM head 的矩阵计算。
 
-服务侧新可选参数为 `--mtp-graph-mode full/off`，完整转发见 [服务启动接线](streaming_mtp_service.md)。不更新服务器工厂签名时，也可直接修改上面的既有引擎 `additional_config`，无需新增服务形参。MTP 总开关 OFF 始终移除整个辅助配置。
+若使用 `--mtp-graph-mode full/off`，在入口先将其值写入上述 `graph_mode` 字段，再走原来的工厂和 `mtp_engine_config()` 调用；不向这些调用新增图参数。入口映射示例见 [服务启动接线](streaming_mtp_service.md)。
 
 CPU 检查覆盖数学路径和生命周期，不能证明 NPU 捕获和时延。设备上的集成测试会实际调用 `torch.npu.NPUGraph`，可在已安装 Torch-NPU 的环境执行：
 
