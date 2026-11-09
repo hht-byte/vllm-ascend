@@ -35,13 +35,13 @@ Keep the existing checkpoint, head count, service MTP flags, Prespec settings,
 target graph mode and load identical. Set in the existing engine dictionary:
 
 ```python
-additional_config["asr_mtp"]["graph_mode"] = "full"  # "off" for baseline
+base_config["additional_config"]["asr_mtp"]["graph_mode"] = "full"  # "off" for baseline
 ```
 
 Optional capacities (defaults shown):
 
 ```python
-additional_config["asr_mtp"].update({
+base_config["additional_config"]["asr_mtp"].update({
     "graph_max_batch_size": 8,
     "graph_query_sizes": [8, 64],
     "graph_context_tokens": 128,
@@ -57,11 +57,22 @@ shortened maximum head budget use the original eager path. There is no online
 capture or deliberate request batching wait. Increasing capacities adds startup
 time, scratch/static memory, graph-pool memory and possibly padded computation.
 
-The master MTP switch remains authoritative. Updated service helpers optionally
-expose `--mtp-graph-mode full/off`; that CLI option must be forwarded through the
-service factory to `mtp_engine_config(..., mtp_graph_mode=...)`. Setting only the
-parser flag without forwarding it does nothing. The dictionary setting above
-works through the existing additional_config path without a new factory argument.
+Keep the existing configuration function and factory interface unchanged. Set
+the dictionary fields above before calling the original function:
+
+```python
+base_config = mtp_engine_config(
+    base_config,
+    mtp_enabled=mtp_enabled,
+    mtp_checkpoint=mtp_checkpoint,
+)
+```
+
+This existing function preserves the graph settings while applying the master
+MTP switch and checkpoint override. No new graph argument is needed in the
+factory or this call. If using the optional `--mtp-graph-mode full/off` parser
+flag, map its value to `base_config["additional_config"]["asr_mtp"]["graph_mode"]`
+at the entry point first. Setting only the parser flag does not enable graphs.
 
 Graphs are prepared during memory profiling before eager fallback profiling and
 KV sizing. A startup-only memory hook conservatively subtracts the retained
