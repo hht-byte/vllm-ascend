@@ -127,6 +127,40 @@ Only existing CPU integer metadata is read, without tensor-to-host copies or
 device synchronization. No graph selection, cache state or fallback precedence
 changes. If INFO is disabled, the extra diagnostic query scan is skipped.
 
+## Row cache transfer upgrade
+
+For an installed auxiliary graph implementation that already includes the
+context diagnostics, apply only this focused upgrade:
+
+```bash
+git apply --check examples/910b/asr_mtp_cache_rows_v023.patch
+git apply examples/910b/asr_mtp_cache_rows_v023.patch
+```
+
+The cumulative graph patch already includes this upgrade. Do not apply both
+consecutively, or apply the older diagnostics-only patch afterward. For a
+different installed version, regenerate against the actual engine with the
+exporter. Worker restart is required; no new service flag is introduced.
+
+The graph program preserves the arena layout, graph keys and KV semantics. It
+addresses rows of `gcd(hidden_size, head_dim)` elements instead of scalar
+addresses. Reads use 2D row `index_select`; NPU writes explicitly use
+`torch_npu.npu_scatter_nd_update_`, avoiding the legacy per-index host fallback
+of generic `index_copy_`. An unavailable device update API fails graph
+initialization. CPU parity tests use row `index_copy_`.
+
+The configured final head no longer stores its unused hidden output or updates
+the local token sequence. Its KV and valid lengths remain available for later
+rounds. A five-head graph has 14 row cache updates and 4 token scatters, replacing
+15 scalar cache scatters and 5 token scatters. The 15 cache reads keep their
+count but use compact row indices. KV update/attention-input fusion and the
+eager fallback implementation are unchanged.
+
+Keep graph parameters and load fixed when comparing this upgrade. Profile
+`aclnnScatterNdUpdate` and the row gathers, and check complete target outputs,
+acceptance, commit P95/P99 and memory. Reduced index counts are not a measured
+latency gain. The device replay test below must run without being skipped.
+
 ## Device test
 
 After applying the patch, run the unit/integration tests against the installed
