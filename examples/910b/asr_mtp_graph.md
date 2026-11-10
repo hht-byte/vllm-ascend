@@ -161,6 +161,68 @@ Keep graph parameters and load fixed when comparing this upgrade. Profile
 acceptance, commit P95/P99 and memory. Reduced index counts are not a measured
 latency gain. The device replay test below must run without being skipped.
 
+## Packed token graphs
+
+To upgrade an installed row-cache graph implementation, apply only:
+
+```bash
+git apply --check examples/910b/asr_mtp_token_graph_v023.patch
+git apply examples/910b/asr_mtp_token_graph_v023.patch
+```
+
+The cumulative graph patch already includes this upgrade. Other installed
+versions should use the exporter against their actual checkout. Restart workers
+normally after applying; pulling this branch alone does not install the modules.
+
+Set `graph_token_sizes` in the existing settings before calling the unchanged
+three-argument `mtp_engine_config` service factory:
+
+```python
+additional = dict(base_config.get("additional_config") or {})
+mtp_settings = dict(additional.get("asr_mtp") or {})
+mtp_settings.update({
+    "graph_mode": "full",
+    "graph_token_sizes": [8, 32, 64, 128, 256, 512],
+    "graph_max_batch_size": 8,
+    "graph_context_tokens": 128,
+})
+additional["asr_mtp"] = mtp_settings
+base_config["additional_config"] = additional
+base_config = mtp_engine_config(
+    base_config,
+    mtp_enabled=mtp_enabled,
+    mtp_checkpoint=mtp_checkpoint,
+)
+```
+
+Absent `graph_token_sizes`, the rectangular `(B,Q)` path remains available. When
+both settings are present, token buckets take precedence. Each token bucket
+captures one graph with fixed request and history capacities. For active heads,
+let `q[i,d] = length[i] - valid[i,d]`; inactive heads contribute zero. Select the
+smallest bucket covering `max_d sum_i q[i,d]`, not a sum over all heads. A
+6/80/45-fresh-token batch therefore fits one 256-token graph.
+
+Requests from the same target step are packed together regardless of per-request
+Q. Only the configured request/token limits split a packed batch; context and
+single-request token overflows retain eager fallbacks. Token capacity is
+independent of per-request context capacity and of the target FULL graph size.
+
+Packed projections and MLP use `[T,H]`. One segmented FIA TND attention per head
+isolates requests using staged cumulative Q/KV lengths, with graph task updates
+before replay. Fixed request-slot logits gather only each request's last hidden
+row; unused request slots still incur LM-head computation. Dummy Q/KV segments
+have equal lengths to avoid all-masked padded queries. Arena layout, row updates,
+rejection cropping and target verification are unchanged.
+
+The token NPU backend requires FP16/BF16, supported FIA head dimensions
+(currently 128/192), FIA out/max-workspace APIs and graph task updates. Workspace
+allocation is startup-only. Unsupported geometry may continue using the old
+rectangular graph or eager path. Compare acceptance, complete target outputs,
+step latency, commit P95/P99, queueing and reserved memory under equal load.
+Device capture/replay and performance have not been established on this host.
+Each replay performs one host task update per auxiliary head; this rebinding
+cost and fixed request-slot logits must be included in the performance comparison.
+
 ## Device test
 
 After applying the patch, run the unit/integration tests against the installed
@@ -169,6 +231,9 @@ modules (no checkpoint download or standalone HF replay):
 ```bash
 PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
   python -m unittest discover -s examples/910b/tests -p test_asr_mtp_graph.py -v
+
+PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
+  python -m unittest discover -s examples/910b/tests -p 'test_asr_mtp_token_*.py' -v
 ```
 
 The actual NPU test uses NPUGraph capture/replay with changed inputs, rejection,
