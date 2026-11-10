@@ -1,0 +1,684 @@
+--- a/vllm_ascend/spec_decode/asr_mtp_heads.py
++++ b/vllm_ascend/spec_decode/asr_mtp_heads.py
+@@ -10,6 +10,11 @@
+ import torch
+ from torch import nn
+ from torch.nn import functional as F
++
++try:
++    from .asr_mtp_fused import add_rms_norm, mlp_forward, project_qkv
++except ImportError:
++    from asr_mtp_fused import add_rms_norm, mlp_forward, project_qkv
+
+
+ @dataclass
+@@ -107,7 +112,7 @@
+         self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
+
+     def forward(self, hidden):
+-        return self.down_proj(F.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
++        return mlp_forward(self, hidden)
+
+
+ class Decoder(nn.Module):
+@@ -188,11 +193,12 @@
+                                            block.token_norm(token_embeddings)), -1))
+             normed = block.decoder.input_layernorm(fused)
+             attn = block.decoder.self_attn
+-            q = attn.q_norm(attn.q_proj(normed).view(count, queries, cfg.num_attention_heads,
++            q_raw, k_raw, v_raw = project_qkv(attn, normed)
++            q = attn.q_norm(q_raw.view(count, queries, cfg.num_attention_heads,
+                                                      cfg.head_dim)).transpose(1, 2)
+-            k = attn.k_norm(attn.k_proj(normed).view(count, queries, cfg.num_key_value_heads,
++            k = attn.k_norm(k_raw.view(count, queries, cfg.num_key_value_heads,
+                                                      cfg.head_dim)).transpose(1, 2)
+-            v = attn.v_proj(normed).view(count, queries, cfg.num_key_value_heads,
++            v = v_raw.view(count, queries, cfg.num_key_value_heads,
+                                         cfg.head_dim).transpose(1, 2)
+             # All three MRoPE axes in SequentialMTP use the same depth+anchor;
+             # their interleaving therefore reduces to ordinary default RoPE.
+@@ -216,9 +222,11 @@
+             attended = F.scaled_dot_product_attention(
+                 q, past_k.repeat_interleave(groups, 1), past_v.repeat_interleave(groups, 1),
+                 attn_mask=allowed[:, None], dropout_p=0.0, scale=cfg.head_dim ** -0.5)
+-            residual = fused + attn.o_proj(attended.transpose(1, 2).reshape(count, queries, -1))
+-            fresh = block.output_norm(residual + block.decoder.mlp(
+-                block.decoder.post_attention_layernorm(residual)))
++            normed_residual, residual = add_rms_norm(
++                block.decoder.post_attention_layernorm, fused,
++                attn.o_proj(attended.transpose(1, 2).reshape(count, queries, -1)))
++            fresh, _ = add_rms_norm(block.output_norm, residual,
++                                    block.decoder.mlp(normed_residual))
+             last = torch.stack([fresh[j, size - 1] for j, size in enumerate(sizes)])
+             predicted = logits(last).argmax(-1)
+             outputs[rows, depth - 1] = predicted
+--- /dev/null
++++ b/vllm_ascend/spec_decode/asr_mtp_fused.py
+@@ -0,0 +1,188 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Local, frozen MTP-head fusion without changing checkpoint parameter names.
++
++Call ``prepare_fused_heads`` once, after strict checkpoint loading, final
++device/dtype placement, and ``eval().requires_grad_(False)``. Packed buffers
++share storage with the original projection Parameters and are nonpersistent.
++Default ``load_state_dict(assign=False)`` continues to update those views;
++moving the model or replacing Parameters with ``assign=True`` afterwards is
++outside this startup contract. Prepare again from an unprepared model instead.
++
++Only NPU preparation imports torch_npu. CPU uses real Torch reference math,
++including packed projections, so checkpoint/aliasing tests need no NPU runtime.
++Native operations can round differently; device capture and ASR acceptance
++must still be checked on the service's torch-npu/CANN version.
++"""
++
++import importlib
++
++import torch
++from torch import nn
++from torch.nn import functional as F
++
++_NATIVE_APIS = ("npu_rms_norm", "npu_add_rms_norm", "npu_swiglu")
++_NORM_PATHS = (
++    "hidden_norm",
++    "token_norm",
++    "decoder.input_layernorm",
++    "decoder.self_attn.q_norm",
++    "decoder.self_attn.k_norm",
++    "decoder.post_attention_layernorm",
++    "output_norm",
++)
++
++
++class _FusedRMSNorm(nn.Module):
++    """Retain the checkpoint's RMSNorm weight; cache native dispatch at load."""
++
++    def __init__(self, original, native_ops):
++        super().__init__()
++        self.normalized_shape = original.normalized_shape
++        self.eps = original.eps
++        self.elementwise_affine = original.elementwise_affine
++        self.register_parameter("weight", original.weight)
++        self._mtp_native_ops = native_ops
++        self.train(original.training)
++
++    def forward(self, value):
++        if self._mtp_native_ops is None:
++            return F.rms_norm(value, self.normalized_shape, self.weight, self.eps)
++        epsilon = self.eps if self.eps is not None else torch.finfo(value.dtype).eps
++        return self._mtp_native_ops.npu_rms_norm(value, self.weight, epsilon)[0]
++
++
++def _projection_group(projections):
++    """Check everything before replacing any storage in the model."""
++    first = projections[0]
++    if not all(isinstance(module, nn.Linear) for module in projections):
++        raise ValueError("MTP fusion requires Linear projection modules")
++    if any(
++        module.in_features != first.in_features
++        or module.weight.device != first.weight.device
++        or module.weight.dtype != first.weight.dtype
++        or (module.bias is None) != (first.bias is None)
++        for module in projections
++    ):
++        raise ValueError("MTP fused projection geometry/device/dtype/bias differs")
++
++
++def _pack(module, prefix, projections):
++    # Frozen Parameters remain registered under their original names. Their
++    # data becomes a packed-storage view; no duplicate resident weights remain.
++    weight = torch.cat(
++        [projection.weight.detach() for projection in projections], dim=0
++    )
++    module.register_buffer(f"{prefix}_weight", weight, persistent=False)
++    offset = 0
++    for projection in projections:
++        stop = offset + projection.out_features
++        projection.weight.data = weight[offset:stop]
++        offset = stop
++    bias = None
++    if projections[0].bias is not None:
++        bias = torch.cat(
++            [projection.bias.detach() for projection in projections], dim=0
++        )
++        offset = 0
++        for projection in projections:
++            stop = offset + projection.out_features
++            projection.bias.data = bias[offset:stop]
++            offset = stop
++    module.register_buffer(f"{prefix}_bias", bias, persistent=False)
++
++
++@torch.no_grad()
++def prepare_fused_heads(model, *, enabled=True, native_ops=None):
++    """Pack frozen auxiliary heads once and install seven local Norms/head.
++
++    ``enabled=False`` leaves a fresh model completely unchanged. It does not
++    undo a model already prepared; use the startup switch on a fresh load.
++    ``native_ops`` is an optional API-compatible test backend. Production
++    dispatch is resolved and validated here, never during graph capture.
++    """
++    if type(enabled) is not bool:
++        raise TypeError("MTP native fusion enabled must be a bool")
++    if not enabled:
++        return False
++    if getattr(model, "_mtp_fused_prepared", False):
++        return True
++    if model.training or any(
++        parameter.requires_grad for parameter in model.parameters()
++    ):
++        raise ValueError("MTP native fusion requires eval mode and frozen Parameters")
++    blocks = list(model.blocks)
++    if not blocks:
++        raise ValueError("MTP native fusion requires auxiliary heads")
++    parameters = list(model.parameters())
++    if native_ops is None and any(
++        parameter.device.type == "npu" for parameter in parameters
++    ):
++        native_ops = importlib.import_module("torch_npu")
++    if native_ops is not None and any(
++        not callable(getattr(native_ops, name, None)) for name in _NATIVE_APIS
++    ):
++        raise ValueError(
++            "MTP native fusion requires rms_norm, add_rms_norm and swiglu APIs"
++        )
++    for block in blocks:
++        attention, mlp = block.decoder.self_attn, block.decoder.mlp
++        _projection_group((attention.q_proj, attention.k_proj, attention.v_proj))
++        _projection_group((mlp.gate_proj, mlp.up_proj))
++        if mlp.gate_proj.out_features != mlp.up_proj.out_features:
++            raise ValueError("MTP fused gate/up widths must match")
++        for path in _NORM_PATHS:
++            norm = block.get_submodule(path)
++            if not isinstance(norm, nn.RMSNorm) or norm.weight is None:
++                raise ValueError("MTP native fusion requires affine RMSNorm modules")
++    for block in blocks:
++        attention, mlp = block.decoder.self_attn, block.decoder.mlp
++        projections = (attention.q_proj, attention.k_proj, attention.v_proj)
++        attention._mtp_qkv_sizes = tuple(
++            projection.out_features for projection in projections
++        )
++        _pack(attention, "_mtp_qkv", projections)
++        _pack(mlp, "_mtp_gate_up", (mlp.gate_proj, mlp.up_proj))
++        mlp._mtp_native_ops = native_ops
++        for path in _NORM_PATHS:
++            parent_path, _, name = path.rpartition(".")
++            parent = block.get_submodule(parent_path) if parent_path else block
++            setattr(parent, name, _FusedRMSNorm(getattr(parent, name), native_ops))
++    model._mtp_fused_prepared = True
++    return True
++
++
++def project_qkv(attn, hidden):
++    """One packed projection after preparation; original three calls otherwise."""
++    weight = getattr(attn, "_mtp_qkv_weight", None)
++    if weight is None:
++        return attn.q_proj(hidden), attn.k_proj(hidden), attn.v_proj(hidden)
++    return F.linear(hidden, weight, attn._mtp_qkv_bias).split(
++        attn._mtp_qkv_sizes, dim=-1
++    )
++
++
++def add_rms_norm(norm, left, right):
++    """Return both normalized output and the residual used by the next add."""
++    native_ops = getattr(norm, "_mtp_native_ops", None)
++    if native_ops is None:
++        residual = left + right
++        return norm(residual), residual
++    epsilon = norm.eps if norm.eps is not None else torch.finfo(left.dtype).eps
++    normalized, _, residual = native_ops.npu_add_rms_norm(
++        left, right, norm.weight, epsilon
++    )
++    return normalized, residual
++
++
++def mlp_forward(mlp, hidden):
++    """Pack gate/up once, then use native SwiGLU on the combined activation."""
++    weight = getattr(mlp, "_mtp_gate_up_weight", None)
++    if weight is None:
++        return mlp.down_proj(F.silu(mlp.gate_proj(hidden)) * mlp.up_proj(hidden))
++    packed = F.linear(hidden, weight, mlp._mtp_gate_up_bias)
++    if mlp._mtp_native_ops is None:
++        gate, up = packed.chunk(2, dim=-1)
++        activated = F.silu(gate) * up
++    else:
++        activated = mlp._mtp_native_ops.npu_swiglu(packed)
++    return mlp.down_proj(activated)
+--- a/vllm_ascend/spec_decode/asr_mtp_graph.py
++++ b/vllm_ascend/spec_decode/asr_mtp_graph.py
+@@ -11,8 +11,10 @@
+ from torch.nn import functional as F
+
+ try:
++    from .asr_mtp_fused import add_rms_norm, project_qkv
+     from .asr_mtp_heads import rotate_half
+ except ImportError:
++    from asr_mtp_fused import add_rms_norm, project_qkv
+     from asr_mtp_heads import rotate_half
+
+ logger = logging.getLogger(__name__)
+@@ -37,6 +39,7 @@
+     queries: tuple[int, ...]
+     context: int
+     tokens: tuple[int, ...] = ()
++    profile_stages: bool = False
+
+     def scratch_elements(self, config):
+         # A positive dummy query must cover the full non-PA TND KV tail even
+@@ -50,6 +53,9 @@
+
+
+ def graph_options(settings, *, context, slots, max_batch):
++    profile_stages = settings.get("profile_stages", False)
++    if type(profile_stages) is not bool:
++        raise ValueError("asr_mtp.profile_stages must be a bool")
+     mode = settings.get("graph_mode", "off")
+     if mode not in ("off", "full"):
+         raise ValueError("asr_mtp.graph_mode must be off or full")
+@@ -81,7 +87,7 @@
+             raise ValueError(
+                 f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}"
+             )
+-        return GraphOptions(batch, (), capacity, tokens)
++        return GraphOptions(batch, (), capacity, tokens, profile_stages)
+     queries = settings.get("graph_query_sizes", (min(8, capacity), min(64, capacity)))
+     if (
+         not isinstance(queries, (list, tuple))
+@@ -94,7 +100,7 @@
+     queries = tuple(sorted(set(queries)))
+     if batch * len(queries) > MAX_MTP_GRAPHS:
+         raise ValueError(f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}")
+-    return GraphOptions(batch, queries, capacity)
++    return GraphOptions(batch, queries, capacity, profile_stages=profile_stages)
+
+
+ class FixedMTPProgram:
+@@ -292,21 +298,20 @@
+             )
+             normed = block.decoder.input_layernorm(fused)
+             attn = block.decoder.self_attn
++            q_raw, k_raw, v_raw = project_qkv(attn, normed)
+             q = attn.q_norm(
+-                attn.q_proj(normed).view(
++                q_raw.view(
+                     self.batch, self.queries, cfg.num_attention_heads, cfg.head_dim
+                 )
+             ).transpose(1, 2)
+             k = attn.k_norm(
+-                attn.k_proj(normed).view(
++                k_raw.view(
+                     self.batch, self.queries, cfg.num_key_value_heads, cfg.head_dim
+                 )
+             ).transpose(1, 2)
+-            v = (
+-                attn.v_proj(normed)
+-                .view(self.batch, self.queries, cfg.num_key_value_heads, cfg.head_dim)
+-                .transpose(1, 2)
+-            )
++            v = v_raw.view(
++                self.batch, self.queries, cfg.num_key_value_heads, cfg.head_dim
++            ).transpose(1, 2)
+             frequencies = (anchors + depth).float().unsqueeze(-1) * self.inverse
+             angles = torch.cat((frequencies, frequencies), -1)
+             cos = angles.cos().to(fused.dtype)[:, None]
+@@ -355,12 +360,15 @@
+                 dropout_p=0.0,
+                 scale=cfg.head_dim**-0.5,
+             )
+-            residual = fused + attn.o_proj(
+-                attended.transpose(1, 2).reshape(self.batch, self.queries, width)
+-            )
+-            fresh = block.output_norm(
+-                residual
+-                + block.decoder.mlp(block.decoder.post_attention_layernorm(residual))
++            normed_residual, residual = add_rms_norm(
++                block.decoder.post_attention_layernorm,
++                fused,
++                attn.o_proj(
++                    attended.transpose(1, 2).reshape(self.batch, self.queries, width)
++                ),
++            )
++            fresh, _ = add_rms_norm(
++                block.output_norm, residual, block.decoder.mlp(normed_residual)
+             )
+             last_index = (lengths - starts - 1).clamp(0, self.queries - 1)
+             last = fresh.gather(
+--- a/vllm_ascend/spec_decode/asr_mtp_token_attention.py
++++ b/vllm_ascend/spec_decode/asr_mtp_token_attention.py
+@@ -7,6 +7,7 @@
+ """
+
+ from dataclasses import dataclass
++from time import perf_counter
+
+ import torch
+ from torch.nn import functional as F
+@@ -26,6 +27,7 @@
+     scale: float
+     handle: object = None
+     event: object = None
++    binding: object = None
+
+
+ class PackedAttention:
+@@ -61,6 +63,7 @@
+         )
+         self.heads, self.device, self.dtype = heads, torch.device(device), dtype
+         self.lengths, self.tasks, self.workspaces = {}, {}, {}
++        self.task_updates = self.task_update_reuses = 0
+         self.recording = False
+         self.is_npu = self.device.type == "npu" or npu_api is not None
+         self.api, self.runtime, self.mask = None, None, None
+@@ -232,6 +235,7 @@
+             self.runtime.graph_task_group_begin(stream)
+             self._execute(head, task)
+             task.handle = self.runtime.graph_task_group_end(stream)
++            task.binding = self._binding(head, task)
+         else:
+             self._execute(head, task)
+         return task.output
+@@ -261,6 +265,17 @@
+             out=[task.output, task.softmax_lse],
+         )
+
++    def _binding(self, head, task):
++        # Shape, dtype, device and contiguity are preflighted for all heads.
++        # Replacing an equal-shaped tensor still needs a task-pointer rebind.
++        return (
++            self.lengths[head],
++            task.query.data_ptr(),
++            task.key.data_ptr(),
++            task.value.data_ptr(),
++            task.scale,
++        )
++
+     def begin_capture(self):
+         if self.recording or any(
+             task.handle is not None for task in self.tasks.values()
+@@ -285,9 +300,17 @@
+             self._validate(head, task.query, task.key, task.value)
+         stream = self.runtime.current_stream()
+         for head, task in self.tasks.items():
+-            self.runtime.graph_task_update_begin(stream, task.handle)
+-            self._execute(head, task)
+-            self.runtime.graph_task_update_end(stream)
++            binding = self._binding(head, task)
++            if task.binding == binding:
++                self.task_update_reuses += 1
++            else:
++                self.runtime.graph_task_update_begin(stream, task.handle)
++                self._execute(head, task)
++                self.runtime.graph_task_update_end(stream)
++                task.binding = binding
++                self.task_updates += 1
++            # The captured wait/reset is replayed even when the task arguments
++            # stay unchanged. Signal every head on every replay, never skip it.
+             task.event.record(stream)
+
+
+@@ -317,8 +340,24 @@
+             attention.end_capture()
+         torch.npu.synchronize()
+
+-        def replay():
+-            attention.update()
+-            graph.replay()
++        if getattr(program, "profile_stages", False):
++
++            def replay():
++                started = perf_counter()
++                updates, reuses = attention.task_updates, attention.task_update_reuses
++                attention.update()
++                updated = perf_counter()
++                graph.replay()
++                replay.last_timings = {
++                    "task_update_host_ms": (updated - started) * 1000,
++                    "replay_enqueue_host_ms": (perf_counter() - updated) * 1000,
++                    "task_updates": attention.task_updates - updates,
++                    "task_update_reuses": attention.task_update_reuses - reuses,
++                }
++        else:
++
++            def replay():
++                attention.update()
++                graph.replay()
+
+         return replay
+--- a/vllm_ascend/spec_decode/asr_mtp_token_graph.py
++++ b/vllm_ascend/spec_decode/asr_mtp_token_graph.py
+@@ -9,9 +9,11 @@
+ import torch
+
+ try:
++    from .asr_mtp_fused import add_rms_norm, project_qkv
+     from .asr_mtp_heads import rotate_half
+     from .asr_mtp_token_attention import PackedAttention, PackedNPUCapture
+ except ImportError:
++    from asr_mtp_fused import add_rms_norm, project_qkv
+     from asr_mtp_heads import rotate_half
+     from asr_mtp_token_attention import PackedAttention, PackedNPUCapture
+
+@@ -292,19 +294,14 @@
+             )
+             normed = block.decoder.input_layernorm(fused)
+             attn = block.decoder.self_attn
++            q_raw, k_raw, v_raw = project_qkv(attn, normed)
+             q = attn.q_norm(
+-                attn.q_proj(normed).view(
+-                    self.query_capacity, cfg.num_attention_heads, cfg.head_dim
+-                )
++                q_raw.view(self.query_capacity, cfg.num_attention_heads, cfg.head_dim)
+             )
+             k = attn.k_norm(
+-                attn.k_proj(normed).view(
+-                    self.query_capacity, cfg.num_key_value_heads, cfg.head_dim
+-                )
+-            )
+-            v = attn.v_proj(normed).view(
+-                self.query_capacity, cfg.num_key_value_heads, cfg.head_dim
+-            )
++                k_raw.view(self.query_capacity, cfg.num_key_value_heads, cfg.head_dim)
++            )
++            v = v_raw.view(self.query_capacity, cfg.num_key_value_heads, cfg.head_dim)
+             frequencies = (anchor + depth).float().unsqueeze(-1) * self.inverse
+             angles = torch.cat((frequencies, frequencies), -1)
+             cos, sin = (
+@@ -350,10 +347,13 @@
+                 0,
+             )
+             attended = self.attention(d, q, past_k, past_v, cfg.head_dim**-0.5)
+-            residual = fused + attn.o_proj(attended.reshape(self.query_capacity, -1))
+-            fresh = block.output_norm(
+-                residual
+-                + block.decoder.mlp(block.decoder.post_attention_layernorm(residual))
++            normed_residual, residual = add_rms_norm(
++                block.decoder.post_attention_layernorm,
++                fused,
++                attn.o_proj(attended.reshape(self.query_capacity, -1)),
++            )
++            fresh, _ = add_rms_norm(
++                block.output_norm, residual, block.decoder.mlp(normed_residual)
+             )
+             last = fresh.index_select(0, self.last[d, : self.max_batch])
+             active = self.limits[: self.max_batch] >= depth
+@@ -431,6 +431,7 @@
+                     token_size=tokens,
+                     context_size=self.options.context,
+                 )
++                program.profile_stages = getattr(self.options, "profile_stages", False)
+                 program.stage(
+                     warm,
+                     [[0] * (s.length + 1) for s in warm],
+@@ -496,9 +497,35 @@
+             self.stats["miss_tokens"] += 1
+             return None
+         program, replay = self.entries[bucket]
++        profiled = getattr(self.options, "profile_stages", False)
++        stage_started = perf_counter() if profiled else None
+         program.stage(states, inputs, limits)
++        replay_started = perf_counter() if profiled else None
+         replay()
++        commit_started = perf_counter() if profiled else None
+         program.commit(states, limits)
++        if profiled:
++            timings = getattr(replay, "last_timings", {})
++            logger.info(
++                "ASR_MTP_GRAPH_HOST_STAGE requests=%d tokens=%d bucket=%d "
++                "query_capacity=%d kv_capacity=%d max_batch=%d stage_host_ms=%.3f "
++                "replay_host_ms=%.3f task_update_host_ms=%.3f "
++                "replay_enqueue_host_ms=%.3f commit_host_ms=%.3f "
++                "task_updates=%d task_update_reuses=%d",
++                len(states),
++                needed,
++                bucket,
++                program.query_capacity,
++                program.kv_capacity,
++                self.options.max_batch,
++                (replay_started - stage_started) * 1000,
++                (commit_started - replay_started) * 1000,
++                timings.get("task_update_host_ms", 0.0),
++                timings.get("replay_enqueue_host_ms", 0.0),
++                (perf_counter() - commit_started) * 1000,
++                timings.get("task_updates", 0),
++                timings.get("task_update_reuses", 0),
++            )
+         self.stats["replays"] += 1
+         self.stats["requests"] += len(states)
+         if self.stats["replays"] == 1:
+--- a/vllm_ascend/spec_decode/asr_mtp_worker.py
++++ b/vllm_ascend/spec_decode/asr_mtp_worker.py
+@@ -4,13 +4,16 @@
+ import logging
+ from collections import Counter
+ from pathlib import Path
++from time import perf_counter
+
+ import torch
+
+ try:
++    from .asr_mtp_fused import prepare_fused_heads
+     from .asr_mtp_graph import MTPGraphs, graph_options, validate_graph_runner
+     from .asr_mtp_heads import BatchedMTPHeads, CacheArena
+ except ImportError:
++    from asr_mtp_fused import prepare_fused_heads
+     from asr_mtp_graph import MTPGraphs, graph_options, validate_graph_runner
+     from asr_mtp_heads import BatchedMTPHeads, CacheArena
+
+@@ -74,13 +77,15 @@
+
+
+ class MTPWorker:
+-    def __init__(self, runner, heads, arena, embedding, logits, eos, *, graphs=None):
++    def __init__(self, runner, heads, arena, embedding, logits, eos, *, graphs=None,
++                 profile_stages=False):
+         self.runner, self.heads, self.arena = runner, heads, arena
+         self.embedding, self.logits, self.eos = embedding, logits, set(eos)
+         self.states, self.disabled = {}, {}
+         self.legacy_submitted = set()
+         self.stats = Counter(target_forwards=0)
+         self.graphs, self.profiled = graphs, False
++        self.profile_stages = profile_stages
+
+     def finish(self, request_ids):
+         for req_id in request_ids:
+@@ -151,6 +156,7 @@
+
+     @torch.inference_mode()
+     def propose(self, sampled, scheduler_output, hidden):
++        prepare_started = perf_counter() if self.profile_stages else None
+         runner, batch = self.runner, self.runner.input_batch
+         outputs = [[] for _ in sampled]
+         states, inputs, limits, indices = [], [], [], []
+@@ -225,8 +231,12 @@
+         if states:
+             before = self.heads.processed_positions
+             buckets = query_buckets(states, limits, self.graphs)
+-            drafts = torch.zeros((len(states), self.heads.num_heads),
+-                                 device=states[0].target.device, dtype=torch.long)
++            single_group = (len(buckets) == 1 and
++                            next(iter(buckets.values())) == list(range(len(states))))
++            proposal_started = perf_counter() if self.profile_stages else None
++            drafts = (None if single_group else
++                      torch.zeros((len(states), self.heads.num_heads),
++                                  device=states[0].target.device, dtype=torch.long))
+             for group in buckets.values():
+                 batch_states = [states[i] for i in group]
+                 batch_inputs = [inputs[i] for i in group]
+@@ -239,8 +249,15 @@
+                     self.stats['eager_head_batches'] += 1
+                 else:
+                     self.stats['graph_head_batches'] += 1
+-                drafts[group] = proposal
++                if single_group:
++                    drafts = proposal
++                else:
++                    # Graph output belongs to a persistent capture buffer and
++                    # may be overwritten by the next group using the same graph.
++                    drafts[group] = proposal
++            to_cpu_started = perf_counter() if self.profile_stages else None
+             rows = drafts.tolist()  # One device-to-host boundary for the whole batch.
++            postprocess_started = perf_counter() if self.profile_stages else None
+             mtp_tokens = 0
+             for i, row, limit in zip(indices, rows, limits):
+                 row = row[:limit]
+@@ -262,6 +279,19 @@
+                          len(states), mtp_tokens, self.heads.processed_positions - before,
+                          self.stats['graph_head_batches'], self.stats['eager_head_batches'],
+                          self.graphs.stats if self.graphs is not None else {})
++            if self.profile_stages:
++                logger.info(
++                    'ASR_MTP_HOST_STAGE requests=%d groups=%d single_group=%s '
++                    'draft_tokens=%d prepare_host_ms=%.3f proposal_host_ms=%.3f '
++                    'to_cpu_wait_ms=%.3f postprocess_host_ms=%.3f',
++                    len(states), len(buckets), single_group, mtp_tokens,
++                    (proposal_started - prepare_started) * 1000,
++                    (to_cpu_started - proposal_started) * 1000,
++                    (postprocess_started - to_cpu_started) * 1000,
++                    (perf_counter() - postprocess_started) * 1000,
++                )
++                # to_cpu_wait_ms includes waiting for preceding queued NPU
++                # work; it is not an additional device-compute interval.
+         return outputs
+
+
+@@ -310,9 +340,13 @@
+     validate_engine(runner)
+     allowed = {'checkpoint', 'num_heads', 'max_context_tokens', 'cache_mib', 'max_requests',
+                'verify_base_signature', 'graph_mode', 'graph_context_tokens',
+-               'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size'}
++               'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size',
++               'native_fusion', 'profile_stages'}
+     if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
+         raise ValueError('invalid additional_config.asr_mtp settings')
++    for name, default in (('native_fusion', True), ('profile_stages', False)):
++        if type(settings.get(name, default)) is not bool:
++            raise ValueError(f'asr_mtp.{name} must be a bool')
+     for name, default in (('num_heads', 5), ('max_context_tokens', 512),
+                           ('cache_mib', 512), ('max_requests', 64)):
+         if type(settings.get(name, default)) is not int or settings.get(name, default) < 1:
+@@ -338,6 +372,7 @@
+         model = BatchedMTPHeads(text, heads)
+     model.load_state_dict(selected, strict=True, assign=True)
+     model = model.to(device=runner.device, dtype=runner.dtype).eval().requires_grad_(False)
++    native_fusion = prepare_fused_heads(model, enabled=settings.get('native_fusion', True))
+     cap = settings.get('max_context_tokens', 512)
+     per_slot = CacheArena.elements_per_position(text, heads) * cap * torch.empty((), dtype=runner.dtype).element_size()
+     slots = min(settings.get('max_requests', 64), settings.get('cache_mib', 512) * 1024 ** 2 // per_slot)
+@@ -365,13 +400,15 @@
+         graphs = graph_class(options, model, arena, language.embed_input_ids,
+                              language.compute_logits)
+     worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits,
+-                       eos, graphs=graphs)
++                       eos, graphs=graphs, profile_stages=settings.get('profile_stages', False))
+     logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
+-                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s',
++                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s '
++                'native_fusion=%s profile_stages=%s',
+                 heads, cap, slots, arena.storage.numel() * arena.storage.element_size() / 1024 ** 2,
+                 settings['checkpoint'], settings.get('verify_base_signature', False),
+                 settings.get('graph_mode', 'off'),
+                 (arena.graph_storage.numel() - arena.scratch_offset) *
+                 arena.storage.element_size() / 1024 ** 2,
+-                'tokens' if options is not None and options.tokens else 'rectangular')
++                'tokens' if options is not None and options.tokens else 'rectangular',
++                native_fusion, settings.get('profile_stages', False))
+     return worker

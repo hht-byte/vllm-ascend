@@ -596,7 +596,14 @@ def npu_available():
 @unittest.skipUnless(npu_available(), "requires torch-npu and an available NPU")
 class ActualNPUReplayTests(unittest.TestCase):
     def test_changed_inputs_rejection_and_graph_bucket_switch_match_eager(self):
+        self._check_changed_inputs_rejection_and_graph_bucket_switch(native_fusion=False)
+
+    def test_native_fused_heads_replay_and_rejection_match_unfused_eager(self):
+        self._check_changed_inputs_rejection_and_graph_bucket_switch(native_fusion=True)
+
+    def _check_changed_inputs_rejection_and_graph_bucket_switch(self, *, native_fusion):
         import torch
+        from asr_mtp_fused import prepare_fused_heads
         from asr_mtp_graph import MTPGraphs, graph_options
         from asr_mtp_heads import BatchedMTPHeads, CacheArena
 
@@ -614,7 +621,10 @@ class ActualNPUReplayTests(unittest.TestCase):
             rope_scaling=None,
         )
         eager = BatchedMTPHeads(cfg, 2).to("npu", torch.float16).eval()
-        fixed = deepcopy(eager)
+        fixed = deepcopy(eager).requires_grad_(False)
+        # Keep the original eager model as the independent checkpoint/math
+        # reference; capture the complete fused program, including native Norms.
+        self.assertEqual(prepare_fused_heads(fixed, enabled=native_fusion), native_fusion)
         embed = torch.nn.Embedding(64, 128).to("npu", torch.float16).eval()
         logits = torch.nn.Linear(128, 64).to("npu", torch.float16).eval()
         options = graph_options(

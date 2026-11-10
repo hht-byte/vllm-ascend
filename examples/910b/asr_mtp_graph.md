@@ -222,7 +222,9 @@ allocation is startup-only. Unsupported geometry may continue using the old
 rectangular graph or eager path. Compare acceptance, complete target outputs,
 step latency, commit P95/P99, queueing and reserved memory under equal load.
 Device capture/replay and performance have not been established on this host.
-Each replay performs one host task update per auxiliary head; this rebinding
+Only heads whose cumulative lengths, Q/K/V pointers or scale changed need a
+host task update. Unchanged bindings are reused, while every replay still
+records all external events required by the captured wait/reset. Rebinding
 cost and fixed request-slot logits must be included in the performance comparison.
 
 ## Strict non-PA TND KV coverage fix
@@ -251,6 +253,81 @@ changes. The backend checks exact cumulative Q/KV coverage before FIA.
 `query_capacities`; the first replay also logs `bucket`, `query_capacity` and
 `kv_capacity`. The extra row's performance impact still needs device measurement.
 
+## Native auxiliary fusion and graph handoff
+
+For the installed strict-TND version (ASR source `46d2537e1`), apply only:
+
+```bash
+git apply --check examples/910b/asr_mtp_native_fusion_v023.patch
+git apply examples/910b/asr_mtp_native_fusion_v023.patch
+```
+
+The fresh ASR `research/asr_mtp_v023.patch`, cumulative graph patch and
+row-cache-to-token patch already include this upgrade. Do not stack them with
+the focused patch. Other installed versions should regenerate against their
+actual source. Updating the files requires the normal worker restart; this
+document does not restart services.
+
+The new default `native_fusion=True` uses native RMSNorm, residual Add+RMSNorm
+and SwiGLU only inside auxiliary heads. QKV and gate/up projections are packed
+once after strict checkpoint loading, final device/dtype placement and freezing,
+before profiling/capture. Original Parameter names remain in the checkpoint;
+nonpersistent packed buffers share their storage rather than keeping a second
+resident weight copy. Eager, rectangular and token paths use the same helpers.
+No target model or global Torch operator is patched. Missing native APIs fail
+startup; `native_fusion=False` restores the original auxiliary math.
+
+Merge the startup settings before the unchanged three-argument service factory:
+
+```python
+additional = dict(base_config.get("additional_config") or {})
+mtp_settings = dict(additional.get("asr_mtp") or {})
+mtp_settings.update({
+    "native_fusion": True,    # default; False for a fusion-only comparison
+    "profile_stages": False,  # opt-in host diagnostics; leave off for timings
+})
+additional["asr_mtp"] = mtp_settings
+base_config["additional_config"] = additional
+base_config = mtp_engine_config(
+    base_config,
+    mtp_enabled=mtp_enabled,
+    mtp_checkpoint=mtp_checkpoint,
+)
+```
+
+This also works when the base dictionary has no `asr_mtp`; an enabled master
+switch still requires a checkpoint. The factory preserves existing checkpoint
+and graph fields. These switches are not hot reconfiguration of a live engine.
+Five heads now use 30 linear matrix calls instead of 45. This verified call-count
+reduction is not a measured device latency gain. Sequential LM heads and unused
+fixed request-slot logits remain part of the cost.
+
+A single complete proposal group consumes the persistent graph output directly,
+removing the intermediate zeros tensor and advanced-index aggregation. Multiple
+groups still copy each result before another replay can overwrite its persistent
+buffer, then perform one final `tolist()` boundary. FIA bindings are reused as
+described above without dropping any event notification. No additional target
+forward, deliberate batching wait or per-head device synchronization is added.
+
+With `profile_stages=True`, INFO `ASR_MTP_HOST_STAGE` separates worker prepare,
+proposal, CPU-transfer wait and postprocessing. Packed graphs additionally emit
+`ASR_MTP_GRAPH_HOST_STAGE` with real requests/tokens/bucket, staging, task-update,
+replay-enqueue and commit host durations, plus `task_updates` and
+`task_update_reuses`. Eager and rectangular graphs retain worker-level timings.
+Default-off diagnostics read no clocks, create no profiling events and add no
+synchronization.
+
+```bash
+rg -n 'ASR_MTP_CONFIG|ASR_MTP_HOST_STAGE|ASR_MTP_GRAPH_HOST_STAGE' "$LOG"
+```
+
+These are host wall-clock intervals. `to_cpu_wait_ms` includes preceding queued
+device work, not just transfer, and must not be added again to device execution
+time. Graph timings are nested inside the worker proposal interval. Logging also
+has overhead, so disable diagnostics for the final comparison. Input preparation,
+IPC and scheduling gaps after the MTP handoff remain outside these intervals;
+this upgrade does not establish that every observed bubble is removed.
+
 ## Device test
 
 After applying the patch, run the unit/integration tests against the installed
@@ -262,10 +339,18 @@ PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
 
 PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
   python -m unittest discover -s examples/910b/tests -p 'test_asr_mtp_token_*.py' -v
+
+PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
+  python -m unittest discover -s examples/910b/tests -p 'test_asr_mtp_fused*.py' -v
+
+PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
+  python -m unittest discover -s examples/910b/tests -p test_asr_mtp_runtime.py -v
 ```
 
-The actual NPU test uses NPUGraph capture/replay with changed inputs, rejection,
-request reordering and multiple buckets. It must not be skipped on the device.
+The actual NPU tests retain unfused cases and additionally combine native fused
+heads with rectangular graphs and packed TND FIA. They use NPUGraph capture/replay
+with changed inputs, rejection, request reordering and multiple buckets. They
+must not be skipped on the device.
 CPU tests cover the same fixed tensor program, masking, cache isolation, caps and
 worker drive-token boundaries; they do not establish NPU compatibility or speedup.
 No 910B device acceptance or latency gain has been measured on the authoring host.
