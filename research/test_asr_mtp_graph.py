@@ -486,8 +486,9 @@ class TokenGraphOptionsTests(unittest.TestCase):
         self.assertEqual(options.max_batch, 8)
         self.assertEqual(options.context, 128)
         geometry = SimpleNamespace(hidden_size=8, num_key_value_heads=1, head_dim=4)
-        # A token graph stages 512 rows, independent of its eight request slots.
-        self.assertEqual(options.scratch_elements(geometry), 4096)
+        # One extra physical dummy query covers the full non-PA TND KV tail.
+        # The logical bucket remains 512, independent of eight request slots.
+        self.assertEqual(options.scratch_elements(geometry), 4104)
 
     def test_token_mode_counts_graphs_without_multiplying_by_batch_slots(self):
         from asr_mtp_graph import graph_options

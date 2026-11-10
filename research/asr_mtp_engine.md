@@ -197,7 +197,18 @@ base_config = mtp_engine_config(
 
 投影、MLP、RoPE 和行缓存操作使用 packed token；attention 使用单次 FIA TND 调用处理所有活动请求，并在 replay 前更新各头的 CPU 累积 query/KV 长度。保留固定请求槽的 LM head，只从各请求最后一个补算位置抽取 hidden，不对全部 T 行做词表投影。未使用请求槽仍有 LM 矩阵计算，需在同负载对比中计入。
 
-所选 910B FIA 入口要求 FP16/BF16 和受支持的 head dimension（当前校验 128/192）；NPU 图启动需要 FIA out、最大 workspace 和 graph task update API。workspace 在启动分配，replay 不分配 workspace、不读取设备 token 或长度到 CPU。矩形图与 MTP eager 路径不受此 FIA 几何限制。dummy query/KV 段等长，避免 padding 行出现全 masked attention。每次 replay 前每个 head 有一次主机 task update；这部分重绑定和固定请求槽的开销需要与减少 replay/补齐计算的收益一起评估。
+所选 910B FIA 入口要求 FP16/BF16 和受支持的 head dimension（当前校验 128/192）；NPU 图启动需要 FIA out、最大 workspace 和 graph task update API。workspace 在启动分配，replay 不分配 workspace、不读取设备 token 或长度到 CPU。矩形图与 MTP eager 路径不受此 FIA 几何限制。每次 replay 前每个 head 有一次主机 task update；这部分重绑定和固定请求槽的开销需要与减少 replay/补齐计算的收益一起评估。
+
+非 PA TND 在已部署 CANN 上要求最后一个累积 KV 长度严格等于 K/V 的物理 T。每个逻辑 token 桶额外预留 1 个物理 query：512 桶仍可容纳 512 个真实补算位置，物理 query 容量为 513。始终存在的正长度 dummy query 段承接所有剩余零填充 KV；dummy KV 长度不小于 dummy query，避免全 masked 行。这样不依赖零 query 分段，不在 task update 中改变 Tensor shape，也不会让恰好填满桶的请求跳到下一档。启动日志显示 `token_sizes` 与 `query_capacities`；首次 replay 还显示 `bucket`、`query_capacity`、`kv_capacity`。
+
+已安装最初 token 图版、遇到 `keyT/valueT must be equal to ... actualSeqenceLengthKV` 的服务，只应用聚焦修复：
+
+```bash
+git apply --check examples/910b/asr_mtp_tnd_kv_coverage_v023.patch
+git apply examples/910b/asr_mtp_tnd_kv_coverage_v023.patch
+```
+
+随后按原流程重启 worker，现有 token 配置无需更改。完整新安装、累计图升级和行缓存版到 token 版的补丁均已包含修复，不要连续叠加；其他安装版本应针对实际源码重新导出。
 
 已安装行缓存优化版的服务可应用 `examples/910b/asr_mtp_token_graph_v023.patch` 聚焦升级；完整安装和累计图补丁已包含此升级，不要连续叠加。当前实现仍需真实 910B 捕获、变长 replay 和时延验收，CPU/FIA 接口模拟测试不能证明设备性能收益。
 

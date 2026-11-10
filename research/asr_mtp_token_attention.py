@@ -32,9 +32,9 @@ class PackedAttention:
     """One packed attention call per auxiliary head, with fixed tensor capacities.
 
     ``stage`` receives cumulative CPU lengths. Each query segment is the tail
-    of its matching KV segment, including an optional equal-length dummy tail.
-    Physical KV capacity may exceed the final cumulative KV length. No device
-    tensor is inspected to determine segment boundaries or update graph tasks.
+    of its matching KV segment. A terminal positive-query dummy segment covers
+    all remaining physical KV rows. Non-PA TND requires exact Q/KV coverage;
+    no device tensor is inspected to stage boundaries or update graph tasks.
     """
 
     def __init__(
@@ -147,7 +147,7 @@ class PackedAttention:
             or key.shape[1:] != (self.num_kv_heads, self.head_dim)
             or value.shape != key.shape
             or q_ends[-1] != query.shape[0]
-            or kv_ends[-1] > key.shape[0]
+            or kv_ends[-1] != key.shape[0]
             or query.device != self.device
             or key.device != self.device
             or value.device != self.device

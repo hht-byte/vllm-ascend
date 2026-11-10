@@ -15,7 +15,7 @@
 - MTP total fresh tokens are independent of the target FULL graph's padded token capacity and of historical context length.
 - Per-head required tokens are summed over active requests; choose capacity covering the maximum of these sums, not the sum over all heads.
 - No cross-request attention, invalid KV/hidden reuse, per-index host synchronization, or runtime graph capture.
-- Dummy query and KV segments have equal lengths to avoid all-masked right-down causal queries.
+- Deployment correction: each logical bucket reserves one extra physical Q row; a positive dummy Q owns the complete remaining KV tail. Final cumulative KV must equal physical KV T. See `2026-11-10-mtp-tnd-kv-coverage.md`.
 - Preserve EOS/budget fallback, rejection crops, row reordering, slot reuse, row alignment and scratch isolation.
 - Fixed request-slot LM output may add padding; mask does not eliminate matrix computation.
 - Keep existing `(B,Q)` settings operational when token buckets are absent. Token buckets take precedence when both settings are present.

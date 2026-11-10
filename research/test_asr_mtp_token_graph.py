@@ -40,7 +40,7 @@ class PackedFixture:
             slots=4,
             device="cpu",
             dtype=torch.float32,
-            scratch_elements=32 * 12 + 1,
+            scratch_elements=33 * 12 + 1,
         )
         self.old.storage.fill_(float("nan"))
         self.new.graph_storage.fill_(float("nan"))
@@ -100,6 +100,47 @@ class PackedFixture:
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "requires Torch")
 class PackedProgramTests(PackedFixture, unittest.TestCase):
+    def test_exact_logical_bucket_has_positive_dummy_and_full_kv_segment(self):
+        from asr_mtp_token_graph import PackedMTPProgram
+
+        program = PackedMTPProgram(
+            self.fixed,
+            self.new,
+            self.embed,
+            self.logits,
+            max_batch=3,
+            token_size=8,
+            context_size=17,
+        )
+        row = list(range(3, 11))
+        for state in (self.a[0], self.b[0]):
+            state.length = 8
+        hidden = self.t.randn(8, 12)
+        self.a[0].target[:8] = self.b[0].target[:8] = hidden
+        program.stage(self.b[:1], [row + [4]], [3])
+        self.assertEqual(program.tokens, 8)
+        self.assertEqual(getattr(program, "query_capacity", None), 9)
+        self.assertEqual(program.kv_capacity, 60)
+        for qends, kvends in program.attention.lengths.values():
+            self.assertEqual(qends, (8, 9))
+            self.assertEqual(kvends, (8, 60))
+        expected = self.eager.propose(
+            self.a[:1], [row + [4]], self.embed, self.logits, [3]
+        )
+        self.t.testing.assert_close(program.run()[:1], expected)
+        program.commit(self.b[:1], [3])
+        for left, right in zip(self.a[0].heads, self.b[0].heads):
+            self.t.testing.assert_close(left.key[:, :8], right.key[:, :8])
+            self.t.testing.assert_close(left.value[:, :8], right.value[:, :8])
+
+    def test_partial_bucket_dummy_covers_every_physical_kv_position(self):
+        self.program.stage(self.b, [row + [4] for row in self.ids], [3, 3, 3])
+        for qends, kvends in self.program.attention.lengths.values():
+            self.assertEqual(kvends[-1], self.program.kv_capacity)
+            self.assertEqual(qends, (7, 10, 15, 33))
+            self.assertEqual(kvends, (7, 10, 15, 84))
+        self.compare(self.a, self.b, [row + [4] for row in self.ids], [3, 3, 3])
+
     def test_total_capacity_is_maximum_per_head_sum_not_sum_of_request_maxima(self):
         from asr_mtp_token_graph import required_tokens
 
@@ -240,6 +281,22 @@ class TokenDispatchTests(PackedFixture, unittest.TestCase):
         self.assertEqual(capture.count, 3)
         self.assertEqual(capture.replays, [16])
 
+    def test_full_logical_bucket_does_not_move_to_the_next_graph(self):
+        graphs, capture = self.manager()
+        row = list(range(3, 11))
+        hidden = self.t.randn(8, 12)
+        for state in (self.a[0], self.b[0]):
+            state.length = 8
+            state.target[:8] = hidden
+        actual = graphs.propose(self.b[:1], [row + [4]], [3])
+        expected = self.eager.propose(
+            self.a[:1], [row + [4]], self.embed, self.logits, [3]
+        )
+        self.t.testing.assert_close(actual, expected)
+        self.assertEqual(capture.replays, [8])
+        self.assertEqual(graphs.entries[8][0].tokens, 8)
+        self.assertEqual(getattr(graphs.entries[8][0], "query_capacity", None), 9)
+
     def test_context_and_reduced_budget_fallback_never_capture_online(self):
         graphs, capture = self.manager()
         before = self.new.graph_storage.clone()
@@ -302,7 +359,7 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
             slots=2,
             device="npu",
             dtype=torch.float16,
-            scratch_elements=32 * 256,
+            scratch_elements=33 * 256,
         )
         options = SimpleNamespace(max_batch=2, context=64, tokens=(8, 32))
         graphs = TokenMTPGraphs(options, fixed, new, embed, logits)

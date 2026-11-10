@@ -39,7 +39,11 @@ class GraphOptions:
     tokens: tuple[int, ...] = ()
 
     def scratch_elements(self, config):
-        rows = max(self.tokens) if self.tokens else self.max_batch * max(self.queries)
+        # A positive dummy query must cover the full non-PA TND KV tail even
+        # when real queries exactly fill the logical token bucket.
+        rows = (
+            max(self.tokens) + 1 if self.tokens else self.max_batch * max(self.queries)
+        )
         return rows * max(
             config.hidden_size, config.num_key_value_heads * config.head_dim
         )

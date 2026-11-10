@@ -51,7 +51,8 @@ class PackedMTPProgram:
             or not 0 < context_size <= arena.max_context
         ):
             raise ValueError("invalid packed MTP capacities")
-        needed = token_size * max(
+        query_capacity = token_size + 1
+        needed = query_capacity * max(
             cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim
         )
         if arena.graph_storage.numel() - arena.scratch_offset < needed:
@@ -59,7 +60,8 @@ class PackedMTPProgram:
         self.heads, self.arena = heads, arena
         self.embedding, self.logits = embedding, logits
         self.max_batch, self.tokens, self.context = max_batch, token_size, context_size
-        self.kv_capacity = max_batch * context_size + token_size
+        self.query_capacity = query_capacity
+        self.kv_capacity = max_batch * context_size + query_capacity
         self.row_width = gcd(cfg.hidden_size, cfg.head_dim)
         row_elements = arena.graph_storage.numel() // self.row_width * self.row_width
         self.cache_rows = arena.graph_storage[:row_elements].view(-1, self.row_width)
@@ -92,7 +94,7 @@ class PackedMTPProgram:
         self.slots, self.lengths, self.limits = (view((requests,)) for _ in range(3))
         self.sequence = view((requests, self.sequence_width))
         self.output = torch.empty((max_batch, count), device=device, dtype=torch.long)
-        self.token_index = torch.arange(token_size, device=device)
+        self.token_index = torch.arange(query_capacity, device=device)
         self.key_index = torch.arange(self.kv_capacity, device=device)
         self.hidden_index = torch.arange(
             cfg.hidden_size // self.row_width, device=device
@@ -103,16 +105,19 @@ class PackedMTPProgram:
         self.hidden_sink = (
             arena.scratch_offset // self.row_width
             + torch.arange(
-                token_size * cfg.hidden_size // self.row_width, device=device
+                query_capacity * cfg.hidden_size // self.row_width, device=device
             )
-        ).view(token_size, cfg.hidden_size // self.row_width)
+        ).view(query_capacity, cfg.hidden_size // self.row_width)
         self.kv_sink = (
             arena.scratch_offset // self.row_width
             + torch.arange(
-                token_size * cfg.num_key_value_heads * cfg.head_dim // self.row_width,
+                query_capacity
+                * cfg.num_key_value_heads
+                * cfg.head_dim
+                // self.row_width,
                 device=device,
             )
-        ).view(token_size, cfg.num_key_value_heads, cfg.head_dim // self.row_width)
+        ).view(query_capacity, cfg.num_key_value_heads, cfg.head_dim // self.row_width)
         self.inverse = 1.0 / (
             cfg.rope_theta
             ** (
@@ -174,14 +179,14 @@ class PackedMTPProgram:
                 q_ends.append(q_total)
                 kv_ends.append(kv_total)
                 last[i] = q_total - 1
-            if q_total < self.tokens:
-                # Equal dummy Q/K lengths avoid all-masked right-causal rows.
-                kv_total += self.tokens - q_total
-                q_ends.append(self.tokens)
-                kv_ends.append(kv_total)
-                order.append(self.max_batch)
+            # A positive dummy Q exists even at the exact logical token limit.
+            # Its zero KV segment covers the remaining physical K/V capacity,
+            # satisfying strict non-PA TND tilers without changing tensor shapes.
+            q_ends.append(self.query_capacity)
+            kv_ends.append(self.kv_capacity)
+            order.append(self.max_batch)
             segments.append((tuple(q_ends), tuple(kv_ends)))
-            q_rows.append(q_ends + [self.tokens] * (r - len(q_ends)))
+            q_rows.append(q_ends + [self.query_capacity] * (r - len(q_ends)))
             kv_rows.append(kv_ends + [self.kv_capacity] * (r - len(kv_ends)))
             orders.append(order + [self.max_batch] * (r - len(order)))
             start_rows.append(starts)
@@ -289,16 +294,16 @@ class PackedMTPProgram:
             attn = block.decoder.self_attn
             q = attn.q_norm(
                 attn.q_proj(normed).view(
-                    self.tokens, cfg.num_attention_heads, cfg.head_dim
+                    self.query_capacity, cfg.num_attention_heads, cfg.head_dim
                 )
             )
             k = attn.k_norm(
                 attn.k_proj(normed).view(
-                    self.tokens, cfg.num_key_value_heads, cfg.head_dim
+                    self.query_capacity, cfg.num_key_value_heads, cfg.head_dim
                 )
             )
             v = attn.v_proj(normed).view(
-                self.tokens, cfg.num_key_value_heads, cfg.head_dim
+                self.query_capacity, cfg.num_key_value_heads, cfg.head_dim
             )
             frequencies = (anchor + depth).float().unsqueeze(-1) * self.inverse
             angles = torch.cat((frequencies, frequencies), -1)
@@ -345,7 +350,7 @@ class PackedMTPProgram:
                 0,
             )
             attended = self.attention(d, q, past_k, past_v, cfg.head_dim**-0.5)
-            residual = fused + attn.o_proj(attended.reshape(self.tokens, -1))
+            residual = fused + attn.o_proj(attended.reshape(self.query_capacity, -1))
             fresh = block.output_norm(
                 residual
                 + block.decoder.mlp(block.decoder.post_attention_layernorm(residual))
@@ -443,10 +448,11 @@ class TokenMTPGraphs:
             self.reserved_bytes = max(0, torch.npu.memory_reserved() - reserved)
         logger.info(
             "ASR_MTP_GRAPH_READY layout=tokens graphs=%d max_batch=%d token_sizes=%s "
-            "context=%d capture_ms=%.2f reserved_mib=%.2f",
+            "query_capacities=%s context=%d capture_ms=%.2f reserved_mib=%.2f",
             len(self.entries),
             self.options.max_batch,
             self.options.tokens,
+            tuple(t + 1 for t in self.options.tokens),
             self.options.context,
             (perf_counter() - started) * 1000,
             self.reserved_bytes / 1024**2,
@@ -498,10 +504,12 @@ class TokenMTPGraphs:
         if self.stats["replays"] == 1:
             logger.info(
                 "ASR_MTP_GRAPH_REPLAY layout=tokens batch=%d tokens=%d bucket=%d "
-                "context=%d heads=%d",
+                "query_capacity=%d kv_capacity=%d context=%d heads=%d",
                 len(states),
                 needed,
                 bucket,
+                program.query_capacity,
+                program.kv_capacity,
                 self.options.context,
                 self.heads.num_heads,
             )
