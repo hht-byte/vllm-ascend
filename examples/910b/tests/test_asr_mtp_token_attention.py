@@ -28,14 +28,25 @@ class PackedAttentionTests(unittest.TestCase):
             **kwargs,
         )
 
-    def test_packed_gqa_right_aligned_causality_ignores_unused_kv_tail(self):
+    def test_nonpa_tnd_rejects_unaccounted_physical_kv_capacity(self):
         attention = self.backend()
-        attention.stage(0, [2, 3, 5], [4, 6, 8])
+        attention.stage(0, [8], [1280])
+        with self.assertRaises(ValueError):
+            attention(
+                0,
+                self.t.zeros(8, 2, 4),
+                self.t.zeros(2304, 1, 4),
+                self.t.zeros(2304, 1, 4),
+                0.5,
+            )
+
+    def test_packed_gqa_uses_positive_dummy_for_entire_physical_kv_padding(self):
+        attention = self.backend()
+        attention.stage(0, [2, 3, 5], [4, 6, 10])
         q = self.t.zeros(5, 2, 4)
         k = self.t.zeros(10, 1, 4)
-        v = self.t.tensor([1, 3, 5, 7, 10, 20, 0, 0, float("nan"), float("nan")])
+        v = self.t.tensor([1, 3, 5, 7, 10, 20, 0, 0, 0, 0], dtype=q.dtype)
         v = v[:, None, None].expand(-1, 1, 4).contiguous()
-        k[8:] = float("nan")
         output = attention(0, q, k, v, 0.5)
         expected = self.t.tensor([3, 4, 15, 0, 0], dtype=q.dtype)[:, None, None].expand_as(q)
         self.t.testing.assert_close(output, expected)
@@ -56,15 +67,18 @@ class PackedAttentionTests(unittest.TestCase):
 
     def test_staged_boundaries_change_without_changing_tensor_capacities(self):
         attention = self.backend()
-        q = self.t.zeros(3, 2, 4)
+        q = self.t.zeros(4, 2, 4)
         k = self.t.zeros(8, 1, 4)
         v = self.t.tensor([1, 3, 5, 7, 10, 20, 0, 0], dtype=q.dtype)[:, None, None].expand(-1, 1, 4)
-        attention.stage(0, [2, 3], [4, 6])
+        attention.stage(0, [2, 3, 4], [4, 6, 8])
         first = attention(0, q, k, v, 1.0)
-        attention.stage(0, [1, 3], [2, 6])
+        attention.stage(0, [1, 3, 4], [2, 6, 8])
         second = attention(0, q, k, v, 1.0)
-        self.t.testing.assert_close(first, self.t.tensor([3, 4, 15], dtype=q.dtype)[:, None, None].expand_as(q))
-        self.t.testing.assert_close(second, self.t.tensor([2, 22 / 3, 10.5])[:, None, None].expand_as(q))
+        self.t.testing.assert_close(
+            first,
+            self.t.tensor([3, 4, 15, 0], dtype=q.dtype)[:, None, None].expand_as(q),
+        )
+        self.t.testing.assert_close(second, self.t.tensor([2, 22 / 3, 10.5, 0])[:, None, None].expand_as(q))
 
     def test_call_rejects_uncovered_query_and_kv_capacities(self):
         attention = self.backend()
@@ -91,24 +105,24 @@ class PackedAttentionTests(unittest.TestCase):
         runtime = FakeRuntime()
         api = FakeAPI(self.t, runtime)
         attention = self.backend(head_dim=128, heads=2, npu_api=api, npu_runtime=runtime)
-        q = self.t.zeros(3, 2, 128)
+        q = self.t.zeros(4, 2, 128)
         k = self.t.zeros(8, 1, 128)
         v = self.t.zeros_like(k)
         for head in range(2):
-            attention.stage(head, [1, 3], [2, 6])
+            attention.stage(head, [1, 3, 4], [2, 6, 8])
             attention(head, q, k, v, 0.25)
         attention.begin_capture()
         outputs = [attention(head, q, k, v, 0.25) for head in range(2)]
         attention.end_capture()
         before = api.workspaces
         for head in range(2):
-            attention.stage(head, [2, 3], [4, 6])
+            attention.stage(head, [2, 3, 4], [4, 6, 8])
         attention.update()
         self.assertEqual(api.workspaces, before)
         updates = api.calls[-2:]
         for head, call in enumerate(updates):
-            self.assertEqual(call["actual_seq_lengths"], (2, 3))
-            self.assertEqual(call["actual_seq_lengths_kv"], (4, 6))
+            self.assertEqual(call["actual_seq_lengths"], (2, 3, 4))
+            self.assertEqual(call["actual_seq_lengths_kv"], (4, 6, 8))
             self.assertEqual(call["input_layout"], "TND")
             self.assertEqual(call["sparse_mode"], 3)
             self.assertEqual(call["out"][0].data_ptr(), outputs[head].data_ptr())
@@ -201,10 +215,12 @@ class FakeAPI:
         self.npu_fused_infer_attention_score = SimpleNamespace(out=self.out)
 
     def _npu_fused_infer_attention_score_get_max_workspace(self, **kwargs):
+        self.validate_tnd(kwargs)
         self.workspaces += 1
         return self.t.empty(64, dtype=self.t.uint8)
 
     def out(self, **kwargs):
+        self.validate_tnd(kwargs)
         self.calls.append(
             {
                 **kwargs,
@@ -214,6 +230,12 @@ class FakeAPI:
         )
         kwargs["out"][0].zero_()
         return kwargs["out"]
+
+    def validate_tnd(self, kwargs):
+        if kwargs.get("input_layout") == "TND":
+            assert kwargs["actual_seq_lengths"][-1] == kwargs["query"].shape[0]
+            assert kwargs["actual_seq_lengths_kv"][-1] == kwargs["key"].shape[0]
+            assert kwargs["actual_seq_lengths_kv"][-1] == kwargs["value"].shape[0]
 
 
 def npu_available():
@@ -227,17 +249,16 @@ def npu_available():
 
 @unittest.skipUnless(npu_available(), "requires torch-npu and an available NPU")
 class ActualPackedAttentionReplayTests(unittest.TestCase):
-    def test_task_update_changes_segment_count_and_ignores_unused_kv_capacity(self):
+    def test_task_update_changes_positive_segments_while_covering_physical_kv(self):
         import torch
         from asr_mtp_token_attention import PackedAttention, PackedNPUCapture
 
         class Program:
             def __init__(self):
                 self.attention = PackedAttention(2, 1, 128, device="npu", dtype=torch.float16, heads=1)
-                self.query = torch.randn(8, 2, 128, device="npu", dtype=torch.float16)
+                self.query = torch.randn(9, 2, 128, device="npu", dtype=torch.float16)
                 self.key = torch.randn(20, 1, 128, device="npu", dtype=torch.float16)
                 self.value = torch.randn_like(self.key)
-                self.key[12:] = self.value[12:] = float("nan")
 
             def run(self):
                 self.output = self.attention(0, self.query, self.key, self.value, 128**-0.5)
@@ -246,15 +267,20 @@ class ActualPackedAttentionReplayTests(unittest.TestCase):
         torch.manual_seed(318)
         with torch.inference_mode():
             program = Program()
-            program.attention.stage(0, [2, 5, 8], [4, 9, 12])
+            program.query[8:] = program.key[12:] = program.value[12:] = 0
+            program.attention.stage(0, [2, 5, 8, 9], [4, 9, 12, 20])
             replay = PackedNPUCapture().capture(program)
             reference = PackedAttention(2, 1, 128, device="cpu", dtype=torch.float32, heads=1)
             for qends, kvends in (
-                ([2, 5, 8], [4, 9, 12]),
-                ([1, 8], [3, 10]),
-                ([8], [12]),
+                ([2, 5, 8, 9], [4, 9, 12, 20]),
+                ([1, 8, 9], [3, 10, 20]),
+                ([8, 9], [12, 20]),
             ):
                 program.query.copy_(torch.randn_like(program.query))
+                program.key.copy_(torch.randn_like(program.key))
+                program.value.copy_(torch.randn_like(program.value))
+                program.query[qends[-2] :] = 0
+                program.key[kvends[-2] :] = program.value[kvends[-2] :] = 0
                 program.attention.stage(0, qends, kvends)
                 replay()
                 reference.stage(0, qends, kvends)

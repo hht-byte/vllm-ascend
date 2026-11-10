@@ -210,9 +210,11 @@ independent of per-request context capacity and of the target FULL graph size.
 Packed projections and MLP use `[T,H]`. One segmented FIA TND attention per head
 isolates requests using staged cumulative Q/KV lengths, with graph task updates
 before replay. Fixed request-slot logits gather only each request's last hidden
-row; unused request slots still incur LM-head computation. Dummy Q/KV segments
-have equal lengths to avoid all-masked padded queries. Arena layout, row updates,
-rejection cropping and target verification are unchanged.
+row; unused request slots still incur LM-head computation. Every logical token
+bucket reserves one extra physical query row. A positive-query dummy segment
+owns all remaining zero-filled KV rows, with dummy KV length at least dummy Q
+length. Arena layout, row updates, rejection cropping and target verification
+are unchanged.
 
 The token NPU backend requires FP16/BF16, supported FIA head dimensions
 (currently 128/192), FIA out/max-workspace APIs and graph task updates. Workspace
@@ -222,6 +224,32 @@ step latency, commit P95/P99, queueing and reserved memory under equal load.
 Device capture/replay and performance have not been established on this host.
 Each replay performs one host task update per auxiliary head; this rebinding
 cost and fixed request-slot logits must be included in the performance comparison.
+
+## Strict non-PA TND KV coverage fix
+
+Some deployed CANN versions require the final cumulative KV length to equal
+physical K/V T exactly. The original token implementation left an unused KV
+tail and can fail startup with `keyT/valueT must be equal to ...
+actualSeqenceLengthKV`. For an installed initial token version, apply only:
+
+```bash
+git apply --check examples/910b/asr_mtp_tnd_kv_coverage_v023.patch
+git apply examples/910b/asr_mtp_tnd_kv_coverage_v023.patch
+```
+
+The fresh, cumulative graph and row-cache-to-token patches already contain this
+fix. Do not stack them with the focused fix. Other source versions should use
+the exporter against the actual checkout. Restart workers normally; service
+configuration is unchanged.
+
+A logical bucket of 512 still accommodates 512 real fresh positions; its
+physical query capacity is 513. The always-positive dummy query segment absorbs
+the entire remaining physical KV capacity, including at the exact logical
+bucket boundary. This avoids zero-query segments and runtime tensor shape
+changes. The backend checks exact cumulative Q/KV coverage before FIA.
+`ASR_MTP_GRAPH_READY` logs logical `token_sizes` and physical
+`query_capacities`; the first replay also logs `bucket`, `query_capacity` and
+`kv_capacity`. The extra row's performance impact still needs device measurement.
 
 ## Device test
 
