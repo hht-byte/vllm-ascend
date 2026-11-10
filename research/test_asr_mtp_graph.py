@@ -464,6 +464,161 @@ class GraphDispatchTests(TinyMTPFixture, unittest.TestCase):
                 graph_options(settings, context=512, slots=100, max_batch=100)
 
 
+@unittest.skipUnless(importlib.util.find_spec("torch"), "requires Torch")
+class TokenGraphOptionsTests(unittest.TestCase):
+    def test_token_capacities_are_independent_of_per_request_context_and_batch(self):
+        from asr_mtp_graph import graph_options
+
+        options = graph_options(
+            {
+                "graph_mode": "full",
+                "graph_query_sizes": [8, 64],
+                "graph_token_sizes": [512, 8, 32, 64, 128, 256, 8],
+                "graph_context_tokens": 128,
+                "graph_max_batch_size": 8,
+            },
+            context=512,
+            slots=23,
+            max_batch=20,
+        )
+        self.assertEqual(getattr(options, "tokens", ()), (8, 32, 64, 128, 256, 512))
+        self.assertEqual(options.queries, ())
+        self.assertEqual(options.max_batch, 8)
+        self.assertEqual(options.context, 128)
+        geometry = SimpleNamespace(hidden_size=8, num_key_value_heads=1, head_dim=4)
+        # A token graph stages 512 rows, independent of its eight request slots.
+        self.assertEqual(options.scratch_elements(geometry), 4096)
+
+    def test_token_mode_counts_graphs_without_multiplying_by_batch_slots(self):
+        from asr_mtp_graph import graph_options
+
+        options = graph_options(
+            {
+                "graph_mode": "full",
+                "graph_token_sizes": list(range(1, 65)),
+                "graph_max_batch_size": 8,
+            },
+            context=128,
+            slots=8,
+            max_batch=8,
+        )
+        self.assertEqual(len(getattr(options, "tokens", ())), 64)
+
+    def test_malformed_token_sizes_fail_before_arena_allocation(self):
+        from asr_mtp_graph import graph_options
+
+        for sizes in (
+            None,
+            False,
+            True,
+            [],
+            "512",
+            [0],
+            [-1],
+            [True],
+            [8.0],
+            list(range(1, 66)),
+        ):
+            with self.subTest(sizes=sizes), self.assertRaises(ValueError):
+                graph_options(
+                    {"graph_mode": "full", "graph_token_sizes": sizes},
+                    context=128,
+                    slots=8,
+                    max_batch=8,
+                )
+
+    def test_old_query_mode_and_master_off_remain_unchanged(self):
+        from asr_mtp_graph import GraphOptions, graph_options
+
+        old = GraphOptions(2, (8,), 16)
+        self.assertEqual(getattr(old, "tokens", ()), ())
+        geometry = SimpleNamespace(hidden_size=8, num_key_value_heads=1, head_dim=4)
+        self.assertEqual(old.scratch_elements(geometry), 128)
+        self.assertIsNone(
+            graph_options(
+                {"graph_mode": "off", "graph_token_sizes": None},
+                context=16,
+                slots=2,
+                max_batch=2,
+            )
+        )
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "requires Torch")
+class TokenQueryBucketTests(unittest.TestCase):
+    def make_states(self, lengths, starts):
+        import torch
+        from asr_mtp_heads import CacheArena
+
+        config = SimpleNamespace(hidden_size=8, num_key_value_heads=1, head_dim=4)
+        arena = CacheArena(
+            config,
+            3,
+            max_context=256,
+            slots=len(lengths),
+            device="cpu",
+            dtype=torch.float32,
+        )
+        states = [arena.acquire() for _ in lengths]
+        for state, length, valid in zip(states, lengths, starts):
+            state.length = length
+            for head, start in zip(state.heads, valid):
+                head.valid = start
+        return states
+
+    def graphs(self, *, tokens=(8, 32, 64, 128, 256), batch=8, context=128):
+        return SimpleNamespace(
+            options=SimpleNamespace(
+                tokens=tokens, queries=(), max_batch=batch, context=context
+            ),
+            heads=SimpleNamespace(num_heads=3),
+        )
+
+    def groups(self, states, limits, graphs):
+        from asr_mtp_worker import query_buckets
+
+        return sorted(
+            tuple(group) for group in query_buckets(states, limits, graphs).values()
+        )
+
+    def test_different_fresh_query_lengths_share_one_token_batch(self):
+        states = self.make_states([10, 100, 80], [[4] * 3, [20] * 3, [35] * 3])
+        # Six + eighty + forty-five fresh positions fit one 256-token graph.
+        self.assertEqual(self.groups(states, [3] * 3, self.graphs()), [(0, 1, 2)])
+
+    def test_packing_uses_maximum_per_head_sum_and_ignores_inactive_heads(self):
+        states = self.make_states([10, 10], [[4, 0, 0], [9, 4, 4]])
+        # Active head totals are [7, 6, 6]; summing per-request maxima gives 12.
+        self.assertEqual(
+            self.groups(states, [1, 3], self.graphs(tokens=(8,))), [(0, 1)]
+        )
+
+    def test_packing_splits_before_exceeding_total_token_capacity(self):
+        states = self.make_states([10, 100, 80], [[4] * 3, [20] * 3, [35] * 3])
+        self.assertEqual(
+            self.groups(states, [3] * 3, self.graphs(tokens=(8, 128))), [(0, 1), (2,)]
+        )
+
+    def test_packing_respects_request_slot_limit(self):
+        states = self.make_states([5] * 3, [[2] * 3] * 3)
+        self.assertEqual(
+            self.groups(states, [3] * 3, self.graphs(tokens=(32,), batch=2)),
+            [(0, 1), (2,)],
+        )
+
+    def test_context_overflow_does_not_pull_valid_rows_into_eager(self):
+        states = self.make_states([10, 129, 10], [[8] * 3, [127] * 3, [7] * 3])
+        self.assertEqual(
+            self.groups(states, [3] * 3, self.graphs(tokens=(8,))), [(0, 2), (1,)]
+        )
+
+    def test_single_request_token_overflow_does_not_pull_valid_rows_into_eager(self):
+        states = self.make_states([10, 12, 10], [[8] * 3, [3] * 3, [7] * 3])
+        self.assertEqual(
+            self.groups(states, [3] * 3, self.graphs(tokens=(8,))), [(0, 2), (1,)]
+        )
+
+
 def npu_available():
     if importlib.util.find_spec("torch_npu") is None:
         return False

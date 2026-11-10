@@ -25,6 +25,8 @@ git apply /tmp/asr-mtp.patch
 | --- | --- |
 | `asr_mtp_heads.py` | `vllm_ascend/spec_decode/asr_mtp_heads.py` |
 | `asr_mtp_graph.py` | `vllm_ascend/spec_decode/asr_mtp_graph.py` |
+| `asr_mtp_token_graph.py` | `vllm_ascend/spec_decode/asr_mtp_token_graph.py` |
+| `asr_mtp_token_attention.py` | `vllm_ascend/spec_decode/asr_mtp_token_attention.py` |
 | `asr_mtp_worker.py` | `vllm_ascend/spec_decode/asr_mtp_worker.py` |
 | `patch_external_draft_mtp.py` | `vllm_ascend/patch/worker/patch_external_draft_mtp.py` |
 | 注册 import | `vllm_ascend/worker/worker.py`，紧接 `NPUModelRunner` 的导入；受 0.23 版本条件保护 |
@@ -166,6 +168,38 @@ python -m unittest discover -s research -p 'test_asr_mtp_graph.py' -v
 ```
 
 NPU 用例不得显示 skipped；之后按相同 checkpoint、head 数、Prespec、并发与负载对照 `graph_mode=off/full`，比较完整目标输出、接受率、commit P95/P99、prefill/decode 和峰值显存。这里没有本地 NPU 性能验收结果。
+
+### Packed token 图：合并不同补算长度
+
+新增 `graph_token_sizes` 后，辅助图按总 token 容量捕获；不设置该字段时继续使用原来的 `(batch, query)` 图。两种配置同时存在时，token 配置优先。仍使用现有三参数服务工厂，合并配置不会覆盖 checkpoint 等原有字段：
+
+```python
+additional = dict(base_config.get("additional_config") or {})
+mtp_settings = dict(additional.get("asr_mtp") or {})
+mtp_settings.update({
+    "graph_mode": "full",
+    "graph_token_sizes": [8, 32, 64, 128, 256, 512],
+    "graph_max_batch_size": 8,
+    "graph_context_tokens": 128,
+})
+additional["asr_mtp"] = mtp_settings
+base_config["additional_config"] = additional
+base_config = mtp_engine_config(
+    base_config,
+    mtp_enabled=mtp_enabled,
+    mtp_checkpoint=mtp_checkpoint,
+)
+```
+
+令请求 i 在辅助头 d 上的补算量为 `q[i,d] = history_length[i] - head_valid[i,d]`，超出该请求 head 预算的项取 0。图容量取能容纳 `max_d sum_i q[i,d]` 的最小 token 档位，五个头按顺序复用这一静态容量，不把五头 token 数相加。每个 head 各自紧凑打包为 `[T,H]`，通过请求边界、slot 和 anchor 元数据保持缓存和 attention 隔离。例如补算量 6、80、45 的三条请求可合并为一个 256-token 图。
+
+同一目标 step 的请求不再按单请求 Q 分桶；仅在总 token 超过最大档位或请求数超过固定槽上限时拆批。历史超过 context 容量、单请求补算超过最大 token 桶以及原有采样/预算条件继续使用 eager 回退。`graph_context_tokens=128` 表示每请求历史容量；总 token 桶可以为 512，不要求两者相等，也不跟随主模型本轮 FULL 图的大小。
+
+投影、MLP、RoPE 和行缓存操作使用 packed token；attention 使用单次 FIA TND 调用处理所有活动请求，并在 replay 前更新各头的 CPU 累积 query/KV 长度。保留固定请求槽的 LM head，只从各请求最后一个补算位置抽取 hidden，不对全部 T 行做词表投影。未使用请求槽仍有 LM 矩阵计算，需在同负载对比中计入。
+
+所选 910B FIA 入口要求 FP16/BF16 和受支持的 head dimension（当前校验 128/192）；NPU 图启动需要 FIA out、最大 workspace 和 graph task update API。workspace 在启动分配，replay 不分配 workspace、不读取设备 token 或长度到 CPU。矩形图与 MTP eager 路径不受此 FIA 几何限制。dummy query/KV 段等长，避免 padding 行出现全 masked attention。每次 replay 前每个 head 有一次主机 task update；这部分重绑定和固定请求槽的开销需要与减少 replay/补齐计算的收益一起评估。
+
+已安装行缓存优化版的服务可应用 `examples/910b/asr_mtp_token_graph_v023.patch` 聚焦升级；完整安装和累计图补丁已包含此升级，不要连续叠加。当前实现仍需真实 910B 捕获、变长 replay 和时延验收，CPU/FIA 接口模拟测试不能证明设备性能收益。
 
 ### 支持范围与缓存
 

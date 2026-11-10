@@ -28,6 +28,32 @@ def request_enabled(params):
 
 def query_buckets(states, limits, graphs=None):
     buckets = {}
+    if graphs is not None and getattr(graphs.options, 'tokens', ()):
+        # Keep one batch across fresh-query lengths. Split only at token/request
+        # limits; use per-head totals because requests may have different budgets.
+        depth = graphs.heads.num_heads
+        token_limit = graphs.options.tokens[-1]
+        totals, group = [0] * depth, []
+        group_index = 0
+        for i, (state, limit) in enumerate(zip(states, limits)):
+            spans = [state.length - head.valid if d < limit else 0
+                     for d, head in enumerate(state.heads)]
+            span = max(spans)
+            if state.length > graphs.options.context or span > token_limit:
+                buckets.setdefault(('eager', (span - 1).bit_length()), []).append(i)
+                continue
+            combined = [old + fresh for old, fresh in zip(totals, spans)]
+            if group and (len(group) >= graphs.options.max_batch or
+                          max(combined) > token_limit):
+                buckets['tokens', group_index] = group
+                group_index += 1
+                totals, group = [0] * depth, []
+                combined = spans
+            group.append(i)
+            totals = combined
+        if group:
+            buckets['tokens', group_index] = group
+        return buckets
     for i, (state, limit) in enumerate(zip(states, limits)):
         span = max(state.length - head.valid for head in state.heads[:limit])
         graph_query = (next((q for q in graphs.options.queries if span <= q), None)
@@ -284,7 +310,7 @@ def load_worker(runner, target, settings):
     validate_engine(runner)
     allowed = {'checkpoint', 'num_heads', 'max_context_tokens', 'cache_mib', 'max_requests',
                'verify_base_signature', 'graph_mode', 'graph_context_tokens',
-               'graph_query_sizes', 'graph_max_batch_size'}
+               'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size'}
     if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
         raise ValueError('invalid additional_config.asr_mtp settings')
     for name, default in (('num_heads', 5), ('max_context_tokens', 512),
@@ -327,15 +353,25 @@ def load_worker(runner, target, settings):
     language = target.get_language_model() if hasattr(target, 'get_language_model') else target.language_model
     eos = getattr(text, 'eos_token_id', None)
     eos = set(eos if isinstance(eos, (tuple, list)) else [eos]) - {None}
-    graphs = (MTPGraphs(options, model, arena, language.embed_input_ids, language.compute_logits)
-              if options is not None else None)
+    graphs = None
+    if options is not None:
+        graph_class = MTPGraphs
+        if options.tokens:
+            try:
+                from .asr_mtp_token_graph import TokenMTPGraphs
+            except ImportError:
+                from asr_mtp_token_graph import TokenMTPGraphs
+            graph_class = TokenMTPGraphs
+        graphs = graph_class(options, model, arena, language.embed_input_ids,
+                             language.compute_logits)
     worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits,
                        eos, graphs=graphs)
     logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
-                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f',
+                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s',
                 heads, cap, slots, arena.storage.numel() * arena.storage.element_size() / 1024 ** 2,
                 settings['checkpoint'], settings.get('verify_base_signature', False),
                 settings.get('graph_mode', 'off'),
                 (arena.graph_storage.numel() - arena.scratch_offset) *
-                arena.storage.element_size() / 1024 ** 2)
+                arena.storage.element_size() / 1024 ** 2,
+                'tokens' if options is not None and options.tokens else 'rectangular')
     return worker

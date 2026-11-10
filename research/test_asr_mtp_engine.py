@@ -401,6 +401,14 @@ class EngineHeadsTests(unittest.TestCase):
             self.assertEqual(worker.heads.num_heads, 2)
             self.assertEqual(worker.arena.storage.shape[0], 2)
             self.assertIs(worker.embedding, self.embed)
+            packed = load_worker(runner, target, {
+                **settings, 'graph_mode': 'full', 'graph_context_tokens': 16,
+                'graph_token_sizes': [8, 32, 64],
+            })
+            self.assertEqual(type(packed.graphs).__name__, 'TokenMTPGraphs')
+            self.assertEqual(packed.graphs.options.tokens, (8, 32, 64))
+            self.assertEqual(packed.arena.graph_storage.numel() - packed.arena.scratch_offset, 512)
+            self.assertFalse(packed.graphs.ready)
             (root / 'config.json').write_text('{"changed":true}', encoding='utf-8')
             self.assertEqual(load_worker(runner, target, settings).heads.num_heads, 2)
             settings['verify_base_signature'] = True

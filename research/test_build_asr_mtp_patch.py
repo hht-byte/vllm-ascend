@@ -59,7 +59,7 @@ class PatchExportTests(unittest.TestCase):
                 stream.write('\n    def sample_tokens(self):\n        self._bookkeeping_sync()\n        propose_draft_token_ids(valid_sampled_token_ids)\n')
             patch = make_patch(root)
             self.assertIn('+++ b/vllm_ascend/spec_decode/asr_mtp_graph.py', patch)
-            self.assertEqual(patch.count('--- /dev/null'), 4)
+            self.assertEqual(patch.count('--- /dev/null'), 6)
             self.assertNotIn('+++ b/vllm_ascend/worker/model_runner_v1.py', patch)
             self.assertIn('+++ b/vllm_ascend/worker/worker.py', patch)
             self.assertNotIn('+++ b/vllm_ascend/patch/worker/__init__.py', patch)
@@ -127,7 +127,7 @@ class PatchExportTests(unittest.TestCase):
                         if name == 'vllm_ascend' or name.startswith('vllm_ascend.'):
                             del sys.modules[name]
                     utils = ModuleType('vllm_ascend.utils')
-                    utils.vllm_version_is = lambda version: supported
+                    utils.vllm_version_is = lambda version, supported=supported: supported
                     sys.modules.update({external.__name__: external, mtp.__name__: mtp,
                                         utils.__name__: utils})
                     with patch.object(sys, 'path', [str(root), *sys.path]):
@@ -181,7 +181,11 @@ class PatchExportTests(unittest.TestCase):
         lines = (directory / 'asr_mtp_v023.patch').read_text(encoding='utf-8').splitlines(keepends=True)
         self.assertNotIn(' \n', lines)
         for name in ('asr_mtp_heads.py', 'asr_mtp_worker.py', 'asr_mtp_graph.py',
+                     'asr_mtp_token_attention.py', 'asr_mtp_token_graph.py',
                      'patch_external_draft_mtp.py'):
+            self.assertIn('+++ b/vllm_ascend/' +
+                          ('patch/worker/' if name.startswith('patch_') else 'spec_decode/') +
+                          name + '\n', lines, name)
             start = next(i for i, line in enumerate(lines) if line.startswith('+++ b/') and line.rstrip().endswith('/' + name))
             section = []
             for line in lines[start + 1:]:

@@ -36,12 +36,12 @@ class GraphOptions:
     max_batch: int
     queries: tuple[int, ...]
     context: int
+    tokens: tuple[int, ...] = ()
 
     def scratch_elements(self, config):
-        return (
-            self.max_batch
-            * max(self.queries)
-            * max(config.hidden_size, config.num_key_value_heads * config.head_dim)
+        rows = max(self.tokens) if self.tokens else self.max_batch * max(self.queries)
+        return rows * max(
+            config.hidden_size, config.num_key_value_heads * config.head_dim
         )
 
 
@@ -57,9 +57,28 @@ def graph_options(settings, *, context, slots, max_batch):
         raise ValueError(
             "asr_mtp.graph_context_tokens exceeds the auxiliary context capacity"
         )
-    queries = settings.get("graph_query_sizes", (min(8, capacity), min(64, capacity)))
     if type(batch) is not int or batch < 1:
         raise ValueError("asr_mtp.graph_max_batch_size must be a positive integer")
+    batch = min(batch, slots, max_batch)
+    if batch < 1:
+        raise ValueError("asr_mtp graphs require at least one request slot")
+    if "graph_token_sizes" in settings:
+        tokens = settings["graph_token_sizes"]
+        if (
+            not isinstance(tokens, (list, tuple))
+            or not tokens
+            or any(type(t) is not int or t < 1 for t in tokens)
+        ):
+            raise ValueError(
+                "asr_mtp.graph_token_sizes must contain positive token capacities"
+            )
+        tokens = tuple(sorted(set(tokens)))
+        if len(tokens) > MAX_MTP_GRAPHS:
+            raise ValueError(
+                f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}"
+            )
+        return GraphOptions(batch, (), capacity, tokens)
+    queries = settings.get("graph_query_sizes", (min(8, capacity), min(64, capacity)))
     if (
         not isinstance(queries, (list, tuple))
         or not queries
@@ -69,8 +88,7 @@ def graph_options(settings, *, context, slots, max_batch):
             "asr_mtp.graph_query_sizes must contain positive query capacities"
         )
     queries = tuple(sorted(set(queries)))
-    batch = min(batch, slots, max_batch)
-    if batch < 1 or batch * len(queries) > MAX_MTP_GRAPHS:
+    if batch * len(queries) > MAX_MTP_GRAPHS:
         raise ValueError(f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}")
     return GraphOptions(batch, queries, capacity)
 
