@@ -7,6 +7,12 @@ from types import SimpleNamespace
 
 
 class TinyMTPFixture:
+    hidden_size = 8
+    attention_heads = 2
+    context_size = 16
+    query_size = 8
+    scratch_extra = 0
+
     def setUp(self):
         import torch
         from asr_mtp_heads import BatchedMTPHeads, CacheArena
@@ -15,9 +21,9 @@ class TinyMTPFixture:
         torch.manual_seed(1729)
         torch.set_num_threads(1)
         self.cfg = SimpleNamespace(
-            hidden_size=8,
+            hidden_size=self.hidden_size,
             intermediate_size=16,
-            num_attention_heads=2,
+            num_attention_heads=self.attention_heads,
             num_key_value_heads=1,
             head_dim=4,
             attention_bias=False,
@@ -28,10 +34,15 @@ class TinyMTPFixture:
         )
         self.eager = BatchedMTPHeads(self.cfg, 3).eval()
         self.fixed = deepcopy(self.eager)
-        self.embed = torch.nn.Embedding(32, 8).eval()
-        self.logits = torch.nn.Linear(8, 32).eval()
+        self.embed = torch.nn.Embedding(32, self.cfg.hidden_size).eval()
+        self.logits = torch.nn.Linear(self.cfg.hidden_size, 32).eval()
         self.old = CacheArena(
-            self.cfg, 3, max_context=16, slots=3, device="cpu", dtype=torch.float32
+            self.cfg,
+            3,
+            max_context=self.context_size,
+            slots=3,
+            device="cpu",
+            dtype=torch.float32,
         )
         try:
             from asr_mtp_graph import FixedMTPProgram
@@ -40,11 +51,12 @@ class TinyMTPFixture:
         self.new = CacheArena(
             self.cfg,
             3,
-            max_context=16,
+            max_context=self.context_size,
             slots=3,
             device="cpu",
             dtype=torch.float32,
-            scratch_elements=2 * 8 * 8,
+            scratch_elements=2 * self.query_size * self.cfg.hidden_size
+            + self.scratch_extra,
         )
         # Unwritten padding may contain arbitrary allocator data, including NaN.
         self.old.storage.fill_(float("nan"))
@@ -55,15 +67,15 @@ class TinyMTPFixture:
             self.embed,
             self.logits,
             batch_size=2,
-            query_size=8,
-            context_size=16,
+            query_size=self.query_size,
+            context_size=self.context_size,
         )
         self.a = [self.old.acquire(), self.old.acquire()]
         self.b = [self.new.acquire(), self.new.acquire()]
         self.ids = [list(range(3, 10)), list(range(10, 13))]
         for a, b, row in zip(self.a, self.b, self.ids):
             a.length = b.length = len(row)
-            hidden = torch.randn(len(row), 8)
+            hidden = torch.randn(len(row), self.cfg.hidden_size)
             a.target[: len(row)].copy_(hidden)
             b.target[: len(row)].copy_(hidden)
 
@@ -75,12 +87,15 @@ class TinyMTPFixture:
             self.program.commit(b, limits)
         self.t.testing.assert_close(actual, expected)
         for first, second in zip(a, b):
-            for old, new in zip(first.heads, second.heads):
+            for depth, (old, new) in enumerate(zip(first.heads, second.heads)):
                 self.assertEqual(old.valid, new.valid)
                 n = old.valid
-                self.t.testing.assert_close(
-                    old.hidden[:n], new.hidden[:n], atol=2e-6, rtol=2e-5
-                )
+                # Only a successor head consumes this hidden history. The
+                # globally final head retains KV/valid, but need not store it.
+                if depth + 1 < len(first.heads):
+                    self.t.testing.assert_close(
+                        old.hidden[:n], new.hidden[:n], atol=2e-6, rtol=2e-5
+                    )
                 self.t.testing.assert_close(
                     old.key[:, :n], new.key[:, :n], atol=2e-6, rtol=2e-5
                 )
@@ -92,6 +107,79 @@ class TinyMTPFixture:
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "requires Torch")
 class FixedMTPTests(TinyMTPFixture, unittest.TestCase):
+    def test_cache_transfers_use_compact_row_indices(self):
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        torch = self.t
+        arena_pointer = self.new.graph_storage.untyped_storage().data_ptr()
+        reads = []
+        token_writes = []
+
+        class Transfers(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if (
+                    func == torch.ops.aten.index_select.default
+                    and args[0].untyped_storage().data_ptr() == arena_pointer
+                ):
+                    reads.append((args[0].ndim, args[2].numel()))
+                if func == torch.ops.aten.scatter_.src and args[0].dtype == torch.long:
+                    token_writes.append(args[0].shape)
+                return func(*args, **(kwargs or {}))
+
+        self.program.stage(self.b, [row + [4] for row in self.ids], [3, 3])
+        with torch.inference_mode(), Transfers():
+            self.program.run()
+        # B=2, Q=8, K=16, hidden=8, KV dim=4: each transfer
+        # needs at most 32 row indices, rather than 128 scalar addresses.
+        self.assertEqual(len(reads), 9)
+        self.assertTrue(all(rank == 2 and size <= 32 for rank, size in reads), reads)
+        # The final prediction is already in output and has no sequence reader.
+        self.assertEqual(len(token_writes), 2)
+
+    def test_final_head_hidden_is_not_written_but_multiround_outputs_match(self):
+        draft = self.compare(self.a, self.b, [row + [4] for row in self.ids], [3, 1])
+        for state in self.b:
+            self.assertTrue(self.t.isnan(state.heads[-1].hidden).all())
+        for i, (a, b, row) in enumerate(zip(self.a, self.b, self.ids)):
+            row.extend([4, int(draft[i, 0])])
+            old_end = a.length
+            a.length = b.length = len(row)
+            hidden = self.t.randn(2, self.cfg.hidden_size)
+            a.target[old_end : a.length] = b.target[old_end : b.length] = hidden
+            a.crop_heads(a.length)
+            b.crop_heads(b.length)
+        # A per-request short budget must not discard non-final hidden needed
+        # when that same row receives a larger budget on the next invocation.
+        self.compare(self.a, self.b, [row + [5] for row in self.ids], [3, 3])
+        for state in self.b:
+            self.assertTrue(self.t.isnan(state.heads[-1].hidden).all())
+
+    def test_eager_fallback_then_graph_reuses_the_same_row_cache(self):
+        for step in range(3):
+            rows = [row + [4 + step] for row in self.ids]
+            if step == 1:
+                # A reduced budget can route a graph-owned cache through eager.
+                with self.t.inference_mode():
+                    expected = self.eager.propose(
+                        self.a, rows, self.embed, self.logits, [1, 2]
+                    )
+                    actual = self.fixed.propose(
+                        self.b, rows, self.embed, self.logits, [1, 2]
+                    )
+                self.t.testing.assert_close(actual, expected)
+            else:
+                self.compare(self.a, self.b, rows, [3, 3])
+            if step < 2:
+                for a, b, row in zip(self.a, self.b, self.ids):
+                    row.append(4 + step)
+                    hidden = self.t.randn(1, self.cfg.hidden_size)
+                    a.target[a.length : a.length + 1] = hidden
+                    b.target[b.length : b.length + 1] = hidden
+                    a.length += 1
+                    b.length += 1
+                    a.crop_heads(a.length)
+                    b.crop_heads(b.length)
+
     def test_mixed_lengths_and_budgets_match_eager_and_do_not_write_other_slots(self):
         untouched = self.new.storage[2].clone()
         self.compare(self.a, self.b, [row + [4] for row in self.ids], [3, 1])
@@ -154,6 +242,22 @@ class FixedMTPTests(TinyMTPFixture, unittest.TestCase):
             a.crop_heads(16)
             b.crop_heads(16)
         self.compare(self.a, self.b, [[3] * 17] * 2, [3, 3])
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "requires Torch")
+class RowAlignmentTests(TinyMTPFixture, unittest.TestCase):
+    hidden_size = 12
+    attention_heads = 3
+    context_size = 7  # A KV region has 7*4=28 elements, not divisible by hidden=12.
+    query_size = 7
+    scratch_extra = 1  # A spare trailing scalar must not invalidate row views.
+
+    def test_unaligned_scratch_tail_and_partial_hidden_rows_preserve_cache(self):
+        untouched = self.new.storage[2].clone()
+        self.new.graph_storage[-1] = 123.0
+        self.compare(self.a, self.b, [row + [4] for row in self.ids], [3, 3])
+        self.t.testing.assert_close(self.new.storage[2], untouched, equal_nan=True)
+        self.assertEqual(float(self.new.graph_storage[-1]), 123.0)
 
 
 class CPUCapture:
@@ -432,14 +536,25 @@ class ActualNPUReplayTests(unittest.TestCase):
                 actual = graphs.propose(right, rows, [2, 2]).clone()
                 torch.testing.assert_close(actual, expected)
                 for first, second in zip(a, b):
-                    for h1, h2 in zip(first.heads, second.heads):
+                    for depth, (h1, h2) in enumerate(zip(first.heads, second.heads)):
                         self.assertEqual(h1.valid, h2.valid)
-                        torch.testing.assert_close(
-                            h1.hidden[: h1.valid],
-                            h2.hidden[: h2.valid],
-                            atol=2e-2,
-                            rtol=2e-2,
-                        )
+                        if depth + 1 < len(first.heads):
+                            torch.testing.assert_close(
+                                h1.hidden[: h1.valid],
+                                h2.hidden[: h2.valid],
+                                atol=2e-2,
+                                rtol=2e-2,
+                            )
+                        for left_cache, right_cache in (
+                            (h1.key, h2.key),
+                            (h1.value, h2.value),
+                        ):
+                            torch.testing.assert_close(
+                                left_cache[:, : h1.valid],
+                                right_cache[:, : h2.valid],
+                                atol=2e-2,
+                                rtol=2e-2,
+                            )
                 for i, (first, second) in enumerate(zip(a, b)):
                     # Accept the drive; reject all auxiliary tokens.
                     ids[i].append(4 + step)

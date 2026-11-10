@@ -22,7 +22,7 @@ git apply /tmp/asr-mtp.patch
 导出器只读引擎：核对 worker 的真实函数签名、CPU token 表更新与 post-bookkeeping 提案顺序，再生成 diff。重复安装同版本会导出空 diff。还可直接审阅本仓的 `research/asr_mtp_v023.patch` 后应用；不同 worker 版本优先重新导出并检查。文件对应关系：
 
 | 本仓文件 | 安装位置 |
-|---|---|
+| --- | --- |
 | `asr_mtp_heads.py` | `vllm_ascend/spec_decode/asr_mtp_heads.py` |
 | `asr_mtp_graph.py` | `vllm_ascend/spec_decode/asr_mtp_graph.py` |
 | `asr_mtp_worker.py` | `vllm_ascend/spec_decode/asr_mtp_worker.py` |
@@ -114,6 +114,19 @@ base_config = mtp_engine_config(
 只在启动 `profile_run` 中预捕获，最多 64 张，运行时只 replay。默认配置为 8 种精确 batch × 2 种 query 容量，共 16 张（受实际辅助槽数和 `max_num_seqs` 限制）。同 query 图档位的请求合并执行，首次长 query 与增量 query 分开。batch 超过上限、context 超过 128、fresh query 超过 64，或者所有请求的剩余 head 预算不足完整深度时，直接走原 eager。不会在线建图或让请求等待其他 batch。`enforce_eager=True` 与显式 `graph_mode=full` 冲突，会在启动报错。
 
 辅助 arena 追加有限 scratch 区，padding 写入独立地址，不会覆盖 live cache 的最后一行。辅助 token 仍在 worker 末尾统一执行一次 batch D2H。共享图池只容纳临时中间张量，输入、输出、arena 和共享权重均在池外；replay 与输出消费保持同一当前流上的顺序。
+
+图路径的缓存搬运使用 `gcd(hidden_size, head_dim)` 宽度的对齐行，保持原 arena 布局与图 key。读取使用二维行 `index_select`，NPU 写入显式调用 `torch_npu.npu_scatter_nd_update_`；CPU 核对路径使用 `index_copy_`，NPU 不回退到可能逐索引同步的兼容实现。缺少设备更新接口会在图初始化时明确报错。以 hidden 2048、head_dim 128 为例，每行 128 个元素，地址索引数量比逐标量寻址减少 128 倍；这不表示数据搬运量或时延同比下降。
+
+全局最后一个辅助 head 仍保留 K/V 和有效长度，但省去没有后续消费者的 hidden 写回和局部 sequence 更新。五头图程序由 15 次标量缓存 scatter 加 5 次 token scatter，变为 14 次行缓存更新加 4 次 token scatter；15 次缓存读取保持次数不变、改为行索引。尚未融合 K/V 更新与 attention 输入整理，eager 回退路径保持原实现。部署后应检查 `aclnnScatterNdUpdate` 和行级 Gather 的实际耗时，并按同负载比较输出、接受率与 commit P95/P99；本机 CPU 等价测试不能证明 910B 性能提升。
+
+已安装 context 诊断版辅助图的服务，可从引擎 `310P-graph` 交付目录应用聚焦升级：
+
+```bash
+git apply --check examples/910b/asr_mtp_cache_rows_v023.patch
+git apply examples/910b/asr_mtp_cache_rows_v023.patch
+```
+
+该补丁只升级 MTP 图模块，不增加启动参数。完整新安装补丁和累计图升级补丁已经包含此改动，不要再叠加聚焦升级；旧版模块不同则对实际安装目录重新导出。按原流程重启 worker 后生效。
 
 显存：先捕获，再运行最坏 eager profile。worker 的启动计量额外从自动 KV 预算扣除捕获前后保留的 reserved memory 增量，包含私有图池和静态缓冲；这是保守预留，部分静态缓冲可能已计入 activation peak，因此可用 KV 会略少。`cache_mib` 不包含该图池、scratch 和辅助权重。显式指定 `kv_cache_memory_bytes` 时保留用户手工预算，需自行为图池留出空间。捕获失败直接报启动错误；运行时图已执行部分操作后不会冒险重试 eager。
 

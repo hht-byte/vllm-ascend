@@ -4,6 +4,7 @@
 import logging
 from collections import Counter
 from dataclasses import dataclass
+from math import gcd
 from time import perf_counter
 
 import torch
@@ -77,8 +78,9 @@ def graph_options(settings, *, context, slots, max_batch):
 class FixedMTPProgram:
     """Fixed B/Q/K tensor program with device-side lengths and cache addresses.
 
-    Persistent inputs/outputs/arena are allocated outside graph pools. Invalid
-    query writes have unique scratch addresses, including at the context cap;
+    Persistent inputs/outputs/arena are allocated outside graph pools. Cache
+    transfers address aligned vector rows instead of individual scalars. Invalid
+    query writes have unique scratch rows, including at the context cap;
     clamping padded writes onto the last live position would corrupt that row.
     """
 
@@ -101,6 +103,18 @@ class FixedMTPProgram:
         self.embedding, self.logits = embedding, logits
         self.batch, self.queries, self.context = batch_size, query_size, context_size
         device = arena.storage.device
+        # Both hidden and KV regions, including each slot and the scratch suffix,
+        # are aligned to this width without changing the existing arena layout.
+        self.row_width = gcd(cfg.hidden_size, cfg.head_dim)
+        row_elements = arena.graph_storage.numel() // self.row_width * self.row_width
+        self.cache_rows = arena.graph_storage[:row_elements].view(-1, self.row_width)
+        self.npu_row_update = None
+        if device.type == "npu":
+            import torch_npu
+
+            self.npu_row_update = getattr(torch_npu, "npu_scatter_nd_update_", None)
+            if self.npu_row_update is None:
+                raise ValueError("MTP graphs require torch_npu.npu_scatter_nd_update_")
         self.metadata = torch.zeros(
             (batch_size, 3 + heads.num_heads + context_size + heads.num_heads + 1),
             device=device,
@@ -111,20 +125,34 @@ class FixedMTPProgram:
         )
         self.query_index = torch.arange(query_size, device=device)
         self.key_index = torch.arange(context_size, device=device)
-        self.hidden_index = torch.arange(cfg.hidden_size, device=device)
+        self.hidden_index = torch.arange(
+            cfg.hidden_size // self.row_width, device=device
+        )
         self.kv_head_index = torch.arange(cfg.num_key_value_heads, device=device)
-        self.dim_index = torch.arange(cfg.head_dim, device=device)
+        self.dim_index = torch.arange(cfg.head_dim // self.row_width, device=device)
         self.hidden_sink = (
-            arena.scratch_offset
-            + torch.arange(batch_size * query_size * cfg.hidden_size, device=device)
-        ).view(batch_size, query_size, cfg.hidden_size)
-        self.kv_sink = (
-            arena.scratch_offset
+            arena.scratch_offset // self.row_width
             + torch.arange(
-                batch_size * cfg.num_key_value_heads * query_size * cfg.head_dim,
+                batch_size * query_size * cfg.hidden_size // self.row_width,
                 device=device,
             )
-        ).view(batch_size, cfg.num_key_value_heads, query_size, cfg.head_dim)
+        ).view(batch_size, query_size, cfg.hidden_size // self.row_width)
+        self.kv_sink = (
+            arena.scratch_offset // self.row_width
+            + torch.arange(
+                batch_size
+                * cfg.num_key_value_heads
+                * query_size
+                * cfg.head_dim
+                // self.row_width,
+                device=device,
+            )
+        ).view(
+            batch_size,
+            cfg.num_key_value_heads,
+            query_size,
+            cfg.head_dim // self.row_width,
+        )
         self.inverse = 1.0 / (
             cfg.rope_theta
             ** (
@@ -177,7 +205,7 @@ class FixedMTPProgram:
     def _hidden_indices(self, base, positions):
         return (
             base[:, None, None]
-            + positions[:, :, None] * self.heads.config.hidden_size
+            + positions[:, :, None] * (self.heads.config.hidden_size // self.row_width)
             + self.hidden_index[None, None, :]
         )
 
@@ -187,27 +215,34 @@ class FixedMTPProgram:
             base[:, None, None, None]
             + self.kv_head_index[None, :, None, None]
             * self.arena.max_context
-            * cfg.head_dim
-            + positions[:, None, :, None] * cfg.head_dim
+            * (cfg.head_dim // self.row_width)
+            + positions[:, None, :, None] * (cfg.head_dim // self.row_width)
             + self.dim_index[None, None, None, :]
         )
 
     def _read(self, indices):
-        return self.arena.graph_storage.index_select(0, indices.reshape(-1)).view(
-            indices.shape
+        return self.cache_rows.index_select(0, indices.reshape(-1)).view(
+            *indices.shape[:-1], indices.shape[-1] * self.row_width
         )
 
     def _write(self, indices, value, valid, sink):
         addresses = torch.where(valid, indices, sink)
-        self.arena.graph_storage.scatter_(0, addresses.reshape(-1), value.reshape(-1))
+        updates = value.reshape(-1, self.row_width)
+        if self.npu_row_update is not None:
+            # Explicit device API avoids legacy index_copy_ implementations that
+            # fetch each index on the host and cannot be safely captured.
+            self.npu_row_update(self.cache_rows, addresses.reshape(-1, 1), updates)
+        else:
+            self.cache_rows.index_copy_(0, addresses.reshape(-1), updates)
 
     @torch.inference_mode()
     def run(self):
         cfg, heads = self.heads.config, self.heads.num_heads
         cap, width = self.arena.max_context, cfg.hidden_size
-        kv_width = cfg.num_key_value_heads * cap * cfg.head_dim
+        hidden_width = cap * width // self.row_width
+        kv_width = cfg.num_key_value_heads * cap * cfg.head_dim // self.row_width
         metadata = self.metadata
-        base = metadata[:, 0] * self.arena.storage.shape[1]
+        base = metadata[:, 0] * (self.arena.storage.shape[1] // self.row_width)
         lengths, limits = metadata[:, 1], metadata[:, 2 + heads]
         sequence = metadata[:, 3 + heads :].clone()
         for depth, block in enumerate(self.heads.blocks, 1):
@@ -219,7 +254,7 @@ class FixedMTPProgram:
             source_offset = (
                 0
                 if depth == 1
-                else cap * width + (depth - 2) * (cap * width + 2 * kv_width)
+                else hidden_width + (depth - 2) * (hidden_width + 2 * kv_width)
             )
             source = self._read(self._hidden_indices(base + source_offset, positions))
             source = torch.where(valid[:, :, None], source, 0)
@@ -256,11 +291,11 @@ class FixedMTPProgram:
             sin = angles.sin().to(fused.dtype)[:, None]
             q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
             hidden_base = (
-                base + cap * width + (depth - 1) * (cap * width + 2 * kv_width)
+                base + hidden_width + (depth - 1) * (hidden_width + 2 * kv_width)
             )
             key_base, value_base = (
-                hidden_base + cap * width,
-                hidden_base + cap * width + kv_width,
+                hidden_base + hidden_width,
+                hidden_base + hidden_width + kv_width,
             )
             for offset, value in ((key_base, k), (value_base, v)):
                 self._write(
@@ -311,13 +346,17 @@ class FixedMTPProgram:
             ).squeeze(1)
             predicted = torch.where(active, self.logits(last).argmax(-1), 0)
             self.output[:, depth - 1].copy_(predicted)
-            sequence.scatter_(1, (lengths + depth)[:, None], predicted[:, None])
-            self._write(
-                self._hidden_indices(hidden_base, positions),
-                fresh,
-                valid[:, :, None],
-                self.hidden_sink,
-            )
+            if depth < heads:
+                # Only a later head consumes this hidden state and token. Keep
+                # the final head's KV above for the next round, but omit its
+                # unused persistent hidden and local sequence updates.
+                sequence.scatter_(1, (lengths + depth)[:, None], predicted[:, None])
+                self._write(
+                    self._hidden_indices(hidden_base, positions),
+                    fresh,
+                    valid[:, :, None],
+                    self.hidden_sink,
+                )
         return self.output
 
     def commit(self, states, limits):
