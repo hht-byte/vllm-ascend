@@ -59,7 +59,8 @@ class PatchExportTests(unittest.TestCase):
                 stream.write('\n    def sample_tokens(self):\n        self._bookkeeping_sync()\n        propose_draft_token_ids(valid_sampled_token_ids)\n')
             patch = make_patch(root)
             self.assertIn('+++ b/vllm_ascend/spec_decode/asr_mtp_graph.py', patch)
-            self.assertEqual(patch.count('--- /dev/null'), 6)
+            self.assertIn('+++ b/vllm_ascend/spec_decode/asr_mtp_fused.py', patch)
+            self.assertEqual(patch.count('--- /dev/null'), 7)
             self.assertNotIn('+++ b/vllm_ascend/worker/model_runner_v1.py', patch)
             self.assertIn('+++ b/vllm_ascend/worker/worker.py', patch)
             self.assertNotIn('+++ b/vllm_ascend/patch/worker/__init__.py', patch)
@@ -180,7 +181,7 @@ class PatchExportTests(unittest.TestCase):
         directory = Path(__file__).resolve().parent
         lines = (directory / 'asr_mtp_v023.patch').read_text(encoding='utf-8').splitlines(keepends=True)
         self.assertNotIn(' \n', lines)
-        for name in ('asr_mtp_heads.py', 'asr_mtp_worker.py', 'asr_mtp_graph.py',
+        for name in ('asr_mtp_heads.py', 'asr_mtp_fused.py', 'asr_mtp_worker.py', 'asr_mtp_graph.py',
                      'asr_mtp_token_attention.py', 'asr_mtp_token_graph.py',
                      'patch_external_draft_mtp.py'):
             self.assertIn('+++ b/vllm_ascend/' +

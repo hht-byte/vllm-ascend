@@ -4,13 +4,16 @@ import hashlib
 import logging
 from collections import Counter
 from pathlib import Path
+from time import perf_counter
 
 import torch
 
 try:
+    from .asr_mtp_fused import prepare_fused_heads
     from .asr_mtp_graph import MTPGraphs, graph_options, validate_graph_runner
     from .asr_mtp_heads import BatchedMTPHeads, CacheArena
 except ImportError:
+    from asr_mtp_fused import prepare_fused_heads
     from asr_mtp_graph import MTPGraphs, graph_options, validate_graph_runner
     from asr_mtp_heads import BatchedMTPHeads, CacheArena
 
@@ -74,13 +77,15 @@ def stop_ids(params, model_eos):
 
 
 class MTPWorker:
-    def __init__(self, runner, heads, arena, embedding, logits, eos, *, graphs=None):
+    def __init__(self, runner, heads, arena, embedding, logits, eos, *, graphs=None,
+                 profile_stages=False):
         self.runner, self.heads, self.arena = runner, heads, arena
         self.embedding, self.logits, self.eos = embedding, logits, set(eos)
         self.states, self.disabled = {}, {}
         self.legacy_submitted = set()
         self.stats = Counter(target_forwards=0)
         self.graphs, self.profiled = graphs, False
+        self.profile_stages = profile_stages
 
     def finish(self, request_ids):
         for req_id in request_ids:
@@ -151,6 +156,7 @@ class MTPWorker:
 
     @torch.inference_mode()
     def propose(self, sampled, scheduler_output, hidden):
+        prepare_started = perf_counter() if self.profile_stages else None
         runner, batch = self.runner, self.runner.input_batch
         outputs = [[] for _ in sampled]
         states, inputs, limits, indices = [], [], [], []
@@ -225,8 +231,12 @@ class MTPWorker:
         if states:
             before = self.heads.processed_positions
             buckets = query_buckets(states, limits, self.graphs)
-            drafts = torch.zeros((len(states), self.heads.num_heads),
-                                 device=states[0].target.device, dtype=torch.long)
+            single_group = (len(buckets) == 1 and
+                            next(iter(buckets.values())) == list(range(len(states))))
+            proposal_started = perf_counter() if self.profile_stages else None
+            drafts = (None if single_group else
+                      torch.zeros((len(states), self.heads.num_heads),
+                                  device=states[0].target.device, dtype=torch.long))
             for group in buckets.values():
                 batch_states = [states[i] for i in group]
                 batch_inputs = [inputs[i] for i in group]
@@ -239,8 +249,15 @@ class MTPWorker:
                     self.stats['eager_head_batches'] += 1
                 else:
                     self.stats['graph_head_batches'] += 1
-                drafts[group] = proposal
+                if single_group:
+                    drafts = proposal
+                else:
+                    # Graph output belongs to a persistent capture buffer and
+                    # may be overwritten by the next group using the same graph.
+                    drafts[group] = proposal
+            to_cpu_started = perf_counter() if self.profile_stages else None
             rows = drafts.tolist()  # One device-to-host boundary for the whole batch.
+            postprocess_started = perf_counter() if self.profile_stages else None
             mtp_tokens = 0
             for i, row, limit in zip(indices, rows, limits):
                 row = row[:limit]
@@ -262,6 +279,19 @@ class MTPWorker:
                          len(states), mtp_tokens, self.heads.processed_positions - before,
                          self.stats['graph_head_batches'], self.stats['eager_head_batches'],
                          self.graphs.stats if self.graphs is not None else {})
+            if self.profile_stages:
+                logger.info(
+                    'ASR_MTP_HOST_STAGE requests=%d groups=%d single_group=%s '
+                    'draft_tokens=%d prepare_host_ms=%.3f proposal_host_ms=%.3f '
+                    'to_cpu_wait_ms=%.3f postprocess_host_ms=%.3f',
+                    len(states), len(buckets), single_group, mtp_tokens,
+                    (proposal_started - prepare_started) * 1000,
+                    (to_cpu_started - proposal_started) * 1000,
+                    (postprocess_started - to_cpu_started) * 1000,
+                    (perf_counter() - postprocess_started) * 1000,
+                )
+                # to_cpu_wait_ms includes waiting for preceding queued NPU
+                # work; it is not an additional device-compute interval.
         return outputs
 
 
@@ -310,9 +340,13 @@ def load_worker(runner, target, settings):
     validate_engine(runner)
     allowed = {'checkpoint', 'num_heads', 'max_context_tokens', 'cache_mib', 'max_requests',
                'verify_base_signature', 'graph_mode', 'graph_context_tokens',
-               'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size'}
+               'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size',
+               'native_fusion', 'profile_stages'}
     if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
         raise ValueError('invalid additional_config.asr_mtp settings')
+    for name, default in (('native_fusion', True), ('profile_stages', False)):
+        if type(settings.get(name, default)) is not bool:
+            raise ValueError(f'asr_mtp.{name} must be a bool')
     for name, default in (('num_heads', 5), ('max_context_tokens', 512),
                           ('cache_mib', 512), ('max_requests', 64)):
         if type(settings.get(name, default)) is not int or settings.get(name, default) < 1:
@@ -338,6 +372,7 @@ def load_worker(runner, target, settings):
         model = BatchedMTPHeads(text, heads)
     model.load_state_dict(selected, strict=True, assign=True)
     model = model.to(device=runner.device, dtype=runner.dtype).eval().requires_grad_(False)
+    native_fusion = prepare_fused_heads(model, enabled=settings.get('native_fusion', True))
     cap = settings.get('max_context_tokens', 512)
     per_slot = CacheArena.elements_per_position(text, heads) * cap * torch.empty((), dtype=runner.dtype).element_size()
     slots = min(settings.get('max_requests', 64), settings.get('cache_mib', 512) * 1024 ** 2 // per_slot)
@@ -365,13 +400,15 @@ def load_worker(runner, target, settings):
         graphs = graph_class(options, model, arena, language.embed_input_ids,
                              language.compute_logits)
     worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits,
-                       eos, graphs=graphs)
+                       eos, graphs=graphs, profile_stages=settings.get('profile_stages', False))
     logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
-                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s',
+                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s '
+                'native_fusion=%s profile_stages=%s',
                 heads, cap, slots, arena.storage.numel() * arena.storage.element_size() / 1024 ** 2,
                 settings['checkpoint'], settings.get('verify_base_signature', False),
                 settings.get('graph_mode', 'off'),
                 (arena.graph_storage.numel() - arena.scratch_offset) *
                 arena.storage.element_size() / 1024 ** 2,
-                'tokens' if options is not None and options.tokens else 'rectangular')
+                'tokens' if options is not None and options.tokens else 'rectangular',
+                native_fusion, settings.get('profile_stages', False))
     return worker

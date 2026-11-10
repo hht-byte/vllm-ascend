@@ -11,8 +11,10 @@ import torch
 from torch.nn import functional as F
 
 try:
+    from .asr_mtp_fused import add_rms_norm, project_qkv
     from .asr_mtp_heads import rotate_half
 except ImportError:
+    from asr_mtp_fused import add_rms_norm, project_qkv
     from asr_mtp_heads import rotate_half
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,7 @@ class GraphOptions:
     queries: tuple[int, ...]
     context: int
     tokens: tuple[int, ...] = ()
+    profile_stages: bool = False
 
     def scratch_elements(self, config):
         # A positive dummy query must cover the full non-PA TND KV tail even
@@ -50,6 +53,9 @@ class GraphOptions:
 
 
 def graph_options(settings, *, context, slots, max_batch):
+    profile_stages = settings.get("profile_stages", False)
+    if type(profile_stages) is not bool:
+        raise ValueError("asr_mtp.profile_stages must be a bool")
     mode = settings.get("graph_mode", "off")
     if mode not in ("off", "full"):
         raise ValueError("asr_mtp.graph_mode must be off or full")
@@ -81,7 +87,7 @@ def graph_options(settings, *, context, slots, max_batch):
             raise ValueError(
                 f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}"
             )
-        return GraphOptions(batch, (), capacity, tokens)
+        return GraphOptions(batch, (), capacity, tokens, profile_stages)
     queries = settings.get("graph_query_sizes", (min(8, capacity), min(64, capacity)))
     if (
         not isinstance(queries, (list, tuple))
@@ -94,7 +100,7 @@ def graph_options(settings, *, context, slots, max_batch):
     queries = tuple(sorted(set(queries)))
     if batch * len(queries) > MAX_MTP_GRAPHS:
         raise ValueError(f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}")
-    return GraphOptions(batch, queries, capacity)
+    return GraphOptions(batch, queries, capacity, profile_stages=profile_stages)
 
 
 class FixedMTPProgram:
@@ -292,21 +298,20 @@ class FixedMTPProgram:
             )
             normed = block.decoder.input_layernorm(fused)
             attn = block.decoder.self_attn
+            q_raw, k_raw, v_raw = project_qkv(attn, normed)
             q = attn.q_norm(
-                attn.q_proj(normed).view(
+                q_raw.view(
                     self.batch, self.queries, cfg.num_attention_heads, cfg.head_dim
                 )
             ).transpose(1, 2)
             k = attn.k_norm(
-                attn.k_proj(normed).view(
+                k_raw.view(
                     self.batch, self.queries, cfg.num_key_value_heads, cfg.head_dim
                 )
             ).transpose(1, 2)
-            v = (
-                attn.v_proj(normed)
-                .view(self.batch, self.queries, cfg.num_key_value_heads, cfg.head_dim)
-                .transpose(1, 2)
-            )
+            v = v_raw.view(
+                self.batch, self.queries, cfg.num_key_value_heads, cfg.head_dim
+            ).transpose(1, 2)
             frequencies = (anchors + depth).float().unsqueeze(-1) * self.inverse
             angles = torch.cat((frequencies, frequencies), -1)
             cos = angles.cos().to(fused.dtype)[:, None]
@@ -355,12 +360,15 @@ class FixedMTPProgram:
                 dropout_p=0.0,
                 scale=cfg.head_dim**-0.5,
             )
-            residual = fused + attn.o_proj(
-                attended.transpose(1, 2).reshape(self.batch, self.queries, width)
+            normed_residual, residual = add_rms_norm(
+                block.decoder.post_attention_layernorm,
+                fused,
+                attn.o_proj(
+                    attended.transpose(1, 2).reshape(self.batch, self.queries, width)
+                ),
             )
-            fresh = block.output_norm(
-                residual
-                + block.decoder.mlp(block.decoder.post_attention_layernorm(residual))
+            fresh, _ = add_rms_norm(
+                block.output_norm, residual, block.decoder.mlp(normed_residual)
             )
             last_index = (lengths - starts - 1).clamp(0, self.queries - 1)
             last = fresh.gather(

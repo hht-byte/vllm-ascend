@@ -401,12 +401,22 @@ class EngineHeadsTests(unittest.TestCase):
             self.assertEqual(worker.heads.num_heads, 2)
             self.assertEqual(worker.arena.storage.shape[0], 2)
             self.assertIs(worker.embedding, self.embed)
+            self.assertTrue(worker.heads._mtp_fused_prepared)
+            self.assertFalse(worker.profile_stages)
+            unfused = load_worker(runner, target, {**settings, 'native_fusion': False})
+            self.assertFalse(getattr(unfused.heads, '_mtp_fused_prepared', False))
+            timed = load_worker(runner, target, {**settings, 'profile_stages': True})
+            self.assertTrue(timed.profile_stages)
+            for name in ('native_fusion', 'profile_stages'):
+                with self.assertRaisesRegex(ValueError, name):
+                    load_worker(runner, target, {**settings, name: 1})
             packed = load_worker(runner, target, {
                 **settings, 'graph_mode': 'full', 'graph_context_tokens': 16,
-                'graph_token_sizes': [8, 32, 64],
+                'graph_token_sizes': [8, 32, 64], 'profile_stages': True,
             })
             self.assertEqual(type(packed.graphs).__name__, 'TokenMTPGraphs')
             self.assertEqual(packed.graphs.options.tokens, (8, 32, 64))
+            self.assertTrue(packed.graphs.options.profile_stages)
             self.assertEqual(packed.arena.graph_storage.numel() - packed.arena.scratch_offset, 520)
             self.assertFalse(packed.graphs.ready)
             (root / 'config.json').write_text('{"changed":true}', encoding='utf-8')

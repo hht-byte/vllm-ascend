@@ -328,7 +328,14 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
     def test_token_bucket_replay_changes_request_boundaries_and_rejection_prefixes(
         self,
     ):
+        self._check_token_bucket_replay_changes_request_boundaries(native_fusion=False)
+
+    def test_native_fused_heads_tnd_replay_and_rejection_match_unfused_eager(self):
+        self._check_token_bucket_replay_changes_request_boundaries(native_fusion=True)
+
+    def _check_token_bucket_replay_changes_request_boundaries(self, *, native_fusion):
         import torch
+        from asr_mtp_fused import prepare_fused_heads
         from asr_mtp_heads import BatchedMTPHeads, CacheArena
         from asr_mtp_token_graph import TokenMTPGraphs
 
@@ -346,7 +353,12 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
             rope_scaling=None,
         )
         eager = BatchedMTPHeads(cfg, 2).to("npu", torch.float16).eval()
-        fixed = deepcopy(eager)
+        fixed = deepcopy(eager).requires_grad_(False)
+        # Native QKV/Norm/SwiGLU and TND FIA task updates must coexist in the
+        # same real NPUGraph; retain unfused eager as an independent reference.
+        self.assertEqual(
+            prepare_fused_heads(fixed, enabled=native_fusion), native_fusion
+        )
         embed = torch.nn.Embedding(64, 256).to("npu", torch.float16).eval()
         logits = torch.nn.Linear(256, 64).to("npu", torch.float16).eval()
         old = CacheArena(

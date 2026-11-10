@@ -7,6 +7,7 @@ CPU execution is a correctness reference, not an online per-request fallback.
 """
 
 from dataclasses import dataclass
+from time import perf_counter
 
 import torch
 from torch.nn import functional as F
@@ -26,6 +27,7 @@ class _Task:
     scale: float
     handle: object = None
     event: object = None
+    binding: object = None
 
 
 class PackedAttention:
@@ -61,6 +63,7 @@ class PackedAttention:
         )
         self.heads, self.device, self.dtype = heads, torch.device(device), dtype
         self.lengths, self.tasks, self.workspaces = {}, {}, {}
+        self.task_updates = self.task_update_reuses = 0
         self.recording = False
         self.is_npu = self.device.type == "npu" or npu_api is not None
         self.api, self.runtime, self.mask = None, None, None
@@ -232,6 +235,7 @@ class PackedAttention:
             self.runtime.graph_task_group_begin(stream)
             self._execute(head, task)
             task.handle = self.runtime.graph_task_group_end(stream)
+            task.binding = self._binding(head, task)
         else:
             self._execute(head, task)
         return task.output
@@ -261,6 +265,17 @@ class PackedAttention:
             out=[task.output, task.softmax_lse],
         )
 
+    def _binding(self, head, task):
+        # Shape, dtype, device and contiguity are preflighted for all heads.
+        # Replacing an equal-shaped tensor still needs a task-pointer rebind.
+        return (
+            self.lengths[head],
+            task.query.data_ptr(),
+            task.key.data_ptr(),
+            task.value.data_ptr(),
+            task.scale,
+        )
+
     def begin_capture(self):
         if self.recording or any(
             task.handle is not None for task in self.tasks.values()
@@ -285,9 +300,17 @@ class PackedAttention:
             self._validate(head, task.query, task.key, task.value)
         stream = self.runtime.current_stream()
         for head, task in self.tasks.items():
-            self.runtime.graph_task_update_begin(stream, task.handle)
-            self._execute(head, task)
-            self.runtime.graph_task_update_end(stream)
+            binding = self._binding(head, task)
+            if task.binding == binding:
+                self.task_update_reuses += 1
+            else:
+                self.runtime.graph_task_update_begin(stream, task.handle)
+                self._execute(head, task)
+                self.runtime.graph_task_update_end(stream)
+                task.binding = binding
+                self.task_updates += 1
+            # The captured wait/reset is replayed even when the task arguments
+            # stay unchanged. Signal every head on every replay, never skip it.
             task.event.record(stream)
 
 
@@ -317,8 +340,24 @@ class PackedNPUCapture:
             attention.end_capture()
         torch.npu.synchronize()
 
-        def replay():
-            attention.update()
-            graph.replay()
+        if getattr(program, "profile_stages", False):
+
+            def replay():
+                started = perf_counter()
+                updates, reuses = attention.task_updates, attention.task_update_reuses
+                attention.update()
+                updated = perf_counter()
+                graph.replay()
+                replay.last_timings = {
+                    "task_update_host_ms": (updated - started) * 1000,
+                    "replay_enqueue_host_ms": (perf_counter() - updated) * 1000,
+                    "task_updates": attention.task_updates - updates,
+                    "task_update_reuses": attention.task_update_reuses - reuses,
+                }
+        else:
+
+            def replay():
+                attention.update()
+                graph.replay()
 
         return replay

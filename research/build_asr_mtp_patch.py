@@ -98,6 +98,7 @@ def make_patch(root):
         'vllm_ascend/patch/worker/__init__.py': None,
         'vllm_ascend/worker/worker.py': None,
         'vllm_ascend/spec_decode/asr_mtp_heads.py': directory / 'asr_mtp_heads.py',
+        'vllm_ascend/spec_decode/asr_mtp_fused.py': directory / 'asr_mtp_fused.py',
         'vllm_ascend/spec_decode/asr_mtp_graph.py': directory / 'asr_mtp_graph.py',
         'vllm_ascend/spec_decode/asr_mtp_token_attention.py': directory / 'asr_mtp_token_attention.py',
         'vllm_ascend/spec_decode/asr_mtp_token_graph.py': directory / 'asr_mtp_token_graph.py',

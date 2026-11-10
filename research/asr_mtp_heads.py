@@ -11,6 +11,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+try:
+    from .asr_mtp_fused import add_rms_norm, mlp_forward, project_qkv
+except ImportError:
+    from asr_mtp_fused import add_rms_norm, mlp_forward, project_qkv
+
 
 @dataclass
 class HeadHistory:
@@ -107,7 +112,7 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
 
     def forward(self, hidden):
-        return self.down_proj(F.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
+        return mlp_forward(self, hidden)
 
 
 class Decoder(nn.Module):
@@ -188,11 +193,12 @@ class BatchedMTPHeads(nn.Module):
                                            block.token_norm(token_embeddings)), -1))
             normed = block.decoder.input_layernorm(fused)
             attn = block.decoder.self_attn
-            q = attn.q_norm(attn.q_proj(normed).view(count, queries, cfg.num_attention_heads,
+            q_raw, k_raw, v_raw = project_qkv(attn, normed)
+            q = attn.q_norm(q_raw.view(count, queries, cfg.num_attention_heads,
                                                      cfg.head_dim)).transpose(1, 2)
-            k = attn.k_norm(attn.k_proj(normed).view(count, queries, cfg.num_key_value_heads,
+            k = attn.k_norm(k_raw.view(count, queries, cfg.num_key_value_heads,
                                                      cfg.head_dim)).transpose(1, 2)
-            v = attn.v_proj(normed).view(count, queries, cfg.num_key_value_heads,
+            v = v_raw.view(count, queries, cfg.num_key_value_heads,
                                         cfg.head_dim).transpose(1, 2)
             # All three MRoPE axes in SequentialMTP use the same depth+anchor;
             # their interleaving therefore reduces to ordinary default RoPE.
@@ -216,9 +222,11 @@ class BatchedMTPHeads(nn.Module):
             attended = F.scaled_dot_product_attention(
                 q, past_k.repeat_interleave(groups, 1), past_v.repeat_interleave(groups, 1),
                 attn_mask=allowed[:, None], dropout_p=0.0, scale=cfg.head_dim ** -0.5)
-            residual = fused + attn.o_proj(attended.transpose(1, 2).reshape(count, queries, -1))
-            fresh = block.output_norm(residual + block.decoder.mlp(
-                block.decoder.post_attention_layernorm(residual)))
+            normed_residual, residual = add_rms_norm(
+                block.decoder.post_attention_layernorm, fused,
+                attn.o_proj(attended.transpose(1, 2).reshape(count, queries, -1)))
+            fresh, _ = add_rms_norm(block.output_norm, residual,
+                                    block.decoder.mlp(normed_residual))
             last = torch.stack([fresh[j, size - 1] for j, size in enumerate(sizes)])
             predicted = logits(last).argmax(-1)
             outputs[rows, depth - 1] = predicted

@@ -9,9 +9,11 @@ from time import perf_counter
 import torch
 
 try:
+    from .asr_mtp_fused import add_rms_norm, project_qkv
     from .asr_mtp_heads import rotate_half
     from .asr_mtp_token_attention import PackedAttention, PackedNPUCapture
 except ImportError:
+    from asr_mtp_fused import add_rms_norm, project_qkv
     from asr_mtp_heads import rotate_half
     from asr_mtp_token_attention import PackedAttention, PackedNPUCapture
 
@@ -292,19 +294,14 @@ class PackedMTPProgram:
             )
             normed = block.decoder.input_layernorm(fused)
             attn = block.decoder.self_attn
+            q_raw, k_raw, v_raw = project_qkv(attn, normed)
             q = attn.q_norm(
-                attn.q_proj(normed).view(
-                    self.query_capacity, cfg.num_attention_heads, cfg.head_dim
-                )
+                q_raw.view(self.query_capacity, cfg.num_attention_heads, cfg.head_dim)
             )
             k = attn.k_norm(
-                attn.k_proj(normed).view(
-                    self.query_capacity, cfg.num_key_value_heads, cfg.head_dim
-                )
+                k_raw.view(self.query_capacity, cfg.num_key_value_heads, cfg.head_dim)
             )
-            v = attn.v_proj(normed).view(
-                self.query_capacity, cfg.num_key_value_heads, cfg.head_dim
-            )
+            v = v_raw.view(self.query_capacity, cfg.num_key_value_heads, cfg.head_dim)
             frequencies = (anchor + depth).float().unsqueeze(-1) * self.inverse
             angles = torch.cat((frequencies, frequencies), -1)
             cos, sin = (
@@ -350,10 +347,13 @@ class PackedMTPProgram:
                 0,
             )
             attended = self.attention(d, q, past_k, past_v, cfg.head_dim**-0.5)
-            residual = fused + attn.o_proj(attended.reshape(self.query_capacity, -1))
-            fresh = block.output_norm(
-                residual
-                + block.decoder.mlp(block.decoder.post_attention_layernorm(residual))
+            normed_residual, residual = add_rms_norm(
+                block.decoder.post_attention_layernorm,
+                fused,
+                attn.o_proj(attended.reshape(self.query_capacity, -1)),
+            )
+            fresh, _ = add_rms_norm(
+                block.output_norm, residual, block.decoder.mlp(normed_residual)
             )
             last = fresh.index_select(0, self.last[d, : self.max_batch])
             active = self.limits[: self.max_batch] >= depth
@@ -431,6 +431,7 @@ class TokenMTPGraphs:
                     token_size=tokens,
                     context_size=self.options.context,
                 )
+                program.profile_stages = getattr(self.options, "profile_stages", False)
                 program.stage(
                     warm,
                     [[0] * (s.length + 1) for s in warm],
@@ -496,9 +497,35 @@ class TokenMTPGraphs:
             self.stats["miss_tokens"] += 1
             return None
         program, replay = self.entries[bucket]
+        profiled = getattr(self.options, "profile_stages", False)
+        stage_started = perf_counter() if profiled else None
         program.stage(states, inputs, limits)
+        replay_started = perf_counter() if profiled else None
         replay()
+        commit_started = perf_counter() if profiled else None
         program.commit(states, limits)
+        if profiled:
+            timings = getattr(replay, "last_timings", {})
+            logger.info(
+                "ASR_MTP_GRAPH_HOST_STAGE requests=%d tokens=%d bucket=%d "
+                "query_capacity=%d kv_capacity=%d max_batch=%d stage_host_ms=%.3f "
+                "replay_host_ms=%.3f task_update_host_ms=%.3f "
+                "replay_enqueue_host_ms=%.3f commit_host_ms=%.3f "
+                "task_updates=%d task_update_reuses=%d",
+                len(states),
+                needed,
+                bucket,
+                program.query_capacity,
+                program.kv_capacity,
+                self.options.max_batch,
+                (replay_started - stage_started) * 1000,
+                (commit_started - replay_started) * 1000,
+                timings.get("task_update_host_ms", 0.0),
+                timings.get("replay_enqueue_host_ms", 0.0),
+                (perf_counter() - commit_started) * 1000,
+                timings.get("task_updates", 0),
+                timings.get("task_update_reuses", 0),
+            )
         self.stats["replays"] += 1
         self.stats["requests"] += len(states)
         if self.stats["replays"] == 1:

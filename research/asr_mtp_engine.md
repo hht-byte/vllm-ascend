@@ -2,7 +2,7 @@
 
 本实现运行在 **vLLM worker 内**。加载用户提供的 `asr-mtp` checkpoint 中的辅助 heads，共享已加载目标模型的 embedding 和 logits 计算；不加载第二个 ASR 主干，不使用 HF `generate()`，不重新编码音频。回滚和 Prespec 的完整草稿仍先由已有 first-verify scheduler 补丁排入首次目标执行。随后，无论部分失配还是草稿耗尽，worker 从实际确认的目标上下文进入 MTP，后续草稿继续交给原有目标模型 / rejection sampler 验证。MTP 启用的请求不再进行旧 aligned/ngram 重接。
 
-新增代码只有三个可部署模块，加 `worker.py` 中 runner 导入完成后的一处注册：[补丁](asr_mtp_v023.patch)。不重写 `model_runner_v1.py`、目标模型、scheduler 或 paged KV 管理。安装必须在现有 [first-verify 补丁](external_draft_first_verify_v023.md)之上。
+新增代码包含七个可部署模块和 `worker.py` 中的启动注册：[补丁](asr_mtp_v023.patch)。不重写 `model_runner_v1.py`、目标模型、scheduler 或 paged KV 管理。安装必须在现有 [first-verify 补丁](external_draft_first_verify_v023.md)之上。
 
 ## 1. 安装到引擎
 
@@ -24,6 +24,7 @@ git apply /tmp/asr-mtp.patch
 | 本仓文件 | 安装位置 |
 | --- | --- |
 | `asr_mtp_heads.py` | `vllm_ascend/spec_decode/asr_mtp_heads.py` |
+| `asr_mtp_fused.py` | `vllm_ascend/spec_decode/asr_mtp_fused.py` |
 | `asr_mtp_graph.py` | `vllm_ascend/spec_decode/asr_mtp_graph.py` |
 | `asr_mtp_token_graph.py` | `vllm_ascend/spec_decode/asr_mtp_token_graph.py` |
 | `asr_mtp_token_attention.py` | `vllm_ascend/spec_decode/asr_mtp_token_attention.py` |
@@ -197,7 +198,7 @@ base_config = mtp_engine_config(
 
 投影、MLP、RoPE 和行缓存操作使用 packed token；attention 使用单次 FIA TND 调用处理所有活动请求，并在 replay 前更新各头的 CPU 累积 query/KV 长度。保留固定请求槽的 LM head，只从各请求最后一个补算位置抽取 hidden，不对全部 T 行做词表投影。未使用请求槽仍有 LM 矩阵计算，需在同负载对比中计入。
 
-所选 910B FIA 入口要求 FP16/BF16 和受支持的 head dimension（当前校验 128/192）；NPU 图启动需要 FIA out、最大 workspace 和 graph task update API。workspace 在启动分配，replay 不分配 workspace、不读取设备 token 或长度到 CPU。矩形图与 MTP eager 路径不受此 FIA 几何限制。每次 replay 前每个 head 有一次主机 task update；这部分重绑定和固定请求槽的开销需要与减少 replay/补齐计算的收益一起评估。
+所选 910B FIA 入口要求 FP16/BF16 和受支持的 head dimension（当前校验 128/192）；NPU 图启动需要 FIA out、最大 workspace 和 graph task update API。workspace 在启动分配，replay 不分配 workspace、不读取设备 token 或长度到 CPU。矩形图与 MTP eager 路径不受此 FIA 几何限制。每个 head 的累计 Q/KV 长度或输入指针改变时才进行主机 task update；相同绑定复用，但每轮仍发送所有 head 的外部事件通知。固定请求槽的开销需要与减少 replay/补齐计算的收益一起评估。
 
 非 PA TND 在已部署 CANN 上要求最后一个累积 KV 长度严格等于 K/V 的物理 T。每个逻辑 token 桶额外预留 1 个物理 query：512 桶仍可容纳 512 个真实补算位置，物理 query 容量为 513。始终存在的正长度 dummy query 段承接所有剩余零填充 KV；dummy KV 长度不小于 dummy query，避免全 masked 行。这样不依赖零 query 分段，不在 task update 中改变 Tensor shape，也不会让恰好填满桶的请求跳到下一档。启动日志显示 `token_sizes` 与 `query_capacities`；首次 replay 还显示 `bucket`、`query_capacity`、`kv_capacity`。
 
@@ -211,6 +212,51 @@ git apply examples/910b/asr_mtp_tnd_kv_coverage_v023.patch
 随后按原流程重启 worker，现有 token 配置无需更改。完整新安装、累计图升级和行缓存版到 token 版的补丁均已包含修复，不要连续叠加；其他安装版本应针对实际源码重新导出。
 
 已安装行缓存优化版的服务可应用 `examples/910b/asr_mtp_token_graph_v023.patch` 聚焦升级；完整安装和累计图补丁已包含此升级，不要连续叠加。当前实现仍需真实 910B 捕获、变长 replay 和时延验收，CPU/FIA 接口模拟测试不能证明设备性能收益。
+
+### 原生辅助头融合与图外接力
+
+新版默认 `native_fusion=True`，仅在 MTP 辅助头内启用原生 RMSNorm、残差 Add+RMSNorm 和 SwiGLU；Q/K/V 以及 gate/up 的权重在启动时各打包一次。原始 Parameter 保留 checkpoint 名称，并共享非持久 packed buffer 的存储，避免常驻两套权重。顺序为严格加载原 checkpoint → 最终设备与 dtype 放置 → 冻结 → 打包 → profile/捕图；运行时不拼权重。eager、矩形图和 token 图共用这些实现，目标模型不变。需要原生 API 而设备软件栈不提供时会在启动报错，可用 `native_fusion=False` 恢复原辅助数学路径。
+
+沿用现有服务工厂，在调用前合并设置，不要求 `base_config` 预先含有 `asr_mtp`：
+
+```python
+additional = dict(base_config.get("additional_config") or {})
+mtp_settings = dict(additional.get("asr_mtp") or {})
+mtp_settings.update({
+    "native_fusion": True,   # 默认 True；False 用于同图配置下消融融合
+    "profile_stages": False, # 默认 False；定位主机空泡时短期开 True
+})
+additional["asr_mtp"] = mtp_settings
+base_config["additional_config"] = additional
+base_config = mtp_engine_config(
+    base_config,
+    mtp_enabled=mtp_enabled,
+    mtp_checkpoint=mtp_checkpoint,
+)
+```
+
+这些都是启动配置，工厂签名与 CLI checkpoint 覆盖规则不变。只切换 `native_fusion` 时应保持 head 数、token 桶、槽数和负载相同。五头的线性矩阵调用从 45 次减到 30 次；这是算子调用数核对，尚不是 910B 时延收益。五个依赖前一预测的 LM head 和固定请求槽计算仍在。
+
+图外接力同时省去两类可避免工作：所有请求属于一个完整提案组时，直接对图输出执行一次 `tolist()`，省去中间零张量和高级索引汇总；多组仍立即复制持久图输出，再统一转到 CPU，防止下一次 replay 覆写。FIA 的累计 Q/KV 长度、Q/K/V 指针和 scale 均未变时复用原 task 绑定，但每轮仍记录所有外部事件。变参仍先校验全部 head，再重绑变化项。不会新增等待凑批、目标前向或每 head 的设备同步。
+
+已安装严格 TND KV 覆盖修复版（源版本 `46d2537e1`）时，只应用本次聚焦升级：
+
+```bash
+git apply --check examples/910b/asr_mtp_native_fusion_v023.patch
+git apply examples/910b/asr_mtp_native_fusion_v023.patch
+```
+
+新安装用 `research/asr_mtp_v023.patch`；旧 pre-graph MTP 版用累计 `asr_mtp_graph_v023.patch`；行缓存版用 `asr_mtp_token_graph_v023.patch`。后三者均已包含本次改动，不与聚焦升级叠加。版本不同则针对实际源码重新导出，检查通过后按正常部署流程重启 worker。
+
+`profile_stages=True` 时额外输出 INFO 主机阶段日志；关闭时不读时钟、不创建诊断事件、不增加同步。eager/矩形图/打包图都有 worker 级 `ASR_MTP_HOST_STAGE`，打包图另有 `ASR_MTP_GRAPH_HOST_STAGE`，细分 stage、FIA task update、replay 入队、commit，并显示 `task_updates` / `task_update_reuses`。筛选命令：
+
+```bash
+rg -n 'ASR_MTP_CONFIG|ASR_MTP_HOST_STAGE|ASR_MTP_GRAPH_HOST_STAGE' "$LOG"
+```
+
+这些是主机墙钟阶段，`to_cpu_wait_ms` 包含此前排队 NPU 工作的等待，不能视为纯传输时间，也不能与设备执行时长重复相加。细分图日志属于 worker 提案阶段的内部时间；诊断日志本身也会增加开销，正式性能对比应关闭。下一轮目标输入准备、IPC 或调度空档不在这些 MTP 内部阶段内，不能据此声称已消除所有空泡。
+
+设备测试已包含原生融合与矩形图、packed FIA 同图 replay，覆盖变输入、请求重排、桶切换和拒绝后的缓存裁剪。本机无 NPU，相关用例只能跳过；需在 910B 上不跳过地执行，再核对完整输出、接受率、commit P95/P99 和图外时间线。
 
 ### 支持范围与缓存
 
