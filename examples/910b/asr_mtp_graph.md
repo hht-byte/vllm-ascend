@@ -543,3 +543,7 @@ No 910B device acceptance or latency gain has been measured on the authoring hos
 Compare full target outputs, acceptance, prefill/decode, commit P95/P99, queue
 wait and memory under the same load. Graphing removes host launch work; LM-head
 matrix computation and padded attention computation remain.
+
+## MTP acceptance statistics
+
+See [MTP acceptance and head-count ablation](asr_mtp_acceptance.md). Enable `additional_config.asr_mtp.acceptance_stats=True` for MTP-only INFO summaries; the default is disabled and adds no device synchronization. Install the metrics module together with the updated worker.

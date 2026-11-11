@@ -18,7 +18,7 @@ class CPUCapture:
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "requires Torch")
 class RuntimeHandoffTests(PackedFixture, unittest.TestCase):
-    def make_worker(self, *, max_batch=3, context=17, profile=False):
+    def make_worker(self, *, max_batch=3, context=17, profile=False, acceptance=False):
         import numpy as np
         from asr_mtp_token_graph import TokenMTPGraphs
         from asr_mtp_worker import MTPWorker
@@ -68,10 +68,52 @@ class RuntimeHandoffTests(PackedFixture, unittest.TestCase):
             {63},
             graphs=graphs,
             **({"profile_stages": True} if profile else {}),
+            **({"acceptance_stats": True} if acceptance else {}),
         )
         hidden = self.t.cat([state.target[: state.length] for state in self.a])
         scheduler = SimpleNamespace(num_scheduled_tokens={key: len(row) for key, row in zip(batch.req_ids, self.ids)})
         return worker, graphs, scheduler, hidden, rows
+
+    def test_acceptance_observes_previous_mtp_before_eos_and_preserves_one_d2h(self):
+        worker, _, scheduler, hidden, rows = self.make_worker(acceptance=True)
+        logs = []
+        worker.acceptance.emit = logs.append
+        converted = []
+        original_tolist = self.t.Tensor.tolist
+
+        def tolist(tensor):
+            converted.append(tuple(tensor.shape))
+            return original_tolist(tensor)
+
+        with patch.object(self.t.Tensor, "tolist", tolist):
+            outputs = worker.propose([[4]] * 3, scheduler, hidden)
+        self.assertEqual(converted, [(3, 3)])
+        self.assertEqual(outputs, self.expected(rows))
+        batch = worker.runner.input_batch
+        scheduler.scheduled_spec_decode_tokens = dict(zip(batch.req_ids, outputs))
+        scheduler.num_scheduled_tokens = {req: len(row) + 1 for req, row in zip(batch.req_ids, outputs)}
+        batch.num_computed_tokens_cpu[:] = [len(row) - 1 for row in rows]
+        result = worker.propose([[row[0], 63] for row in outputs], scheduler, hidden)
+        self.assertEqual(result, [[], [], []])
+        self.assertEqual(len(logs), 3)
+        self.assertTrue(all(row["total"]["accepted"] == 1 for row in logs))
+        self.assertTrue(all(row["total"]["drafted"] == 3 for row in logs))
+        worker.finish(batch.req_ids)
+        self.assertEqual(len(logs), 3)
+
+    def test_disabled_acceptance_has_no_tracker(self):
+        worker, _, _, _, _ = self.make_worker()
+        self.assertIsNone(worker.acceptance)
+
+    def test_finish_cancels_pending_acceptance_proposals(self):
+        worker, _, scheduler, hidden, _ = self.make_worker(acceptance=True)
+        logs = []
+        worker.acceptance.emit = logs.append
+        worker.propose([[4]] * 3, scheduler, hidden)
+        worker.finish(worker.runner.input_batch.req_ids)
+        self.assertEqual(len(logs), 3)
+        self.assertTrue(all(row["total"]["rounds"] == 0 for row in logs))
+        self.assertTrue(all(row["unverified_tokens"] == 3 for row in logs))
 
     def expected(self, rows):
         with self.t.inference_mode():

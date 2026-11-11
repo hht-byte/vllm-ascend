@@ -2606,13 +2606,13 @@
      return buckets
 
 
-@@ -43,12 +77,15 @@
+@@ -43,15 +77,27 @@
 
 
  class MTPWorker:
 -    def __init__(self, runner, heads, arena, embedding, logits, eos):
 +    def __init__(self, runner, heads, arena, embedding, logits, eos, *, graphs=None,
-+                 profile_stages=False):
++                 profile_stages=False, acceptance_stats=False):
          self.runner, self.heads, self.arena = runner, heads, arena
          self.embedding, self.logits, self.eos = embedding, logits, set(eos)
          self.states, self.disabled = {}, {}
@@ -2620,10 +2620,22 @@
          self.stats = Counter(target_forwards=0)
 +        self.graphs, self.profiled = graphs, False
 +        self.profile_stages = profile_stages
++        self.acceptance = None
++        if acceptance_stats:
++            try:
++                from .asr_mtp_metrics import AcceptanceTracker
++            except ImportError:
++                from asr_mtp_metrics import AcceptanceTracker
++            self.acceptance = AcceptanceTracker(heads.num_heads)
 
      def finish(self, request_ids):
          for req_id in request_ids:
-@@ -90,6 +127,13 @@
++            if self.acceptance is not None:
++                self.acceptance.finish(req_id)
+             state = self.states.pop(req_id, None)
+             if state is not None:
+                 self.arena.release(state)
+@@ -90,6 +136,13 @@
      def profile(self):
          if self.states or self.arena.leased:
              raise RuntimeError('MTP memory profiling must precede live requests')
@@ -2637,7 +2649,7 @@
          before = self.heads.processed_positions, self.heads.reused_positions
          states = []
          try:
-@@ -108,9 +152,11 @@
+@@ -108,13 +161,22 @@
              for state in states:
                  self.arena.release(state)
              self.heads.processed_positions, self.heads.reused_positions = before
@@ -2649,8 +2661,41 @@
          runner, batch = self.runner, self.runner.input_batch
          outputs = [[] for _ in sampled]
          states, inputs, limits, indices = [], [], [], []
-@@ -184,14 +230,34 @@
++        fresh_counts = {}
+         for i, (req_id, tokens) in enumerate(zip(batch.req_ids, sampled)):
++            if self.acceptance is not None:
++                self.acceptance.observe(
++                    req_id, getattr(scheduler_output, 'scheduled_spec_decode_tokens', {}).get(req_id, ()),
++                    tokens, start=int(batch.num_computed_tokens_cpu[i]),
++                    count=scheduler_output.num_scheduled_tokens.get(req_id, 0),
++                    invalid=(getattr(scheduler_output, 'num_invalid_spec_tokens', None) or {}).get(req_id, 0))
+             request = runner.requests[req_id]
+             params = request.sampling_params
+             if not request_enabled(params):
+@@ -130,6 +192,8 @@
+             # Scheduler will stop at EOS, so no auxiliary work can be consumed.
+             if any(token in stops and previous_output + j + 1 >= minimum
+                    for j, token in enumerate(tokens)):
++                if self.acceptance is not None:
++                    self.acceptance.finish(req_id)
+                 continue
+             confirmed = int(batch.num_tokens_no_spec[i])
+             legacy = self._legacy_draft(req_id, params, tokens, confirmed)
+@@ -174,6 +238,8 @@
+             limit = min(self.heads.num_heads, runner.speculative_config.num_speculative_tokens,
+                         batch.max_model_len - confirmed, remaining)
+             if limit <= 0:
++                if self.acceptance is not None:
++                    self.acceptance.finish(req_id)
+                 continue
+             row = batch.token_ids_cpu[i, :confirmed].tolist()
+             if row[-len(tokens):] != tokens:
+@@ -182,16 +248,38 @@
+             inputs.append(row)
+             limits.append(limit)
              indices.append(i)
++            if self.acceptance is not None:
++                fresh_counts[i] = sum(state.length - head.valid for head in state.heads[:limit])
          if states:
              before = self.heads.processed_positions
 -            buckets = query_buckets(states, limits)
@@ -2690,7 +2735,14 @@
              mtp_tokens = 0
              for i, row, limit in zip(indices, rows, limits):
                  row = row[:limit]
-@@ -208,8 +274,24 @@
+@@ -204,12 +292,31 @@
+                         break
+                 outputs[i] = row
+                 mtp_tokens += len(row)
++                if self.acceptance is not None:
++                    self.acceptance.offer(batch.req_ids[i], row,
++                        int(batch.num_tokens_no_spec[i]) - 1, fresh_positions=fresh_counts[i])
+             self.stats['proposal_batches'] += 1
              self.stats['head_batches'] += len(buckets)
              self.stats['draft_tokens'] += mtp_tokens
              self.stats['head_positions'] += self.heads.processed_positions - before
@@ -2717,7 +2769,7 @@
          return outputs
 
 
-@@ -257,9 +339,31 @@
+@@ -257,9 +364,31 @@
  def load_worker(runner, target, settings):
      validate_engine(runner)
      allowed = {'checkpoint', 'num_heads', 'max_context_tokens', 'cache_mib', 'max_requests',
@@ -2725,10 +2777,10 @@
 +               'verify_base_signature', 'graph_mode', 'graph_context_tokens',
 +               'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size',
 +               'native_fusion', 'profile_stages', 'kv_cache_backend',
-+               'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend'}
++               'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend', 'acceptance_stats'}
      if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
          raise ValueError('invalid additional_config.asr_mtp settings')
-+    for name, default in (('native_fusion', True), ('profile_stages', False)):
++    for name, default in (('native_fusion', True), ('profile_stages', False), ('acceptance_stats', False)):
 +        if type(settings.get(name, default)) is not bool:
 +            raise ValueError(f'asr_mtp.{name} must be a bool')
 +    qkv_rope_backend = settings.get('qkv_rope_backend', 'auto')
@@ -2750,7 +2802,7 @@
      for name, default in (('num_heads', 5), ('max_context_tokens', 512),
                            ('cache_mib', 512), ('max_requests', 64)):
          if type(settings.get(name, default)) is not int or settings.get(name, default) < 1:
-@@ -285,19 +389,73 @@
+@@ -285,19 +414,74 @@
          model = BatchedMTPHeads(text, heads)
      model.load_state_dict(selected, strict=True, assign=True)
      model = model.to(device=runner.device, dtype=runner.dtype).eval().requires_grad_(False)
@@ -2812,14 +2864,15 @@
 +        graphs = graph_class(options, model, arena, language.embed_input_ids,
 +                             language.compute_logits)
 +    worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits,
-+                       eos, graphs=graphs, profile_stages=settings.get('profile_stages', False))
++                       eos, graphs=graphs, profile_stages=settings.get('profile_stages', False),
++                       acceptance_stats=settings.get('acceptance_stats', False))
      logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
 -                'verify_base_signature=%s',
 -                heads, cap, slots, arena.storage.numel() * arena.storage.element_size() / 1024 ** 2,
 -                settings['checkpoint'], settings.get('verify_base_signature', False))
 +                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s '
 +                'native_fusion=%s profile_stages=%s kv_cache_backend=%s kv_write_backend=%s '
-+                'qkv_rope_backend=%s row_write_backend=%s',
++                'qkv_rope_backend=%s row_write_backend=%s acceptance_stats=%s',
 +                heads, cap, slots, getattr(arena, 'cache_bytes',
 +                    arena.storage.numel() * arena.storage.element_size()) / 1024 ** 2,
 +                settings['checkpoint'], settings.get('verify_base_signature', False),
@@ -2830,8 +2883,336 @@
 +                native_fusion, settings.get('profile_stages', False), kv_backend,
 +                getattr(arena, 'write_backend', 'separate_scatter_nd'),
 +                model.qkv_rope.backend if native_fusion else 'legacy',
-+                settings.get('row_write_backend', 'auto'))
++                settings.get('row_write_backend', 'auto'), settings.get('acceptance_stats', False))
      return worker
+--- /dev/null
++++ b/vllm_ascend/spec_decode/asr_mtp_metrics.py
+@@ -0,0 +1,325 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU-only MTP provenance counters and offline summary analysis.
++
++No tensors, clocks or device synchronization. Statistics use raw synchronous
++sampler output before scheduler stop/length truncation, like vLLM counters.
++"""
++
++import argparse
++import json
++import logging
++from collections import Counter
++from pathlib import Path
++from uuid import uuid4
++
++logger = logging.getLogger(__name__)
++MARKER = "ASR_MTP_ACCEPTANCE "
++
++
++def request_type(request_id):
++    return next(
++        (
++            kind
++            for prefix, kind in (
++                ("stream_", "chunk"),
++                ("finish_", "finish"),
++                ("prespec-", "shadow"),
++            )
++            if request_id.startswith(prefix)
++        ),
++        "other",
++    )
++
++
++def counters(heads):
++    return {
++        "rounds": 0,
++        "drafted": 0,
++        "accepted": 0,
++        "fresh_positions": 0,
++        "accepted_histogram": [0] * (heads + 1),
++        "accepted_per_position": [0] * heads,
++        "exposed_per_position": [0] * heads,
++    }
++
++
++def accumulate(target, source):
++    for key, value in source.items():
++        if isinstance(value, list):
++            target[key] = [a + b for a, b in zip(target[key], value)]
++        else:
++            target[key] += value
++
++
++class AcceptanceTracker:
++    def __init__(self, heads, emit=None):
++        self.heads, self.emit = heads, emit or self._emit
++        self.session, self.serial = uuid4().hex, 0
++        self.rows, self.pending = {}, {}
++
++    @staticmethod
++    def _emit(row):
++        logger.info("%s%s", MARKER, json.dumps(row, separators=(",", ":")))
++
++    def offer(self, req, tokens, anchor, *, fresh_positions):
++        if not tokens:
++            return
++        if req not in self.rows:
++            self.serial += 1
++            self.rows[req] = {
++                "version": 1,
++                "source": "mtp",
++                "session_id": self.session,
++                "request_id": req,
++                "lifetime": self.serial,
++                "request_type": request_type(req),
++                "num_heads": self.heads,
++                "proposal_rounds": 0,
++                "proposed_tokens": 0,
++                "proposed_fresh_positions": 0,
++                "total": counters(self.heads),
++                "phases": {p: counters(self.heads) for p in ("cold", "warm")},
++                "discard_reasons": Counter(),
++            }
++        row = self.rows[req]
++        if req in self.pending:
++            row["discard_reasons"]["replaced"] += 1
++        phase = "cold" if row["proposal_rounds"] == 0 else "warm"
++        self.pending[req] = (tuple(tokens), anchor, phase, fresh_positions)
++        row["proposal_rounds"] += 1
++        row["proposed_tokens"] += len(tokens)
++        row["proposed_fresh_positions"] += fresh_positions
++
++    def observe(self, req, scheduled, sampled, *, start, count, invalid=0):
++        pending = self.pending.get(req)
++        if pending is None:
++            return  # Initial external drafts and AR are not MTP observations.
++        if not sampled:
++            return  # Discarded sampler row / recomputation is not a rejection.
++        tokens, anchor, phase, fresh = self.pending.pop(req)
++        row = self.rows[req]
++        k, accepted = len(scheduled) - invalid, len(sampled) - 1
++        reason = None
++        if not scheduled:
++            reason = "not_scheduled"
++        elif start != anchor:
++            reason = "context_mismatch"
++        elif invalid < 0 or not 0 < k <= len(tokens) or count < len(scheduled) + 1:
++            reason = "incomplete_or_invalid_verification"
++        elif tuple(scheduled[:k]) != tokens[:k]:
++            reason = "source_mismatch"
++        elif not 0 <= accepted <= k or tuple(sampled[:accepted]) != tokens[:accepted]:
++            reason = "invalid_sampler_result"
++        if reason:
++            row["discard_reasons"][reason] += 1
++            return
++        delta = counters(self.heads)
++        delta.update(rounds=1, drafted=k, accepted=accepted, fresh_positions=fresh)
++        delta["accepted_histogram"][accepted] = 1
++        delta["accepted_per_position"][:accepted] = [1] * accepted
++        delta["exposed_per_position"][:k] = [1] * k
++        accumulate(row["total"], delta)
++        accumulate(row["phases"][phase], delta)
++        if logger.isEnabledFor(logging.DEBUG):
++            logger.debug(
++                "ASR_MTP_VERIFY %s",
++                json.dumps(
++                    {
++                        "request_id": req,
++                        "source": "mtp",
++                        "request_type": row["request_type"],
++                        "phase": phase,
++                        "drafted": k,
++                        "accepted": accepted,
++                        "proposed": len(tokens),
++                        "fresh_positions": fresh,
++                    }
++                ),
++            )
++
++    def snapshot(self, req):
++        row = self.rows[req]
++        # Copy lists/counters: future observations must not mutate an emitted row.
++        result = json.loads(json.dumps(row))
++        result["unverified_tokens"] = row["proposed_tokens"] - row["total"]["drafted"]
++        result["unverified_proposal_rounds"] = (
++            row["proposal_rounds"] - row["total"]["rounds"]
++        )
++        return result
++
++    def finish(self, req):
++        if req not in self.rows:
++            return
++        if self.pending.pop(req, None) is not None:
++            self.rows[req]["discard_reasons"]["finished_unverified"] += 1
++        self.emit(self.snapshot(req))
++        del self.rows[req]
++
++
++def derived(count):
++    rounds, drafted = count["rounds"], count["drafted"]
++    accepted = count["accepted"]
++    return dict(
++        **count,
++        acceptance_rate=accepted / drafted if drafted else None,
++        mean_accepted_length=accepted / rounds if rounds else None,
++        mean_advance_length=1 + accepted / rounds if rounds else None,
++        position_survival=[
++            a / e if e else None
++            for a, e in zip(
++                count["accepted_per_position"], count["exposed_per_position"]
++            )
++        ],
++    )
++
++
++def validate_summary(row):
++    h = row.get("num_heads")
++    if (
++        row.get("version") != 1
++        or row.get("source") != "mtp"
++        or type(h) is not int
++        or h < 1
++        or row.get("request_type") not in ("chunk", "finish", "shadow", "other")
++    ):
++        raise ValueError("unsupported MTP summary")
++    for count in (row["total"], *row["phases"].values()):
++        if set(count) != set(counters(h)):
++            raise ValueError("invalid MTP counters")
++        for key, value in count.items():
++            values = value if isinstance(value, list) else [value]
++            if any(type(n) is not int or n < 0 for n in values):
++                raise ValueError("invalid MTP counter value")
++            if isinstance(value, list) and len(value) != h + (
++                key == "accepted_histogram"
++            ):
++                raise ValueError("invalid MTP position array")
++        hist = count["accepted_histogram"]
++        if (
++            sum(hist) != count["rounds"]
++            or sum(i * n for i, n in enumerate(hist)) != count["accepted"]
++            or sum(count["exposed_per_position"]) != count["drafted"]
++            or count["accepted_per_position"] != [sum(hist[i + 1 :]) for i in range(h)]
++            or any(
++                not a <= e <= count["rounds"]
++                for a, e in zip(
++                    count["accepted_per_position"], count["exposed_per_position"]
++                )
++            )
++        ):
++            raise ValueError("inconsistent MTP counters")
++    combined = counters(h)
++    for phase in ("cold", "warm"):
++        accumulate(combined, row["phases"][phase])
++    if combined != row["total"]:
++        raise ValueError("inconsistent MTP phases")
++    for key in (
++        "proposal_rounds",
++        "proposed_tokens",
++        "proposed_fresh_positions",
++        "unverified_tokens",
++        "unverified_proposal_rounds",
++    ):
++        if type(row[key]) is not int or row[key] < 0:
++            raise ValueError("invalid MTP proposal counter")
++    if (
++        row["unverified_tokens"] != row["proposed_tokens"] - row["total"]["drafted"]
++        or row["unverified_proposal_rounds"]
++        != row["proposal_rounds"] - row["total"]["rounds"]
++    ):
++        raise ValueError("inconsistent MTP unverified counters")
++
++
++def analyze(paths):
++    groups, seen = {}, set()
++    for path in paths:
++        with Path(path).open(encoding="utf-8") as stream:
++            for line_no, line in enumerate(stream, 1):
++                if MARKER not in line:
++                    continue
++                row = json.loads(line.split(MARKER, 1)[1])
++                validate_summary(row)
++                key = (row["session_id"], row["request_id"], row["lifetime"])
++                if key in seen:
++                    raise ValueError(f"{path}:{line_no}: duplicate MTP summary {key}")
++                seen.add(key)
++                h = row["num_heads"]
++                if (
++                    row.get("version") != 1
++                    or row.get("source") != "mtp"
++                    or type(h) is not int
++                    or h < 1
++                ):
++                    raise ValueError(f"{path}:{line_no}: unsupported MTP summary")
++                group = groups.setdefault(
++                    (h, row["request_type"]),
++                    {
++                        "num_heads": h,
++                        "request_type": row["request_type"],
++                        "requests": 0,
++                        "proposal_rounds": 0,
++                        "proposed_tokens": 0,
++                        "proposed_fresh_positions": 0,
++                        "unverified_tokens": 0,
++                        "unverified_proposal_rounds": 0,
++                        "total": counters(h),
++                        "phases": {p: counters(h) for p in ("cold", "warm")},
++                        "discard_reasons": Counter(),
++                    },
++                )
++                for name in (
++                    "requests",
++                    "proposal_rounds",
++                    "proposed_tokens",
++                    "proposed_fresh_positions",
++                    "unverified_tokens",
++                    "unverified_proposal_rounds",
++                ):
++                    group[name] += 1 if name == "requests" else row[name]
++                accumulate(group["total"], row["total"])
++                for phase in ("cold", "warm"):
++                    accumulate(group["phases"][phase], row["phases"][phase])
++                group["discard_reasons"].update(row["discard_reasons"])
++    if not seen:
++        raise ValueError(
++            "no ASR_MTP_ACCEPTANCE summaries: enable acceptance_stats, "
++            "collect INFO logs and allow worker request cleanup"
++        )
++    output = []
++    for _, group in sorted(groups.items()):
++        group.update(derived(group.pop("total")))
++        group["phases"] = {p: derived(c) for p, c in group["phases"].items()}
++        n = group["proposal_rounds"]
++        group["unverified_proposal_fraction"] = (
++            group["unverified_proposal_rounds"] / n if n else None
++        )
++        output.append(group)
++    return {
++        "methodology": "MTP-only raw verifier counters; completed worker request lifetimes only. "
++        "Active/crashed workers without a final summary are absent. Cold is the first "
++        "proposal of each lifetime; warm does not imply zero recomputation. No timings "
++        "are inferred from acceptance. Advance length includes a verifier bonus/correction "
++        "before scheduler EOS/length truncation, not delivered text tokens.",
++        "groups": output,
++    }
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--run", action="append", required=True, metavar="LABEL=LOG")
++    parser.add_argument("--out", type=Path)
++    args = parser.parse_args()
++    runs = {}
++    for item in args.run:
++        label, separator, path = item.partition("=")
++        if not label or not separator or not path or label in runs:
++            parser.error("--run needs a unique LABEL=LOG")
++        runs[label] = analyze([path])
++    content = json.dumps(runs, ensure_ascii=False, indent=2)
++    if args.out:
++        args.out.write_text(content + "\n", encoding="utf-8")
++    print(content)
++
++
++if __name__ == "__main__":
++    main()
 --- a/vllm_ascend/patch/worker/patch_external_draft_mtp.py
 +++ b/vllm_ascend/patch/worker/patch_external_draft_mtp.py
 @@ -8,13 +8,15 @@
