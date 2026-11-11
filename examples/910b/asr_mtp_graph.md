@@ -328,6 +328,71 @@ has overhead, so disable diagnostics for the final comparison. Input preparation
 IPC and scheduling gaps after the MTP handoff remain outside these intervals;
 this upgrade does not establish that every observed bubble is removed.
 
+## Optional auxiliary paged KV
+
+For an installed native-fusion version (source `a5e591b9c`), apply only:
+
+```bash
+git apply --check examples/910b/asr_mtp_paged_kv_v023.patch
+git apply examples/910b/asr_mtp_paged_kv_v023.patch
+```
+
+Fresh, cumulative graph and row-cache-to-token upgrades already include it.
+Do not stack upgrades; regenerate against other installed versions. This patch
+does not restart workers or modify target attention/scheduling.
+
+Merge into the existing settings before the unchanged three-argument factory:
+
+```python
+additional = dict(base_config.get("additional_config") or {})
+settings = dict(additional.get("asr_mtp") or {})
+settings.update({
+    "graph_mode": "full",
+    "graph_token_sizes": [8, 32, 64, 128, 256, 512],
+    "kv_cache_backend": "paged",  # default tnd preserves the old path
+    "kv_block_size": 128,          # 128, 256 or 512
+    "kv_write_backend": "auto",   # auto, scatter_pa or scatter_nd
+})
+additional["asr_mtp"] = settings
+base_config["additional_config"] = additional
+base_config = mtp_engine_config(
+    base_config, mtp_enabled=mtp_enabled, mtp_checkpoint=mtp_checkpoint,
+)
+```
+
+Each auxiliary slot owns fixed pages, independent of the target block allocator.
+Hidden and paged KV have separate storage; eager fallback uses shared strided
+views of the same KV. Rejection still crops valid prefixes, with lazy tail
+overwrite. No full-history copy is introduced when switching execution paths.
+Padded writes use independent dummy pages and unique addresses.
+
+The graph combines new K/V writes once per head and gives persistent pages
+directly to FIA through a block table. For five heads, explicit history K/V
+gathers fall from ten to zero and K/V write calls from ten to five. Hidden
+reads/writes, token updates and final-hidden extraction remain. These are
+program call counts, not measured kernel counts or latency speedups.
+
+`auto` checks ND `cache_mode="Norm"` support at startup. If available, it uses
+ScatterPa; older NZ-only APIs use one joint K/V ScatterNd update instead.
+Explicit `scatter_pa` fails early if unsupported; `scatter_nd` enables write
+ablation under the same paged layout. Both graph write paths avoid historical
+KV gathering; eager fallback retains its original dense attention preparation.
+FIA receives cumulative TND Q lengths and per-sequence PA KV lengths. All head
+tables upload together; identical tables skip upload. Length changes retain
+task updates/event notifications. No device metadata is read on the host.
+
+The cache budget includes rounded live pages, hidden storage and dummy pages;
+weights, graph metadata and workspaces remain additional. Slot capacity may
+decrease at equal MiB. Check actual `cache_slots`, `kv_cache_backend` and
+`kv_write_backend` in `ASR_MTP_CONFIG`. Capture remains token-bucket based.
+
+The installed suite adds `test_asr_mtp_paged.py` and real NPU paged cases in
+`ActualPackedNPUReplayTests`, covering request counts/order/budgets, rejection,
+native fusion and both write selections. CPU checks do not establish 910B FIA
+capture/replay or speed. Compare complete target outputs, acceptance, commit
+P95/P99, prefill/decode, host gaps and memory at equal load. PA may lose on very
+short contexts. Hold all other MTP/graph settings fixed during comparison.
+
 ## Device test
 
 After applying the patch, run the unit/integration tests against the installed
@@ -345,6 +410,9 @@ PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
 
 PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
   python -m unittest discover -s examples/910b/tests -p test_asr_mtp_runtime.py -v
+
+PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
+  python -m unittest discover -s examples/910b/tests -p test_asr_mtp_paged.py -v
 ```
 
 The actual NPU tests retain unfused cases and additionally combine native fused

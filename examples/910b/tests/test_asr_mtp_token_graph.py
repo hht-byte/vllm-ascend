@@ -307,7 +307,21 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
     def test_native_fused_heads_tnd_replay_and_rejection_match_unfused_eager(self):
         self._check_token_bucket_replay_changes_request_boundaries(native_fusion=True)
 
-    def _check_token_bucket_replay_changes_request_boundaries(self, *, native_fusion):
+    def test_paged_kv_auto_write_and_direct_fia_graph_read(self):
+        self._check_token_bucket_replay_changes_request_boundaries(native_fusion=True, paged=True)
+
+    def test_paged_kv_combined_scatter_and_direct_fia_graph_read(self):
+        self._check_token_bucket_replay_changes_request_boundaries(
+            native_fusion=True, paged=True, write_backend="scatter_nd"
+        )
+
+    def _check_token_bucket_replay_changes_request_boundaries(
+        self,
+        *,
+        native_fusion,
+        paged=False,
+        write_backend="auto",
+    ):
         import torch
         from asr_mtp_fused import prepare_fused_heads
         from asr_mtp_heads import BatchedMTPHeads, CacheArena
@@ -334,7 +348,17 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
         embed = torch.nn.Embedding(64, 256).to("npu", torch.float16).eval()
         logits = torch.nn.Linear(256, 64).to("npu", torch.float16).eval()
         old = CacheArena(cfg, 2, max_context=64, slots=2, device="npu", dtype=torch.float16)
-        new = CacheArena(
+        arena_class, arena_kwargs = CacheArena, {}
+        if paged:
+            from asr_mtp_paged_cache import PagedCacheArena
+
+            arena_class = PagedCacheArena
+            arena_kwargs = {
+                "block_size": 128,
+                "dummy_tokens": 33,
+                "write_backend": write_backend,
+            }
+        new = arena_class(
             cfg,
             2,
             max_context=64,
@@ -342,6 +366,7 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
             device="npu",
             dtype=torch.float16,
             scratch_elements=33 * 256,
+            **arena_kwargs,
         )
         options = SimpleNamespace(max_batch=2, context=64, tokens=(8, 32))
         graphs = TokenMTPGraphs(options, fixed, new, embed, logits)
@@ -354,11 +379,12 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
                 hidden = torch.randn(len(row), 256, device="npu", dtype=torch.float16)
                 left.target[: len(row)] = right.target[: len(row)] = hidden
             for step in range(3):
-                order = [0, 1] if step % 2 == 0 else [1, 0]
+                order = [0] if paged and step == 2 else [0, 1] if step % 2 == 0 else [1, 0]
                 left, right = [a[i] for i in order], [b[i] for i in order]
                 rows = [ids[i] + [4 + step] for i in order]
-                expected = eager.propose(left, rows, embed, logits, [2, 2])
-                actual = graphs.propose(right, rows, [2, 2]).clone()
+                limits = [2, 1] if paged and step == 0 else [2] * len(order)
+                expected = eager.propose(left, rows, embed, logits, limits)
+                actual = graphs.propose(right, rows, limits).clone()
                 torch.npu.synchronize()
                 torch.testing.assert_close(actual, expected)
                 for x, y in zip(a, b):
