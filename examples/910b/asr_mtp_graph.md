@@ -393,6 +393,95 @@ capture/replay or speed. Compare complete target outputs, acceptance, commit
 P95/P99, prefill/decode, host gaps and memory at equal load. PA may lose on very
 short contexts. Hold all other MTP/graph settings fixed during comparison.
 
+## QKV/RoPE and sparse hidden-row writes
+
+For an installed paged version corresponding to source `f9bf28b42`, apply only:
+
+```bash
+git apply --check examples/910b/asr_mtp_native_ops_v023.patch
+git apply examples/910b/asr_mtp_native_ops_v023.patch
+```
+
+Fresh ASR installation, cumulative graph and row-cache-to-token upgrades already
+include this change. Do not stack them with the focused patch. Regenerate against
+other installed versions. The deployable module count increases from nine to
+twelve: include `asr_mtp_qkv_rope.py`, `asr_mtp_row_copy.py` and
+`asr_mtp_row_copy_kernel.py` under `vllm_ascend/spec_decode/`.
+
+The three-argument service factory remains unchanged. Merge settings before it:
+
+```python
+additional = dict(base_config.get("additional_config") or {})
+settings = dict(additional.get("asr_mtp") or {})
+settings.update({
+    "qkv_rope_backend": "auto",   # auto / torch / native / triton
+    "row_write_backend": "auto",  # auto / triton / scatter_nd
+})
+additional["asr_mtp"] = settings
+base_config["additional_config"] = additional
+base_config = mtp_engine_config(
+    base_config, mtp_enabled=mtp_enabled, mtp_checkpoint=mtp_checkpoint,
+)
+```
+
+| QKV/RoPE selection | Execution and comparison boundary |
+| --- | --- |
+| `auto` (default) | Native half-style RoPE when `npu_rotary_mul` is available, otherwise Torch. Separate Q/K RMSNorm remains; joint fusion is never selected automatically. |
+| `torch` | Original separate Q/K norm and multiply/add rotation rounding order. |
+| `native` | `npu_rotary_mul(rotary_mode="half")` after Q/K norm; unavailable API fails startup. |
+| `triton` | Explicit joint split QKV, Q/K RMSNorm and RoPE through the registered `triton_split_qkv_rmsnorm_mrope`; unsupported API/geometry fails startup. |
+
+The joint kernel retains FP32 normalization/rotation until its final cast, so it
+may change low-precision rounding. Validate complete target output and acceptance
+on the NPU before adopting it. The older split-QKV kernel with hard-coded BF16
+output is unsuitable for this FP16 service. Packed Linear applies projection
+bias once; the joint kernel's post-norm Q/K affine biases remain `None`.
+
+All three MTP paths (eager, rectangular graph and packed token graph) share the
+prepared helper. Position tables are budgeted and computed at startup on the final
+device/dtype, with capacity `context_cap + number_of_heads + 1`. Runtime performs
+table selection without trigonometry, device scalar reads or CPU length syncs.
+Clamp padding anchors to the arena context cap before adding head depth: the
+1024-token bucket may exceed the 512-token history cap. With
+`native_fusion=False`, `auto/torch` keep the original math without installing the
+helper; explicit `native/triton` is rejected.
+
+The row option affects flat-arena `_write`, chiefly hidden writes in paged mode.
+NPU `auto` prefers a startup-selected Triton sparse row copy; CPU retains
+`index_copy_`. Only an unavailable Triton import selects the old ScatterNd API.
+Explicit unavailable `triton` fails startup, while runtime/JIT errors propagate
+without a silent retry. `scatter_nd` retains the old writer for an equal-layout
+comparison. The dedicated paged K/V `scatter_pa` writer is unchanged.
+
+The copy kernel reads update indices/values and stores only those destination
+rows, without reading/scanning/cloning/zeroing the entire destination. The caller
+provides unique live and padding-sink addresses. The reported FP16 destination
+`(1097744,128)` maps to hidden storage at the user's current settings:
+
+```text
+22 * 512 * 6 * 2048 / 128 + (1024 + 1) * 2048 / 128 = 1,097,744 rows
+2320 update rows / (2048 / 128) = 145 positions = 144-token bucket + one dummy
+```
+
+This is about 268 MiB of destination and 580 KiB of updates. It identifies the
+hidden write, but does not prove that the previous ScatterNd kernel internally
+scanned or copied the full destination. No target model, scheduler, head count or
+draft budget changes are introduced.
+
+`ASR_MTP_CONFIG qkv_rope_backend` reports the selected QKV/RoPE backend;
+`row_write_backend` there is the requested option. The actual graph row writer is
+reported by `ASR_MTP_GRAPH_READY row_write_backend`. Check with:
+
+```bash
+rg -n 'ASR_MTP_CONFIG|ASR_MTP_GRAPH_READY' "$LOG"
+```
+
+Helper tests and conditional full NPU replay tests cover the new operations.
+The authoring host has no NPU; CPU tests cannot establish 910B numerical,
+capture/replay or latency acceptance. Hold checkpoint, heads, token buckets,
+budgets and load fixed; change one backend at a time and compare complete outputs,
+acceptance, prefill/decode, commit P95/P99 and the graph handoff timeline.
+
 ## Device test
 
 After applying the patch, run the unit/integration tests against the installed
@@ -413,6 +502,12 @@ PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
 
 PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
   python -m unittest discover -s examples/910b/tests -p test_asr_mtp_paged.py -v
+
+PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
+  python -m unittest discover -s examples/910b/tests -p test_asr_mtp_qkv_rope.py -v
+
+PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
+  python -m unittest discover -s examples/910b/tests -p test_asr_mtp_row_copy.py -v
 ```
 
 The actual NPU tests retain unfused cases and additionally combine native fused

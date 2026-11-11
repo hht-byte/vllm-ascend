@@ -315,12 +315,32 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
             native_fusion=True, paged=True, write_backend="scatter_nd"
         )
 
+    def test_paged_native_rope_and_sparse_rows_coexist_in_full_mtp_graph(self):
+        self._check_token_bucket_replay_changes_request_boundaries(
+            native_fusion=True,
+            paged=True,
+            qkv_rope_backend="native",
+            row_write_backend="triton",
+        )
+
+    def test_paged_joint_qkv_rope_and_sparse_rows_coexist_in_full_mtp_graph(self):
+        import vllm_ascend.ops  # noqa: F401
+
+        self._check_token_bucket_replay_changes_request_boundaries(
+            native_fusion=True,
+            paged=True,
+            qkv_rope_backend="triton",
+            row_write_backend="triton",
+        )
+
     def _check_token_bucket_replay_changes_request_boundaries(
         self,
         *,
         native_fusion,
         paged=False,
         write_backend="auto",
+        qkv_rope_backend=None,
+        row_write_backend="auto",
     ):
         import torch
         from asr_mtp_fused import prepare_fused_heads
@@ -345,6 +365,10 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
         # Native QKV/Norm/SwiGLU and TND FIA task updates must coexist in the
         # same real NPUGraph; retain unfused eager as an independent reference.
         self.assertEqual(prepare_fused_heads(fixed, enabled=native_fusion), native_fusion)
+        if qkv_rope_backend is not None:
+            from asr_mtp_qkv_rope import prepare_qkv_rope
+
+            fixed.qkv_rope = prepare_qkv_rope(fixed, max_context=64, backend=qkv_rope_backend)
         embed = torch.nn.Embedding(64, 256).to("npu", torch.float16).eval()
         logits = torch.nn.Linear(256, 64).to("npu", torch.float16).eval()
         old = CacheArena(cfg, 2, max_context=64, slots=2, device="npu", dtype=torch.float16)
@@ -368,7 +392,7 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
             scratch_elements=33 * 256,
             **arena_kwargs,
         )
-        options = SimpleNamespace(max_batch=2, context=64, tokens=(8, 32))
+        options = SimpleNamespace(max_batch=2, context=64, tokens=(8, 32), row_write_backend=row_write_backend)
         graphs = TokenMTPGraphs(options, fixed, new, embed, logits)
         graphs.prepare()  # Real NPUGraph and FIA task-update path.
         a, b = [old.acquire(), old.acquire()], [new.acquire(), new.acquire()]
