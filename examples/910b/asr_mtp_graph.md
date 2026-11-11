@@ -395,15 +395,25 @@ short contexts. Hold all other MTP/graph settings fixed during comparison.
 
 ## QKV/RoPE and sparse hidden-row writes
 
-For an installed paged version corresponding to source `f9bf28b42`, apply only:
+For the previous native-ops version (ASR source `637b6f878`, engine deliverable
+`5d757257c`), apply only the native-row correction:
+
+```bash
+git apply --check examples/910b/asr_mtp_native_rows_v023.patch
+git apply examples/910b/asr_mtp_native_rows_v023.patch
+```
+
+For an earlier paged version corresponding to source `f9bf28b42`, use the updated
+native-ops upgrade, which already includes that correction:
 
 ```bash
 git apply --check examples/910b/asr_mtp_native_ops_v023.patch
 git apply examples/910b/asr_mtp_native_ops_v023.patch
 ```
 
-Fresh ASR installation, cumulative graph and row-cache-to-token upgrades already
-include this change. Do not stack them with the focused patch. Regenerate against
+Choose one focused upgrade for the installed baseline; do not stack them. Fresh
+ASR installation, cumulative graph and row-cache-to-token upgrades already
+include this correction. Do not stack them with a focused patch. Regenerate against
 other installed versions. The deployable module count increases from nine to
 twelve: include `asr_mtp_qkv_rope.py`, `asr_mtp_row_copy.py` and
 `asr_mtp_row_copy_kernel.py` under `vllm_ascend/spec_decode/`.
@@ -415,7 +425,7 @@ additional = dict(base_config.get("additional_config") or {})
 settings = dict(additional.get("asr_mtp") or {})
 settings.update({
     "qkv_rope_backend": "auto",   # auto / torch / native / triton
-    "row_write_backend": "auto",  # auto / triton / scatter_nd
+    "row_write_backend": "scatter_nd",  # recommended here; auto also uses ScatterND
 })
 additional["asr_mtp"] = settings
 base_config["additional_config"] = additional
@@ -446,14 +456,18 @@ Clamp padding anchors to the arena context cap before adding head depth: the
 `native_fusion=False`, `auto/torch` keep the original math without installing the
 helper; explicit `native/triton` is rejected.
 
-The row option affects flat-arena `_write`, chiefly hidden writes in paged mode.
-NPU `auto` prefers a startup-selected Triton sparse row copy; CPU retains
-`index_copy_`. Only an unavailable Triton import selects the old ScatterNd API.
-Explicit unavailable `triton` fails startup, while runtime/JIT errors propagate
-without a silent retry. `scatter_nd` retains the old writer for an equal-layout
-comparison. The dedicated paged K/V `scatter_pa` writer is unchanged.
+The row option accepts `auto/triton/scatter_nd` and affects flat-arena `_write`,
+chiefly hidden writes in paged mode. NPU `auto` now directly selects the native
+ScatterNd API without importing Triton; CPU retains `index_copy_`. Explicit
+`triton` remains experimental: unavailable imports fail startup and runtime/JIT
+errors propagate without a silent retry. The user's 910B profile reported about
+1.377 ms for one `row_copy_kernel`, slower than the earlier native writer. Start
+with `scatter_nd`, retaining the existing native helper, graph settings, head
+count and budgets. The reported recomputation loads were only similar, so this
+is not a strictly matched-shape stable slowdown ratio or proof of inefficient IR.
+The dedicated paged K/V `scatter_pa` writer is unchanged.
 
-The copy kernel reads update indices/values and stores only those destination
+The experimental copy kernel reads update indices/values and stores only those destination
 rows, without reading/scanning/cloning/zeroing the entire destination. The caller
 provides unique live and padding-sink addresses. The reported FP16 destination
 `(1097744,128)` maps to hidden storage at the user's current settings:
@@ -465,12 +479,20 @@ provides unique live and padding-sink addresses. The reported FP16 destination
 
 This is about 268 MiB of destination and 580 KiB of updates. It identifies the
 hidden write, but does not prove that the previous ScatterNd kernel internally
-scanned or copied the full destination. No target model, scheduler, head count or
+scanned or copied the full destination. The paged token graph now expresses each
+complete hidden vector as one row: `(1097744,128)` becomes `(68609,2048)`, and
+`(2320,128)` updates become `(145,2048)`. Hidden gathers likewise use one row per
+token. Byte counts, scratch isolation and cache validity are unchanged; the mixed
+hidden/KV TND and rectangular layouts retain their gcd row width. Official
+[VectorCore guidance](https://github.com/Ascend/triton-ascend/blob/main/docs/en/programming_guide/vector_operator.md)
+suggests future optimization candidates, without proving the
+current root cause or a latency gain. No target model, scheduler, head count or
 draft budget changes are introduced.
 
 `ASR_MTP_CONFIG qkv_rope_backend` reports the selected QKV/RoPE backend;
 `row_write_backend` there is the requested option. The actual graph row writer is
-reported by `ASR_MTP_GRAPH_READY row_write_backend`. Check with:
+reported by `ASR_MTP_GRAPH_READY row_write_backend`; `row_width=2048` identifies
+the whole-token hidden rows in the paged token graph. Check with:
 
 ```bash
 rg -n 'ASR_MTP_CONFIG|ASR_MTP_GRAPH_READY' "$LOG"

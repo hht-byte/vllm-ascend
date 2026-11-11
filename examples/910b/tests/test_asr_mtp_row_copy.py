@@ -85,7 +85,7 @@ class RowWriterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "backend"):
             api.prepare_row_writer("cpu", backend="unknown")
 
-    def test_auto_missing_triton_uses_old_native_api_without_runtime_catch(self):
+    def test_auto_uses_native_api_without_loading_triton(self):
         api = writer_module(self)
         calls = []
 
@@ -94,7 +94,7 @@ class RowWriterTests(unittest.TestCase):
             cache.index_copy_(0, indices[:, 0], updates)
 
         with (
-            patch.object(api, "_load_triton_writer", side_effect=ImportError("missing")),
+            patch.object(api, "_load_triton_writer", side_effect=AssertionError("load")),
             patch.object(
                 api.importlib,
                 "import_module",
@@ -128,14 +128,31 @@ class RowWriterTests(unittest.TestCase):
         ):
             api.prepare_row_writer("npu", backend="triton")
 
-    def test_auto_returns_triton_writer_without_importing_old_native_api(self):
+    def test_auto_stays_native_even_when_triton_is_available(self):
+        api = writer_module(self)
+        selected_writer = lambda *args: None
+        with (
+            patch.object(api, "_load_triton_writer", return_value=selected_writer) as load_triton,
+            patch.object(
+                api.importlib,
+                "import_module",
+                return_value=SimpleNamespace(npu_scatter_nd_update_=lambda *args: None),
+            ) as import_module,
+        ):
+            actual, selected = api.prepare_row_writer("npu")
+        load_triton.assert_not_called()
+        import_module.assert_called_once_with("torch_npu")
+        self.assertIsNot(actual, selected_writer)
+        self.assertEqual(selected, "scatter_nd")
+
+    def test_explicit_triton_returns_writer_without_importing_native_api(self):
         api = writer_module(self)
         selected_writer = lambda *args: None
         with (
             patch.object(api, "_load_triton_writer", return_value=selected_writer),
             patch.object(api.importlib, "import_module", side_effect=AssertionError("import")),
         ):
-            actual, selected = api.prepare_row_writer("npu")
+            actual, selected = api.prepare_row_writer("npu", backend="triton")
         self.assertIs(actual, selected_writer)
         self.assertEqual(selected, "triton")
 
@@ -146,7 +163,7 @@ class RowWriterTests(unittest.TestCase):
             raise RuntimeError("launch failed")
 
         with patch.object(api, "_load_triton_writer", return_value=unavailable_at_run):
-            writer, selected = api.prepare_row_writer("npu")
+            writer, selected = api.prepare_row_writer("npu", backend="triton")
         self.assertEqual(selected, "triton")
         with self.assertRaisesRegex(RuntimeError, "launch failed"):
             writer(None, None, None)

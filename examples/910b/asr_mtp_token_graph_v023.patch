@@ -490,7 +490,7 @@
 +    return QKVRope(heads, max_context, backend, native_ops, fused_op)
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_row_copy.py
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,96 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Startup-selected sparse auxiliary row writes, without destination scans.
 +
@@ -557,9 +557,9 @@
 +def prepare_row_writer(device, *, backend="auto"):
 +    """Return ``(writer, name)``; CPU keeps the caller's index_copy_ reference.
 +
-+    ``auto`` selects Triton if it can be imported, otherwise the old NPU API.
-+    Explicit ``triton`` fails at startup when unavailable. Import selection is
-+    performed once, not inside the writer or graph replay. A runtime/JIT error
++    ``auto`` keeps the native ScatterNd writer without importing Triton. The
++    opt-in ``triton`` backend fails at startup when unavailable. Import selection
++    is performed once, not inside the writer or graph replay. A runtime/JIT error
 +    propagates instead of silently switching semantics or adding synchronization.
 +    """
 +    if backend not in ("auto", "triton", "scatter_nd"):
@@ -569,12 +569,11 @@
 +        return None, "index_copy"
 +    if kind != "npu":
 +        raise ValueError("MTP row writer requires a CPU or NPU device")
-+    if backend != "scatter_nd":
++    if backend == "triton":
 +        try:
 +            return _load_triton_writer(), "triton"
 +        except ImportError as error:
-+            if backend == "triton":
-+                raise RuntimeError("MTP triton row writer is unavailable") from error
++            raise RuntimeError("MTP triton row writer is unavailable") from error
 +    api = importlib.import_module("torch_npu")
 +    operation = getattr(api, "npu_scatter_nd_update_", None)
 +    if operation is None:
@@ -1201,7 +1200,7 @@
 +        return replay
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_token_graph.py
-@@ -0,0 +1,607 @@
+@@ -0,0 +1,618 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Packed auxiliary MTP graphs keyed only by total fresh-token capacity."""
 +
@@ -1284,7 +1283,13 @@
 +            if self.paged_kv
 +            else max_batch * context_size + query_capacity
 +        )
-+        self.row_width = gcd(cfg.hidden_size, cfg.head_dim)
++        # Paged K/V is separate: the flat arena contains only full hidden
++        # vectors. Express their contiguous H elements as one row, rather than
++        # H/gcd independently indexed fragments. Mixed hidden/KV TND keeps its
++        # shared alignment because not every KV region is H-aligned.
++        self.row_width = (
++            cfg.hidden_size if self.paged_kv else gcd(cfg.hidden_size, cfg.head_dim)
++        )
 +        row_elements = arena.graph_storage.numel() // self.row_width * self.row_width
 +        self.cache_rows = arena.graph_storage[:row_elements].view(-1, self.row_width)
 +        device, dtype = arena.storage.device, arena.storage.dtype
@@ -1328,16 +1333,20 @@
 +                query_capacity * cfg.hidden_size // self.row_width, device=device
 +            )
 +        ).view(query_capacity, cfg.hidden_size // self.row_width)
-+        self.kv_sink = (
-+            arena.scratch_offset // self.row_width
-+            + torch.arange(
-+                query_capacity
-+                * cfg.num_key_value_heads
-+                * cfg.head_dim
-+                // self.row_width,
-+                device=device,
++        self.kv_sink = None
++        if not self.paged_kv:
++            self.kv_sink = (
++                arena.scratch_offset // self.row_width
++                + torch.arange(
++                    query_capacity
++                    * cfg.num_key_value_heads
++                    * cfg.head_dim
++                    // self.row_width,
++                    device=device,
++                )
++            ).view(
++                query_capacity, cfg.num_key_value_heads, cfg.head_dim // self.row_width
 +            )
-+        ).view(query_capacity, cfg.num_key_value_heads, cfg.head_dim // self.row_width)
 +        self.inverse = 1.0 / (
 +            cfg.rope_theta
 +            ** (
@@ -1716,7 +1725,7 @@
 +        logger.info(
 +            "ASR_MTP_GRAPH_READY layout=tokens graphs=%d max_batch=%d token_sizes=%s "
 +            "query_capacities=%s context=%d capture_ms=%.2f reserved_mib=%.2f "
-+            "row_write_backend=%s",
++            "row_write_backend=%s row_width=%d",
 +            len(self.entries),
 +            self.options.max_batch,
 +            self.options.tokens,
@@ -1725,6 +1734,7 @@
 +            (perf_counter() - started) * 1000,
 +            self.reserved_bytes / 1024**2,
 +            next(iter(self.entries.values()))[0].row_write_backend,
++            next(iter(self.entries.values()))[0].row_width,
 +        )
 +
 +    @torch.inference_mode()

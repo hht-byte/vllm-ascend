@@ -179,6 +179,31 @@ class PagedProgramTests(PackedFixture, unittest.TestCase):
         prepare_fused_heads(self.fixed.requires_grad_(False))
         self.test_mixed_prefixes_budgets_and_rejection_match_contiguous_reference()
 
+    def test_paged_hidden_transfers_use_one_full_token_row_per_address(self):
+        self.assertEqual(self.program.row_width, self.cfg.hidden_size)
+        self.assertEqual(self.program.cache_rows.shape[1], self.cfg.hidden_size)
+        self.assertEqual(self.program.hidden_sink.shape, (33, 1))
+        self.assertIsNone(self.program.kv_sink)
+        writes = []
+        original_read = self.program._read
+
+        def read(indices):
+            self.assertEqual(indices.shape, (33, 1))
+            return original_read(indices)
+
+        def write(cache, indices, updates):
+            self.assertEqual(indices.shape, (33, 1))
+            self.assertEqual(updates.shape, (33, self.cfg.hidden_size))
+            self.assertEqual(indices.unique().numel(), 33)
+            self.assertEqual(cache.data_ptr(), self.new.graph_storage.data_ptr())
+            writes.append(indices.shape[0])
+            cache.index_copy_(0, indices[:, 0], updates)
+
+        self.program.npu_row_update = write
+        with patch.object(self.program, "_read", read):
+            self.test_mixed_prefixes_budgets_and_rejection_match_contiguous_reference()
+        self.assertEqual(writes, [33] * 6)
+
     def test_precomputed_rope_clamps_padding_when_token_bucket_exceeds_context(self):
         from asr_mtp_fused import prepare_fused_heads
         from asr_mtp_paged_cache import PagedCacheArena
