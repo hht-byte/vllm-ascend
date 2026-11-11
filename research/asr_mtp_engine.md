@@ -349,7 +349,7 @@ additional = dict(base_config.get("additional_config") or {})
 settings = dict(additional.get("asr_mtp") or {})
 settings.update({
     "qkv_rope_backend": "auto",   # auto / torch / native / triton
-    "row_write_backend": "auto",  # auto / triton / scatter_nd
+    "row_write_backend": "scatter_nd",  # 本轮建议；auto 同样选择 ScatterND
 })
 additional["asr_mtp"] = settings
 base_config["additional_config"] = additional
@@ -377,13 +377,16 @@ token bucket 容量作为历史上限，因 1024-token 桶可大于 512-token ca
 `native_fusion=False` 时 `auto/torch` 保留旧数学路径且不安装 helper；显式
 `native/triton` 则拒绝启动，避免消融配置实际仍启用融合。
 
-`row_write_backend` 独立控制 flat arena `_write`，分页模式下主要是 hidden
-写入。`auto` 在 NPU 启动时优先选择 Triton 稀疏行 copy；CPU 继续用
-`index_copy_`。仅缺少 Triton import 时回退旧 `npu_scatter_nd_update_`；
-显式 `triton` 缺失则启动失败。运行时/JIT 错误直接报出，不吞掉错误后换算子。
-`scatter_nd` 保留原 writer，供同布局消融。
+`row_write_backend` 允许 `auto/triton/scatter_nd`，独立控制 flat arena
+`_write`，分页模式下主要是 hidden 写入。当前 `auto` 在 NPU 直接选择
+`npu_scatter_nd_update_`，不导入 Triton；CPU 继续用 `index_copy_`。
+显式 `triton` 保留为实验后端，缺失则启动失败，运行时/JIT 错误直接报出，
+不吞掉错误后换算子。用户在 910B 观测到 `row_copy_kernel` 单次约 1.377 ms，
+比此前原生 writer 更慢，因此本轮先用 `scatter_nd`，保持 native helper
+以及其余图配置、head 数和预算不变。两次补算量仅接近，不能据此给出严格
+同 shape 的稳定倍率或把原因确定为低效编译 IR。
 
-新 copy kernel 只读取更新行的索引和值，并写入相应 destination 行，不读取、
+实验 copy kernel 只读取更新行的索引和值，并写入相应 destination 行，不读取、
 扫描、克隆或清零整个 destination。live 和 padding scratch 地址唯一性由调用
 方保证。用户这轮 `(1097744,128)` 的 FP16 destination 对应 hidden arena：
 
@@ -395,19 +398,35 @@ token bucket 容量作为历史上限，因 1024-token 桶可大于 512-token ca
 
 约 268 MiB destination 只更新 580 KiB；145 个位置对应 144-token 桶加一个
 dummy。这些形状能定位 hidden 写入，不能证明旧 ScatterND 内部全量扫描或
-复制了 destination。分页 K/V 已走专用 `scatter_pa`，不会被该开关替换。
+复制了 destination。新版分页 token 图把 hidden 的行宽由 128 改为完整
+`hidden_size=2048`：同一存储 view 从 `(1097744,128)` 变为
+`(68609,2048)`，更新从 `(2320,128)` 变为 `(145,2048)`。hidden gather
+也按一个 token 一行读取，减少索引行数，字节量、padding 隔离和缓存有效性
+不变。混合 hidden/KV 的 TND 与矩形图仍使用 gcd 行宽；分页 K/V 已走专用
+`scatter_pa`，不会被该开关替换。[官方 VectorCore 优化指南](https://github.com/Ascend/triton-ascend/blob/main/docs/en/programming_guide/vector_operator.md)可指导后续实验，
+但不能据此证明当前 kernel 的瓶颈或保证新的时延收益。
 
-已安装分页版（源码 `f9bf28b42`）应用引擎交付目录中的聚焦升级：
+已安装上一轮 native-ops 版（ASR 源码 `637b6f878`、引擎交付
+`5d757257c`）应用新的聚焦修复：
+
+```bash
+git apply --check examples/910b/asr_mtp_native_rows_v023.patch
+git apply examples/910b/asr_mtp_native_rows_v023.patch
+```
+
+更早的分页版（源码 `f9bf28b42`）则应用已累计包含该修复的 native-ops 升级：
 
 ```bash
 git apply --check examples/910b/asr_mtp_native_ops_v023.patch
 git apply examples/910b/asr_mtp_native_ops_v023.patch
 ```
 
-新安装的完整补丁、累计图升级和行缓存到 token 升级已包含它，不连续叠加。
+上述两条聚焦升级按已安装基线二选一，不叠加。新安装的完整补丁、累计图
+升级和行缓存到 token 升级也已包含修复，不与聚焦升级连续叠加。
 其他版本对实际安装目录重新导出；新增三个 helper 模块也必须一起部署。
 `ASR_MTP_CONFIG` 中 `qkv_rope_backend` 是实际选择，`row_write_backend`
-是请求配置；`ASR_MTP_GRAPH_READY row_write_backend` 是图实际 writer：
+是请求配置；`ASR_MTP_GRAPH_READY row_write_backend` 是图实际 writer，
+分页 token 图的 `row_width=2048` 可核对整 token 行布局：
 
 ```bash
 rg -n 'ASR_MTP_CONFIG|ASR_MTP_GRAPH_READY' "$LOG"

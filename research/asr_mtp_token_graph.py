@@ -80,7 +80,13 @@ class PackedMTPProgram:
             if self.paged_kv
             else max_batch * context_size + query_capacity
         )
-        self.row_width = gcd(cfg.hidden_size, cfg.head_dim)
+        # Paged K/V is separate: the flat arena contains only full hidden
+        # vectors. Express their contiguous H elements as one row, rather than
+        # H/gcd independently indexed fragments. Mixed hidden/KV TND keeps its
+        # shared alignment because not every KV region is H-aligned.
+        self.row_width = (
+            cfg.hidden_size if self.paged_kv else gcd(cfg.hidden_size, cfg.head_dim)
+        )
         row_elements = arena.graph_storage.numel() // self.row_width * self.row_width
         self.cache_rows = arena.graph_storage[:row_elements].view(-1, self.row_width)
         device, dtype = arena.storage.device, arena.storage.dtype
@@ -124,16 +130,20 @@ class PackedMTPProgram:
                 query_capacity * cfg.hidden_size // self.row_width, device=device
             )
         ).view(query_capacity, cfg.hidden_size // self.row_width)
-        self.kv_sink = (
-            arena.scratch_offset // self.row_width
-            + torch.arange(
-                query_capacity
-                * cfg.num_key_value_heads
-                * cfg.head_dim
-                // self.row_width,
-                device=device,
+        self.kv_sink = None
+        if not self.paged_kv:
+            self.kv_sink = (
+                arena.scratch_offset // self.row_width
+                + torch.arange(
+                    query_capacity
+                    * cfg.num_key_value_heads
+                    * cfg.head_dim
+                    // self.row_width,
+                    device=device,
+                )
+            ).view(
+                query_capacity, cfg.num_key_value_heads, cfg.head_dim // self.row_width
             )
-        ).view(query_capacity, cfg.num_key_value_heads, cfg.head_dim // self.row_width)
         self.inverse = 1.0 / (
             cfg.rope_theta
             ** (
@@ -512,7 +522,7 @@ class TokenMTPGraphs:
         logger.info(
             "ASR_MTP_GRAPH_READY layout=tokens graphs=%d max_batch=%d token_sizes=%s "
             "query_capacities=%s context=%d capture_ms=%.2f reserved_mib=%.2f "
-            "row_write_backend=%s",
+            "row_write_backend=%s row_width=%d",
             len(self.entries),
             self.options.max_batch,
             self.options.tokens,
@@ -521,6 +531,7 @@ class TokenMTPGraphs:
             (perf_counter() - started) * 1000,
             self.reserved_bytes / 1024**2,
             next(iter(self.entries.values()))[0].row_write_backend,
+            next(iter(self.entries.values()))[0].row_width,
         )
 
     @torch.inference_mode()

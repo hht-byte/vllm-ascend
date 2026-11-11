@@ -64,9 +64,9 @@ def _load_triton_writer():
 def prepare_row_writer(device, *, backend="auto"):
     """Return ``(writer, name)``; CPU keeps the caller's index_copy_ reference.
 
-    ``auto`` selects Triton if it can be imported, otherwise the old NPU API.
-    Explicit ``triton`` fails at startup when unavailable. Import selection is
-    performed once, not inside the writer or graph replay. A runtime/JIT error
+    ``auto`` keeps the native ScatterNd writer without importing Triton. The
+    opt-in ``triton`` backend fails at startup when unavailable. Import selection
+    is performed once, not inside the writer or graph replay. A runtime/JIT error
     propagates instead of silently switching semantics or adding synchronization.
     """
     if backend not in ("auto", "triton", "scatter_nd"):
@@ -76,12 +76,11 @@ def prepare_row_writer(device, *, backend="auto"):
         return None, "index_copy"
     if kind != "npu":
         raise ValueError("MTP row writer requires a CPU or NPU device")
-    if backend != "scatter_nd":
+    if backend == "triton":
         try:
             return _load_triton_writer(), "triton"
         except ImportError as error:
-            if backend == "triton":
-                raise RuntimeError("MTP triton row writer is unavailable") from error
+            raise RuntimeError("MTP triton row writer is unavailable") from error
     api = importlib.import_module("torch_npu")
     operation = getattr(api, "npu_scatter_nd_update_", None)
     if operation is None:
