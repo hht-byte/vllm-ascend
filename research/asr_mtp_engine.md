@@ -2,7 +2,7 @@
 
 本实现运行在 **vLLM worker 内**。加载用户提供的 `asr-mtp` checkpoint 中的辅助 heads，共享已加载目标模型的 embedding 和 logits 计算；不加载第二个 ASR 主干，不使用 HF `generate()`，不重新编码音频。回滚和 Prespec 的完整草稿仍先由已有 first-verify scheduler 补丁排入首次目标执行。随后，无论部分失配还是草稿耗尽，worker 从实际确认的目标上下文进入 MTP，后续草稿继续交给原有目标模型 / rejection sampler 验证。MTP 启用的请求不再进行旧 aligned/ngram 重接。
 
-新增代码包含十二个可部署模块和 `worker.py` 中的启动注册：[补丁](asr_mtp_v023.patch)。不重写 `model_runner_v1.py`、目标模型、scheduler 或 paged KV 管理。安装必须在现有 [first-verify 补丁](external_draft_first_verify_v023.md)之上。
+新增代码包含十三个可部署模块和 `worker.py` 中的启动注册：[补丁](asr_mtp_v023.patch)。不重写 `model_runner_v1.py`、目标模型、scheduler 或 paged KV 管理。安装必须在现有 [first-verify 补丁](external_draft_first_verify_v023.md)之上。
 
 ## 1. 安装到引擎
 
@@ -34,6 +34,7 @@ git apply /tmp/asr-mtp.patch
 | `asr_mtp_paged_cache.py` | `vllm_ascend/spec_decode/asr_mtp_paged_cache.py` |
 | `asr_mtp_paged_attention.py` | `vllm_ascend/spec_decode/asr_mtp_paged_attention.py` |
 | `asr_mtp_worker.py` | `vllm_ascend/spec_decode/asr_mtp_worker.py` |
+| `asr_mtp_metrics.py` | `vllm_ascend/spec_decode/asr_mtp_metrics.py` |
 | `patch_external_draft_mtp.py` | `vllm_ascend/patch/worker/patch_external_draft_mtp.py` |
 | 注册 import | `vllm_ascend/worker/worker.py`，紧接 `NPUModelRunner` 的导入；受 0.23 版本条件保护 |
 
@@ -520,3 +521,7 @@ python -m unittest discover -s research -p 'test_streaming_mtp_config.py' -v
 ```
 
 前一组需要 Torch、transformers 4.57.6 及 `SPEC_ASR_TEST_ROOT` 对应的参考源码（当前测试默认使用 `.tmp/asr-mtp-reference`）；这些只用于 CPU 核对，不是线上模块的运行依赖。完整 910B checkpoint 的 BF16/NPU 数值和性能尚未实测。部署后先核对 `ASR_MTP_CONFIG`、正式 `INITIAL_DRAFT` 和后续 `ASR_VERIFY_STEP`，以相同音频 / 并发对照完整目标输出、decode 轮次、commit P50/P95/P99、队列等待和显存；辅助输出匹配或减少 head 计算位置不等于已经提高在线性能。单独 NPU 辅助 kernel 的数值差异可能改变接受率，所有输出仍由目标 verifier 决定。
+
+## MTP acceptance statistics
+
+See [MTP acceptance and head-count ablation](asr_mtp_acceptance.md). Enable `additional_config.asr_mtp.acceptance_stats=True` for MTP-only INFO summaries; the default is disabled and adds no device synchronization. Install the metrics module together with the updated worker.

@@ -78,7 +78,7 @@ def stop_ids(params, model_eos):
 
 class MTPWorker:
     def __init__(self, runner, heads, arena, embedding, logits, eos, *, graphs=None,
-                 profile_stages=False):
+                 profile_stages=False, acceptance_stats=False):
         self.runner, self.heads, self.arena = runner, heads, arena
         self.embedding, self.logits, self.eos = embedding, logits, set(eos)
         self.states, self.disabled = {}, {}
@@ -86,9 +86,18 @@ class MTPWorker:
         self.stats = Counter(target_forwards=0)
         self.graphs, self.profiled = graphs, False
         self.profile_stages = profile_stages
+        self.acceptance = None
+        if acceptance_stats:
+            try:
+                from .asr_mtp_metrics import AcceptanceTracker
+            except ImportError:
+                from asr_mtp_metrics import AcceptanceTracker
+            self.acceptance = AcceptanceTracker(heads.num_heads)
 
     def finish(self, request_ids):
         for req_id in request_ids:
+            if self.acceptance is not None:
+                self.acceptance.finish(req_id)
             state = self.states.pop(req_id, None)
             if state is not None:
                 self.arena.release(state)
@@ -160,7 +169,14 @@ class MTPWorker:
         runner, batch = self.runner, self.runner.input_batch
         outputs = [[] for _ in sampled]
         states, inputs, limits, indices = [], [], [], []
+        fresh_counts = {}
         for i, (req_id, tokens) in enumerate(zip(batch.req_ids, sampled)):
+            if self.acceptance is not None:
+                self.acceptance.observe(
+                    req_id, getattr(scheduler_output, 'scheduled_spec_decode_tokens', {}).get(req_id, ()),
+                    tokens, start=int(batch.num_computed_tokens_cpu[i]),
+                    count=scheduler_output.num_scheduled_tokens.get(req_id, 0),
+                    invalid=(getattr(scheduler_output, 'num_invalid_spec_tokens', None) or {}).get(req_id, 0))
             request = runner.requests[req_id]
             params = request.sampling_params
             if not request_enabled(params):
@@ -176,6 +192,8 @@ class MTPWorker:
             # Scheduler will stop at EOS, so no auxiliary work can be consumed.
             if any(token in stops and previous_output + j + 1 >= minimum
                    for j, token in enumerate(tokens)):
+                if self.acceptance is not None:
+                    self.acceptance.finish(req_id)
                 continue
             confirmed = int(batch.num_tokens_no_spec[i])
             legacy = self._legacy_draft(req_id, params, tokens, confirmed)
@@ -220,6 +238,8 @@ class MTPWorker:
             limit = min(self.heads.num_heads, runner.speculative_config.num_speculative_tokens,
                         batch.max_model_len - confirmed, remaining)
             if limit <= 0:
+                if self.acceptance is not None:
+                    self.acceptance.finish(req_id)
                 continue
             row = batch.token_ids_cpu[i, :confirmed].tolist()
             if row[-len(tokens):] != tokens:
@@ -228,6 +248,8 @@ class MTPWorker:
             inputs.append(row)
             limits.append(limit)
             indices.append(i)
+            if self.acceptance is not None:
+                fresh_counts[i] = sum(state.length - head.valid for head in state.heads[:limit])
         if states:
             before = self.heads.processed_positions
             buckets = query_buckets(states, limits, self.graphs)
@@ -270,6 +292,9 @@ class MTPWorker:
                         break
                 outputs[i] = row
                 mtp_tokens += len(row)
+                if self.acceptance is not None:
+                    self.acceptance.offer(batch.req_ids[i], row,
+                        int(batch.num_tokens_no_spec[i]) - 1, fresh_positions=fresh_counts[i])
             self.stats['proposal_batches'] += 1
             self.stats['head_batches'] += len(buckets)
             self.stats['draft_tokens'] += mtp_tokens
@@ -342,10 +367,10 @@ def load_worker(runner, target, settings):
                'verify_base_signature', 'graph_mode', 'graph_context_tokens',
                'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size',
                'native_fusion', 'profile_stages', 'kv_cache_backend',
-               'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend'}
+               'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend', 'acceptance_stats'}
     if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
         raise ValueError('invalid additional_config.asr_mtp settings')
-    for name, default in (('native_fusion', True), ('profile_stages', False)):
+    for name, default in (('native_fusion', True), ('profile_stages', False), ('acceptance_stats', False)):
         if type(settings.get(name, default)) is not bool:
             raise ValueError(f'asr_mtp.{name} must be a bool')
     qkv_rope_backend = settings.get('qkv_rope_backend', 'auto')
@@ -442,11 +467,12 @@ def load_worker(runner, target, settings):
         graphs = graph_class(options, model, arena, language.embed_input_ids,
                              language.compute_logits)
     worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits,
-                       eos, graphs=graphs, profile_stages=settings.get('profile_stages', False))
+                       eos, graphs=graphs, profile_stages=settings.get('profile_stages', False),
+                       acceptance_stats=settings.get('acceptance_stats', False))
     logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
                 'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s '
                 'native_fusion=%s profile_stages=%s kv_cache_backend=%s kv_write_backend=%s '
-                'qkv_rope_backend=%s row_write_backend=%s',
+                'qkv_rope_backend=%s row_write_backend=%s acceptance_stats=%s',
                 heads, cap, slots, getattr(arena, 'cache_bytes',
                     arena.storage.numel() * arena.storage.element_size()) / 1024 ** 2,
                 settings['checkpoint'], settings.get('verify_base_signature', False),
@@ -457,5 +483,5 @@ def load_worker(runner, target, settings):
                 native_fusion, settings.get('profile_stages', False), kv_backend,
                 getattr(arena, 'write_backend', 'separate_scatter_nd'),
                 model.qkv_rope.backend if native_fusion else 'legacy',
-                settings.get('row_write_backend', 'auto'))
+                settings.get('row_write_backend', 'auto'), settings.get('acceptance_stats', False))
     return worker

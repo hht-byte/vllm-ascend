@@ -420,12 +420,13 @@ class EngineHeadsTests(unittest.TestCase):
             packed = load_worker(runner, target, {
                 **settings, 'graph_mode': 'full', 'graph_context_tokens': 16,
                 'graph_token_sizes': [8, 32, 64], 'profile_stages': True,
-                'row_write_backend': 'scatter_nd', 'qkv_rope_backend': 'torch',
+                'row_write_backend': 'scatter_nd', 'qkv_rope_backend': 'torch', 'acceptance_stats': True,
             })
             self.assertEqual(type(packed.graphs).__name__, 'TokenMTPGraphs')
             self.assertEqual(packed.graphs.options.tokens, (8, 32, 64))
             self.assertTrue(packed.graphs.options.profile_stages)
             self.assertEqual(packed.graphs.options.row_write_backend, 'scatter_nd')
+            self.assertIsNotNone(packed.acceptance)
             self.assertEqual(packed.arena.graph_storage.numel() - packed.arena.scratch_offset, 520)
             self.assertFalse(packed.graphs.ready)
             paged = load_worker(runner, target, {
@@ -442,6 +443,7 @@ class EngineHeadsTests(unittest.TestCase):
                               {'kv_cache_backend': 'unknown'},
                               {'qkv_rope_backend': 'unknown'},
                               {'row_write_backend': 'unknown'},
+                              {'acceptance_stats': 'true'},
                               {'graph_token_sizes': [1000000]}):
                 with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                     load_worker(runner, target, {
