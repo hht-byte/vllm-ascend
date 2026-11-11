@@ -547,3 +547,45 @@ matrix computation and padded attention computation remain.
 ## MTP acceptance statistics
 
 See [MTP acceptance and head-count ablation](asr_mtp_acceptance.md). Enable `additional_config.asr_mtp.acceptance_stats=True` for MTP-only INFO summaries; the default is disabled and adds no device synchronization. Install the metrics module together with the updated worker.
+
+## Cold / warm head depth
+
+默认 `cold_heads=实际加载的 num_heads`、`warm_heads=min(3, 实际加载的 num_heads)`。
+加载 5 heads 时即 cold MTP5 / warm MTP3；两项都设为 5 可恢复固定 MTP5。
+两项必须是正整数，且不超过实际加载深度（还受 checkpoint 与引擎投机预算限制）。
+冷暖阶段按每个引擎请求首次/后续实际提交的 MTP 草稿划分，与 chunk 编号无关，
+也不依赖 `acceptance_stats`。prefill-only、旧 rollback 草稿和已结束请求不会消费 cold；
+结束清理后复用请求 ID 会重新 cold。失配、补算不会重置为 cold。
+
+普通 token 图按 `(执行 head 数, token 桶)` 捕获；旧 B/Q 图也增加执行深度。
+混合 cold/warm 批次按深度分组，结果仍在整个 worker 批次完成后只回传一次。
+warm 的图只捕获前三个 head，后两个 head 的数学计算、LM head、FIA task update 均不执行；
+其缓存有效前缀仍按确认上下文裁剪，不会被虚假推进。EOS 仍在返回草稿时截断并交目标模型验证，
+不使用条件节点或图内 EOS 提前结束；cold 遇到早期 EOS 时仍可能执行完所选 5 heads。
+
+图数量是原 token/BQ 桶数乘以不同执行深度数，上限仍为 64。
+例如 31 个 token 桶配 3/5 两个深度共 62 张图；额外常驻图内存会计入启动内存预算。
+剩余输出预算不足时返回更少草稿，图选择能容纳该预算的最小已捕获深度。
+
+日志检查：
+
+```bash
+rg -n 'ASR_MTP_CONFIG|ASR_MTP_GRAPH_READY|ASR_MTP_STEP' "$LOG"
+```
+
+配置日志包含 `cold_heads=5 warm_heads=3`，图就绪日志包含 `head_counts=(3, 5)`。
+step 中的 `cold_requests` / `warm_requests` 是本批请求数；
+`graph_stats` 中 `replays_h3` / `replays_h5` 是各深度累计图执行次数。
+先比较固定 5/5 与 5/3 的端到端时延、各阶段实际补算与接受长度；本机 CPU 测试不代表 910B 收益。
+
+更新已有 acceptance 版本可使用引擎交付目录的 `asr_mtp_phase_depth_v023.patch`，
+或重新运行导出器按服务器实际源码生成增量补丁。不要叠加已撤回的 EOS 条件图补丁。
+
+服务器验证普通 3/5 深度图和 FIA 更新（真实 NPU 用例不能 skipped）：
+
+```bash
+PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
+  python -m unittest discover -s examples/910b/tests -p test_asr_mtp_phase.py -v
+PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
+  python -m unittest discover -s examples/910b/tests -p test_asr_mtp_token_graph.py -v
+```

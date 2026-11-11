@@ -78,6 +78,11 @@ python vllm_ascend/spec_decode/asr_mtp_metrics.py \
 研究仓库也可运行 `python research/asr_mtp_metrics.py`，参数相同。
 JSON 中每组同时包含全局计数和 cold/warm 分项；按各组实际样本数解释差异。
 
+采用 cold/warm 分深度版本时，默认加载 5 heads 对应 cold=5 / warm=3。
+固定 H 的消融应显式设置 `num_heads=H, cold_heads=H, warm_heads=H`。
+`num_heads` 分组字段是加载的最大深度，不代表每一轮都执行该深度；
+5/3 与 5/5 请使用不同运行标签，并检查配置日志和 cold/warm 实际草稿长度。
+
 ## 如何选 head 数
 
 保持音频、并发、checkpoint、图模式和草稿来源开关一致，分别跑 OFF、1、2、3、5。
