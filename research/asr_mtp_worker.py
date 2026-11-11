@@ -30,6 +30,22 @@ def request_enabled(params):
 
 
 def query_buckets(states, limits, graphs=None):
+    depths = getattr(getattr(graphs, 'options', None), 'head_counts', ())
+    if not depths:
+        return _query_buckets(states, limits, graphs)
+    phases = {}
+    for i, limit in enumerate(limits):
+        depth = next((d for d in depths if limit <= d), graphs.heads.num_heads)
+        phases.setdefault(depth, []).append(i)
+    buckets = {}
+    for depth, indices in phases.items():
+        local = _query_buckets([states[i] for i in indices], [limits[i] for i in indices], graphs)
+        for key, group in local.items():
+            buckets[depth, key] = [indices[i] for i in group]
+    return buckets
+
+
+def _query_buckets(states, limits, graphs=None):
     buckets = {}
     if graphs is not None and getattr(graphs.options, 'tokens', ()):
         # Keep one batch across fresh-query lengths. Split only at token/request
@@ -68,21 +84,29 @@ def query_buckets(states, limits, graphs=None):
 
 def stop_ids(params, model_eos):
     ids = set(getattr(params, 'stop_token_ids', None) or ())
-    if hasattr(params, 'eos_token_id'):
-        if params.eos_token_id is not None:
-            ids.add(params.eos_token_id)
-    elif not getattr(params, 'ignore_eos', False):
-        ids.update(model_eos)
+    if not getattr(params, 'ignore_eos', False):
+        if hasattr(params, 'eos_token_id'):
+            if params.eos_token_id is not None:
+                ids.add(params.eos_token_id)
+        else:
+            ids.update(model_eos)
     return ids
 
 
 class MTPWorker:
     def __init__(self, runner, heads, arena, embedding, logits, eos, *, graphs=None,
-                 profile_stages=False, acceptance_stats=False):
+                 profile_stages=False, acceptance_stats=False, cold_heads=None, warm_heads=None):
         self.runner, self.heads, self.arena = runner, heads, arena
         self.embedding, self.logits, self.eos = embedding, logits, set(eos)
         self.states, self.disabled = {}, {}
         self.legacy_submitted = set()
+        self.cold_heads = heads.num_heads if cold_heads is None else cold_heads
+        self.warm_heads = min(3, heads.num_heads) if warm_heads is None else warm_heads
+        for name in ('cold_heads', 'warm_heads'):
+            value = getattr(self, name)
+            if type(value) is not int or not 0 < value <= heads.num_heads:
+                raise ValueError(f'asr_mtp.{name} must be between 1 and loaded num_heads')
+        self.proposed = set()
         self.stats = Counter(target_forwards=0)
         self.graphs, self.profiled = graphs, False
         self.profile_stages = profile_stages
@@ -103,6 +127,7 @@ class MTPWorker:
                 self.arena.release(state)
             self.disabled.pop(req_id, None)
             self.legacy_submitted.discard(req_id)
+            self.proposed.discard(req_id)
 
     def _fallback(self, req_id, reason):
         state = self.states.pop(req_id, None)
@@ -235,7 +260,8 @@ class MTPWorker:
                 # through the target once. Do not skip it by immediately drafting MTP.
                 continue
             remaining = params.max_tokens - len(request.output_token_ids)
-            limit = min(self.heads.num_heads, runner.speculative_config.num_speculative_tokens,
+            phase_limit = self.warm_heads if req_id in self.proposed else self.cold_heads
+            limit = min(phase_limit, runner.speculative_config.num_speculative_tokens,
                         batch.max_model_len - confirmed, remaining)
             if limit <= 0:
                 if self.acceptance is not None:
@@ -280,6 +306,7 @@ class MTPWorker:
             to_cpu_started = perf_counter() if self.profile_stages else None
             rows = drafts.tolist()  # One device-to-host boundary for the whole batch.
             postprocess_started = perf_counter() if self.profile_stages else None
+            cold_count = sum(batch.req_ids[i] not in self.proposed for i in indices)
             mtp_tokens = 0
             for i, row, limit in zip(indices, rows, limits):
                 row = row[:limit]
@@ -291,6 +318,8 @@ class MTPWorker:
                         row = row[:j + 1]
                         break
                 outputs[i] = row
+                self.stats['warm_requests' if batch.req_ids[i] in self.proposed else 'cold_requests'] += 1
+                self.proposed.add(batch.req_ids[i])
                 mtp_tokens += len(row)
                 if self.acceptance is not None:
                     self.acceptance.offer(batch.req_ids[i], row,
@@ -300,10 +329,12 @@ class MTPWorker:
             self.stats['draft_tokens'] += mtp_tokens
             self.stats['head_positions'] += self.heads.processed_positions - before
             logger.debug('ASR_MTP_STEP requests=%d draft_tokens=%d new_head_positions=%d '
-                         'graph_batches_total=%d eager_batches_total=%d graph_stats=%s',
+                         'graph_batches_total=%d eager_batches_total=%d graph_stats=%s '
+                         'cold_requests=%d warm_requests=%d cold_heads=%d warm_heads=%d',
                          len(states), mtp_tokens, self.heads.processed_positions - before,
                          self.stats['graph_head_batches'], self.stats['eager_head_batches'],
-                         self.graphs.stats if self.graphs is not None else {})
+                         self.graphs.stats if self.graphs is not None else {},
+                         cold_count, len(states) - cold_count, self.cold_heads, self.warm_heads)
             if self.profile_stages:
                 logger.info(
                     'ASR_MTP_HOST_STAGE requests=%d groups=%d single_group=%s '
@@ -367,7 +398,7 @@ def load_worker(runner, target, settings):
                'verify_base_signature', 'graph_mode', 'graph_context_tokens',
                'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size',
                'native_fusion', 'profile_stages', 'kv_cache_backend',
-               'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend', 'acceptance_stats'}
+               'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend', 'acceptance_stats', 'cold_heads', 'warm_heads'}
     if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
         raise ValueError('invalid additional_config.asr_mtp settings')
     for name, default in (('native_fusion', True), ('profile_stages', False), ('acceptance_stats', False)):
@@ -408,6 +439,10 @@ def load_worker(runner, target, settings):
     if type(trained) is not int or trained < 1:
         raise ValueError('invalid checkpoint num_heads')
     heads = min(settings.get('num_heads', trained), trained, runner.speculative_config.num_speculative_tokens)
+    phase_depths = (settings.get('cold_heads', heads), settings.get('warm_heads', min(3, heads)))
+    for name, value in zip(('cold_heads', 'warm_heads'), phase_depths):
+        if type(value) is not int or not 0 < value <= heads:
+            raise ValueError(f'asr_mtp.{name} must be between 1 and loaded num_heads')
     selected = {name: value for name, value in weights.items()
                 if any(name.startswith(f'blocks.{i}.') for i in range(heads))}
     with torch.device('meta'):
@@ -430,7 +465,7 @@ def load_worker(runner, target, settings):
             from .asr_mtp_paged_cache import PagedCacheArena
         except ImportError:
             from asr_mtp_paged_cache import PagedCacheArena
-        probe = graph_options(settings, context=cap, slots=1, max_batch=1)
+        probe = graph_options(settings, context=cap, slots=1, max_batch=1, head_counts=phase_depths)
         if probe is None or not probe.tokens:
             raise ValueError('asr_mtp.kv_cache_backend=paged requires full token graphs')
         dummy_tokens = max(probe.tokens) + 1
@@ -445,7 +480,7 @@ def load_worker(runner, target, settings):
     if slots < 1:
         raise ValueError('asr_mtp.cache_mib cannot hold one request slot')
     options = graph_options(settings, context=cap, slots=slots,
-                            max_batch=getattr(runner, 'max_num_reqs', slots))
+                            max_batch=getattr(runner, 'max_num_reqs', slots), head_counts=phase_depths)
     if options is not None:
         validate_graph_runner(runner)
     arena = arena_class(text, heads, max_context=cap, slots=slots,
@@ -468,11 +503,12 @@ def load_worker(runner, target, settings):
                              language.compute_logits)
     worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits,
                        eos, graphs=graphs, profile_stages=settings.get('profile_stages', False),
-                       acceptance_stats=settings.get('acceptance_stats', False))
+                       acceptance_stats=settings.get('acceptance_stats', False),
+                       cold_heads=phase_depths[0], warm_heads=phase_depths[1])
     logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
                 'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s '
                 'native_fusion=%s profile_stages=%s kv_cache_backend=%s kv_write_backend=%s '
-                'qkv_rope_backend=%s row_write_backend=%s acceptance_stats=%s',
+                'qkv_rope_backend=%s row_write_backend=%s acceptance_stats=%s cold_heads=%d warm_heads=%d',
                 heads, cap, slots, getattr(arena, 'cache_bytes',
                     arena.storage.numel() * arena.storage.element_size()) / 1024 ** 2,
                 settings['checkpoint'], settings.get('verify_base_signature', False),
@@ -483,5 +519,5 @@ def load_worker(runner, target, settings):
                 native_fusion, settings.get('profile_stages', False), kv_backend,
                 getattr(arena, 'write_backend', 'separate_scatter_nd'),
                 model.qkv_rope.backend if native_fusion else 'legacy',
-                settings.get('row_write_backend', 'auto'), settings.get('acceptance_stats', False))
+                settings.get('row_write_backend', 'auto'), settings.get('acceptance_stats', False), *phase_depths)
     return worker

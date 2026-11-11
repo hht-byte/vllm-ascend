@@ -361,6 +361,11 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
             row_write_backend="triton",
         )
 
+    def test_paged_cold_five_then_warm_three_use_ordinary_depth_graphs(self):
+        self._check_token_bucket_replay_changes_request_boundaries(
+            native_fusion=True, paged=True, phase_depths=(3, 5)
+        )
+
     def _check_token_bucket_replay_changes_request_boundaries(
         self,
         *,
@@ -369,6 +374,7 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
         write_backend="auto",
         qkv_rope_backend=None,
         row_write_backend="auto",
+        phase_depths=(),
     ):
         import torch
         from asr_mtp_fused import prepare_fused_heads
@@ -388,7 +394,8 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
             rope_theta=10000,
             rope_scaling=None,
         )
-        eager = BatchedMTPHeads(cfg, 2).to("npu", torch.float16).eval()
+        depth = max(phase_depths) if phase_depths else 2
+        eager = BatchedMTPHeads(cfg, depth).to("npu", torch.float16).eval()
         fixed = deepcopy(eager).requires_grad_(False)
         # Native QKV/Norm/SwiGLU and TND FIA task updates must coexist in the
         # same real NPUGraph; retain unfused eager as an independent reference.
@@ -404,7 +411,7 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
         embed = torch.nn.Embedding(64, 256).to("npu", torch.float16).eval()
         logits = torch.nn.Linear(256, 64).to("npu", torch.float16).eval()
         old = CacheArena(
-            cfg, 2, max_context=64, slots=2, device="npu", dtype=torch.float16
+            cfg, depth, max_context=64, slots=2, device="npu", dtype=torch.float16
         )
         arena_class, arena_kwargs = CacheArena, {}
         if paged:
@@ -418,7 +425,7 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
             }
         new = arena_class(
             cfg,
-            2,
+            depth,
             max_context=64,
             slots=2,
             device="npu",
@@ -427,7 +434,11 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
             **arena_kwargs,
         )
         options = SimpleNamespace(
-            max_batch=2, context=64, tokens=(8, 32), row_write_backend=row_write_backend
+            max_batch=2,
+            context=64,
+            tokens=(8, 32),
+            row_write_backend=row_write_backend,
+            head_counts=phase_depths,
         )
         graphs = TokenMTPGraphs(options, fixed, new, embed, logits)
         graphs.prepare()  # Real NPUGraph and FIA task-update path.
@@ -445,10 +456,20 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
                 left, right = [a[i] for i in order], [b[i] for i in order]
                 rows = [ids[i] + [4 + step] for i in order]
                 limits = [2, 1] if paged and step == 0 else [2] * len(order)
+                if phase_depths:
+                    limits = [
+                        max(phase_depths) if step == 0 else min(phase_depths)
+                    ] * len(order)
                 expected = eager.propose(left, rows, embed, logits, limits)
                 actual = graphs.propose(right, rows, limits).clone()
                 torch.npu.synchronize()
-                torch.testing.assert_close(actual, expected)
+                if phase_depths:
+                    for i, limit in enumerate(limits):
+                        torch.testing.assert_close(
+                            actual[i, :limit], expected[i, :limit]
+                        )
+                else:
+                    torch.testing.assert_close(actual, expected)
                 for x, y in zip(a, b):
                     for d, (hx, hy) in enumerate(zip(x.heads, y.heads)):
                         self.assertEqual(hx.valid, hy.valid)
@@ -478,7 +499,12 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
                         for state in (*a, *b):
                             state.crop_heads(state.length - 6)
         self.assertEqual(graphs.stats["replays"], 3)
-        self.assertEqual(set(graphs.entries), {8, 32})
+        self.assertEqual(
+            set(graphs.entries),
+            {(h, t) for h in phase_depths for t in (8, 32)}
+            if phase_depths
+            else {8, 32},
+        )
 
 
 if __name__ == "__main__":

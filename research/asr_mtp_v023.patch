@@ -806,7 +806,7 @@
 +    tl.store(cache + destination[:, None] * WIDTH + column[None, :], value, mask=valid)
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_graph.py
-@@ -0,0 +1,571 @@
+@@ -0,0 +1,606 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Bounded, independent auxiliary graphs; target forward/verification is untouched."""
 +
@@ -852,6 +852,7 @@
 +    tokens: tuple[int, ...] = ()
 +    profile_stages: bool = False
 +    row_write_backend: str = "auto"
++    head_counts: tuple[int, ...] = ()
 +
 +    def scratch_elements(self, config):
 +        # A positive dummy query must cover the full non-PA TND KV tail even
@@ -864,7 +865,9 @@
 +        )
 +
 +
-+def graph_options(settings, *, context, slots, max_batch):
++def graph_options(settings, *, context, slots, max_batch, head_counts=()):
++    head_counts = tuple(sorted(set(head_counts)))
++    variants = max(1, len(head_counts))
 +    row_write_backend = settings.get("row_write_backend", "auto")
 +    if row_write_backend not in ("auto", "triton", "scatter_nd"):
 +        raise ValueError("asr_mtp.row_write_backend must be auto, triton or scatter_nd")
@@ -898,12 +901,12 @@
 +                "asr_mtp.graph_token_sizes must contain positive token capacities"
 +            )
 +        tokens = tuple(sorted(set(tokens)))
-+        if len(tokens) > MAX_MTP_GRAPHS:
++        if len(tokens) * variants > MAX_MTP_GRAPHS:
 +            raise ValueError(
 +                f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}"
 +            )
 +        return GraphOptions(
-+            batch, (), capacity, tokens, profile_stages, row_write_backend
++            batch, (), capacity, tokens, profile_stages, row_write_backend, head_counts
 +        )
 +    queries = settings.get("graph_query_sizes", (min(8, capacity), min(64, capacity)))
 +    if (
@@ -915,7 +918,7 @@
 +            "asr_mtp.graph_query_sizes must contain positive query capacities"
 +        )
 +    queries = tuple(sorted(set(queries)))
-+    if batch * len(queries) > MAX_MTP_GRAPHS:
++    if batch * len(queries) * variants > MAX_MTP_GRAPHS:
 +        raise ValueError(f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}")
 +    return GraphOptions(
 +        batch,
@@ -923,7 +926,19 @@
 +        capacity,
 +        profile_stages=profile_stages,
 +        row_write_backend=row_write_backend,
++        head_counts=head_counts,
 +    )
++
++
++def captured_depth(options, heads, limit):
++    depths = getattr(options, "head_counts", ())
++    if not depths:
++        return heads if limit == heads else None
++    return next((depth for depth in depths if limit <= depth), None)
++
++
++def depth_key(options, depth, key):
++    return (depth, key) if getattr(options, "head_counts", ()) else key
 +
 +
 +class FixedMTPProgram:
@@ -946,8 +961,17 @@
 +        query_size,
 +        context_size,
 +        row_write_backend="auto",
++        execution_heads=None,
 +    ):
 +        cfg = heads.config
++        self.execution_heads = (
++            heads.num_heads if execution_heads is None else execution_heads
++        )
++        if (
++            type(self.execution_heads) is not int
++            or not 0 < self.execution_heads <= heads.num_heads
++        ):
++            raise ValueError("invalid MTP execution depth")
 +        if not 0 < query_size <= context_size <= arena.max_context:
 +            raise ValueError("invalid fixed MTP query/context capacity")
 +        if not 0 < batch_size <= arena.storage.shape[0]:
@@ -1030,7 +1054,7 @@
 +        for state, tokens, limit in zip(states, inputs, limits):
 +            if (
 +                type(limit) is not int
-+                or not 0 < limit <= depth
++                or not 0 < limit <= self.execution_heads
 +                or not 0 < state.length <= self.context
 +                or len(tokens) != state.length + 1
 +            ):
@@ -1101,7 +1125,7 @@
 +        base = metadata[:, 0] * (self.arena.storage.shape[1] // self.row_width)
 +        lengths, limits = metadata[:, 1], metadata[:, 2 + heads]
 +        sequence = metadata[:, 3 + heads :].clone()
-+        for depth, block in enumerate(self.heads.blocks, 1):
++        for depth, block in enumerate(self.heads.blocks[: self.execution_heads], 1):
 +            starts = metadata[:, 1 + depth]
 +            active = limits >= depth
 +            anchors = starts[:, None] + self.query_index[None, :]
@@ -1273,32 +1297,38 @@
 +                states.append(self.arena.acquire())
 +            # Largest first to reuse temporary pool allocations. Live graph
 +            # inputs/outputs are deliberately outside that shared pool.
-+            for queries in reversed(self.options.queries):
-+                for count in range(self.options.max_batch, 0, -1):
-+                    warm = states[:count]
-+                    for state in warm:
-+                        state.length = self.options.context
-+                        for head in state.heads:
-+                            head.valid = self.options.context - queries
-+                    program = FixedMTPProgram(
-+                        self.heads,
-+                        self.arena,
-+                        self.embedding,
-+                        self.logits,
-+                        batch_size=count,
-+                        query_size=queries,
-+                        context_size=self.options.context,
-+                        row_write_backend=getattr(
-+                            self.options, "row_write_backend", "auto"
-+                        ),
-+                    )
-+                    program.stage(
-+                        warm,
-+                        [[0] * (state.length + 1) for state in warm],
-+                        [self.heads.num_heads] * count,
-+                    )
-+                    replay = capture.capture(program)
-+                    self.entries[count, queries] = program, replay
++            for depth in reversed(
++                getattr(self.options, "head_counts", ()) or (self.heads.num_heads,)
++            ):
++                for queries in reversed(self.options.queries):
++                    for count in range(self.options.max_batch, 0, -1):
++                        warm = states[:count]
++                        for state in warm:
++                            state.length = self.options.context
++                            for head in state.heads:
++                                head.valid = self.options.context - queries
++                        program = FixedMTPProgram(
++                            self.heads,
++                            self.arena,
++                            self.embedding,
++                            self.logits,
++                            batch_size=count,
++                            query_size=queries,
++                            context_size=self.options.context,
++                            row_write_backend=getattr(
++                                self.options, "row_write_backend", "auto"
++                            ),
++                            execution_heads=depth,
++                        )
++                        program.stage(
++                            warm,
++                            [[0] * (state.length + 1) for state in warm],
++                            [depth] * count,
++                        )
++                        replay = capture.capture(program)
++                        self.entries[
++                            depth_key(self.options, depth, (count, queries))
++                        ] = program, replay
 +        finally:
 +            for state in states:
 +                self.arena.release(state)
@@ -1312,7 +1342,7 @@
 +            self.reserved_bytes = max(0, torch.npu.memory_reserved() - reserved_before)
 +        logger.info(
 +            "ASR_MTP_GRAPH_READY graphs=%d max_batch=%d query_sizes=%s context=%d "
-+            "capture_ms=%.2f reserved_mib=%.2f row_write_backend=%s",
++            "capture_ms=%.2f reserved_mib=%.2f row_write_backend=%s head_counts=%s",
 +            len(self.entries),
 +            self.options.max_batch,
 +            self.options.queries,
@@ -1320,6 +1350,7 @@
 +            (perf_counter() - start_time) * 1000,
 +            self.reserved_bytes / 1024**2,
 +            next(iter(self.entries.values()))[0].row_write_backend,
++            getattr(self.options, "head_counts", ()) or (self.heads.num_heads,),
 +        )
 +
 +    @torch.inference_mode()
@@ -1329,7 +1360,8 @@
 +        if not states or len(states) > self.options.max_batch:
 +            self.stats["miss_batch"] += 1
 +            return None
-+        if max(limits) != self.heads.num_heads:
++        depth = captured_depth(self.options, self.heads.num_heads, max(limits))
++        if depth is None:
 +            self.stats["miss_budget"] += 1
 +            return None
 +        max_context = max(state.length for state in states)
@@ -1363,10 +1395,13 @@
 +        if queries is None:
 +            self.stats["miss_query"] += 1
 +            return None
-+        program, replay = self.entries[len(states), queries]
++        program, replay = self.entries[
++            depth_key(self.options, depth, (len(states), queries))
++        ]
 +        program.stage(states, inputs, limits)
 +        replay()
 +        program.commit(states, limits)
++        self.stats[f"replays_h{depth}"] += 1
 +        self.stats["replays"] += 1
 +        self.stats["requests"] += len(states)
 +        if self.stats["replays"] == 1:
@@ -1375,7 +1410,7 @@
 +                len(states),
 +                queries,
 +                self.options.context,
-+                self.heads.num_heads,
++                depth,
 +            )
 +        return program.output
 --- /dev/null
@@ -1746,9 +1781,9 @@
 +        return replay
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_token_graph.py
-@@ -0,0 +1,618 @@
+@@ -0,0 +1,643 @@
 +# SPDX-License-Identifier: Apache-2.0
-+"""Packed auxiliary MTP graphs keyed only by total fresh-token capacity."""
++"""Packed auxiliary MTP graphs keyed by execution depth and fresh-token capacity."""
 +
 +import logging
 +from collections import Counter
@@ -1759,11 +1794,13 @@
 +
 +try:
 +    from .asr_mtp_fused import add_rms_norm
++    from .asr_mtp_graph import captured_depth, depth_key
 +    from .asr_mtp_heads import project_norm_rope
 +    from .asr_mtp_row_copy import prepare_row_writer
 +    from .asr_mtp_token_attention import PackedAttention, PackedNPUCapture
 +except ImportError:
 +    from asr_mtp_fused import add_rms_norm
++    from asr_mtp_graph import captured_depth, depth_key
 +    from asr_mtp_heads import project_norm_rope
 +    from asr_mtp_row_copy import prepare_row_writer
 +    from asr_mtp_token_attention import PackedAttention, PackedNPUCapture
@@ -1802,8 +1839,17 @@
 +        token_size,
 +        context_size,
 +        row_write_backend="auto",
++        execution_heads=None,
 +    ):
 +        cfg = heads.config
++        self.execution_heads = (
++            heads.num_heads if execution_heads is None else execution_heads
++        )
++        if (
++            type(self.execution_heads) is not int
++            or not 0 < self.execution_heads <= heads.num_heads
++        ):
++            raise ValueError("invalid MTP execution depth")
 +        if (
 +            type(max_batch) is not int
 +            or not 0 < max_batch <= arena.storage.shape[0]
@@ -1919,7 +1965,7 @@
 +            cfg.head_dim,
 +            device=device,
 +            dtype=dtype,
-+            heads=count,
++            heads=self.execution_heads,
 +            **extra,
 +        )
 +
@@ -1936,7 +1982,7 @@
 +        for state, tokens, limit in zip(states, inputs, limits):
 +            if (
 +                type(limit) is not int
-+                or not 0 < limit <= h
++                or not 0 < limit <= self.execution_heads
 +                or not 0 < state.length <= self.context
 +                or len(tokens) != state.length + 1
 +                or any(
@@ -2021,10 +2067,12 @@
 +                    else self.arena.block_rows[-1]
 +                    for i in order[: len(segment[0])]
 +                ]
-+                for order, segment in zip(orders, segments)
++                for order, segment in zip(
++                    orders[: self.execution_heads], segments[: self.execution_heads]
++                )
 +            ]
 +            self.attention.set_tables(tables)
-+        for d, (q_ends, kv_ends) in enumerate(segments):
++        for d, (q_ends, kv_ends) in enumerate(segments[: self.execution_heads]):
 +            self.attention.stage(d, q_ends, kv_ends)
 +
 +    def _segments(self, index, ends):
@@ -2077,7 +2125,7 @@
 +        )
 +        stride = self.arena.storage.shape[1] // self.row_width
 +        sequence = self.sequence.clone()
-+        for d, block in enumerate(self.heads.blocks):
++        for d, block in enumerate(self.heads.blocks[: self.execution_heads]):
 +            depth = d + 1
 +            segment, relative = self._segments(self.token_index, self.q_ends[d])
 +            request = self.order[d].index_select(0, segment)
@@ -2230,35 +2278,44 @@
 +        states = []
 +        try:
 +            states = [self.arena.acquire() for _ in range(self.options.max_batch)]
-+            for tokens in reversed(self.options.tokens):
-+                count = min(self.options.max_batch, tokens)
-+                warm = states[:count]
-+                available = min(tokens, count * self.options.context)
-+                for i, state in enumerate(warm):
-+                    fresh = min(self.options.context, available - (count - i - 1))
-+                    available -= fresh
-+                    state.length = self.options.context
-+                    for head in state.heads:
-+                        head.valid = state.length - fresh
-+                program = PackedMTPProgram(
-+                    self.heads,
-+                    self.arena,
-+                    self.embedding,
-+                    self.logits,
-+                    max_batch=self.options.max_batch,
-+                    token_size=tokens,
-+                    context_size=self.options.context,
-+                    row_write_backend=getattr(
-+                        self.options, "row_write_backend", "auto"
-+                    ),
-+                )
-+                program.profile_stages = getattr(self.options, "profile_stages", False)
-+                program.stage(
-+                    warm,
-+                    [[0] * (s.length + 1) for s in warm],
-+                    [self.heads.num_heads] * count,
-+                )
-+                self.entries[tokens] = program, capture.capture(program)
++            for depth in reversed(
++                getattr(self.options, "head_counts", ()) or (self.heads.num_heads,)
++            ):
++                for tokens in reversed(self.options.tokens):
++                    count = min(self.options.max_batch, tokens)
++                    warm = states[:count]
++                    available = min(tokens, count * self.options.context)
++                    for i, state in enumerate(warm):
++                        fresh = min(self.options.context, available - (count - i - 1))
++                        available -= fresh
++                        state.length = self.options.context
++                        for head in state.heads:
++                            head.valid = state.length - fresh
++                    program = PackedMTPProgram(
++                        self.heads,
++                        self.arena,
++                        self.embedding,
++                        self.logits,
++                        max_batch=self.options.max_batch,
++                        token_size=tokens,
++                        context_size=self.options.context,
++                        row_write_backend=getattr(
++                            self.options, "row_write_backend", "auto"
++                        ),
++                        execution_heads=depth,
++                    )
++                    program.profile_stages = getattr(
++                        self.options, "profile_stages", False
++                    )
++                    program.stage(
++                        warm,
++                        [[0] * (s.length + 1) for s in warm],
++                        [depth] * count,
++                    )
++                    self.entries[depth_key(self.options, depth, tokens)] = (
++                        program,
++                        capture.capture(program),
++                    )
 +        finally:
 +            for state in states:
 +                self.arena.release(state)
@@ -2271,7 +2328,7 @@
 +        logger.info(
 +            "ASR_MTP_GRAPH_READY layout=tokens graphs=%d max_batch=%d token_sizes=%s "
 +            "query_capacities=%s context=%d capture_ms=%.2f reserved_mib=%.2f "
-+            "row_write_backend=%s row_width=%d",
++            "row_write_backend=%s row_width=%d head_counts=%s",
 +            len(self.entries),
 +            self.options.max_batch,
 +            self.options.tokens,
@@ -2281,6 +2338,7 @@
 +            self.reserved_bytes / 1024**2,
 +            next(iter(self.entries.values()))[0].row_write_backend,
 +            next(iter(self.entries.values()))[0].row_width,
++            getattr(self.options, "head_counts", ()) or (self.heads.num_heads,),
 +        )
 +
 +    @torch.inference_mode()
@@ -2292,7 +2350,8 @@
 +            return None
 +        if len(states) != len(inputs) or len(states) != len(limits):
 +            raise ValueError("aligned MTP graph requests required")
-+        if max(limits) != self.heads.num_heads:
++        depth = captured_depth(self.options, self.heads.num_heads, max(limits))
++        if depth is None:
 +            self.stats["miss_budget"] += 1
 +            return None
 +        history = max(state.length for state in states)
@@ -2320,7 +2379,7 @@
 +        if bucket is None:
 +            self.stats["miss_tokens"] += 1
 +            return None
-+        program, replay = self.entries[bucket]
++        program, replay = self.entries[depth_key(self.options, depth, bucket)]
 +        profiled = getattr(self.options, "profile_stages", False)
 +        stage_started = perf_counter() if profiled else None
 +        program.stage(states, inputs, limits)
@@ -2350,6 +2409,7 @@
 +                timings.get("task_updates", 0),
 +                timings.get("task_update_reuses", 0),
 +            )
++        self.stats[f"replays_h{depth}"] += 1
 +        self.stats["replays"] += 1
 +        self.stats["requests"] += len(states)
 +        if self.stats["replays"] == 1:
@@ -2362,7 +2422,7 @@
 +                program.query_capacity,
 +                program.kv_capacity,
 +                self.options.context,
-+                self.heads.num_heads,
++                depth,
 +            )
 +        return program.output[: len(states)]
 --- /dev/null
@@ -2697,7 +2757,7 @@
 +        return result
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_worker.py
-@@ -0,0 +1,487 @@
+@@ -0,0 +1,523 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Worker-local external draft -> MTP handoff for the v0.23 sync runner."""
 +import hashlib
@@ -2730,6 +2790,22 @@
 +
 +
 +def query_buckets(states, limits, graphs=None):
++    depths = getattr(getattr(graphs, 'options', None), 'head_counts', ())
++    if not depths:
++        return _query_buckets(states, limits, graphs)
++    phases = {}
++    for i, limit in enumerate(limits):
++        depth = next((d for d in depths if limit <= d), graphs.heads.num_heads)
++        phases.setdefault(depth, []).append(i)
++    buckets = {}
++    for depth, indices in phases.items():
++        local = _query_buckets([states[i] for i in indices], [limits[i] for i in indices], graphs)
++        for key, group in local.items():
++            buckets[depth, key] = [indices[i] for i in group]
++    return buckets
++
++
++def _query_buckets(states, limits, graphs=None):
 +    buckets = {}
 +    if graphs is not None and getattr(graphs.options, 'tokens', ()):
 +        # Keep one batch across fresh-query lengths. Split only at token/request
@@ -2768,21 +2844,29 @@
 +
 +def stop_ids(params, model_eos):
 +    ids = set(getattr(params, 'stop_token_ids', None) or ())
-+    if hasattr(params, 'eos_token_id'):
-+        if params.eos_token_id is not None:
-+            ids.add(params.eos_token_id)
-+    elif not getattr(params, 'ignore_eos', False):
-+        ids.update(model_eos)
++    if not getattr(params, 'ignore_eos', False):
++        if hasattr(params, 'eos_token_id'):
++            if params.eos_token_id is not None:
++                ids.add(params.eos_token_id)
++        else:
++            ids.update(model_eos)
 +    return ids
 +
 +
 +class MTPWorker:
 +    def __init__(self, runner, heads, arena, embedding, logits, eos, *, graphs=None,
-+                 profile_stages=False, acceptance_stats=False):
++                 profile_stages=False, acceptance_stats=False, cold_heads=None, warm_heads=None):
 +        self.runner, self.heads, self.arena = runner, heads, arena
 +        self.embedding, self.logits, self.eos = embedding, logits, set(eos)
 +        self.states, self.disabled = {}, {}
 +        self.legacy_submitted = set()
++        self.cold_heads = heads.num_heads if cold_heads is None else cold_heads
++        self.warm_heads = min(3, heads.num_heads) if warm_heads is None else warm_heads
++        for name in ('cold_heads', 'warm_heads'):
++            value = getattr(self, name)
++            if type(value) is not int or not 0 < value <= heads.num_heads:
++                raise ValueError(f'asr_mtp.{name} must be between 1 and loaded num_heads')
++        self.proposed = set()
 +        self.stats = Counter(target_forwards=0)
 +        self.graphs, self.profiled = graphs, False
 +        self.profile_stages = profile_stages
@@ -2803,6 +2887,7 @@
 +                self.arena.release(state)
 +            self.disabled.pop(req_id, None)
 +            self.legacy_submitted.discard(req_id)
++            self.proposed.discard(req_id)
 +
 +    def _fallback(self, req_id, reason):
 +        state = self.states.pop(req_id, None)
@@ -2935,7 +3020,8 @@
 +                # through the target once. Do not skip it by immediately drafting MTP.
 +                continue
 +            remaining = params.max_tokens - len(request.output_token_ids)
-+            limit = min(self.heads.num_heads, runner.speculative_config.num_speculative_tokens,
++            phase_limit = self.warm_heads if req_id in self.proposed else self.cold_heads
++            limit = min(phase_limit, runner.speculative_config.num_speculative_tokens,
 +                        batch.max_model_len - confirmed, remaining)
 +            if limit <= 0:
 +                if self.acceptance is not None:
@@ -2980,6 +3066,7 @@
 +            to_cpu_started = perf_counter() if self.profile_stages else None
 +            rows = drafts.tolist()  # One device-to-host boundary for the whole batch.
 +            postprocess_started = perf_counter() if self.profile_stages else None
++            cold_count = sum(batch.req_ids[i] not in self.proposed for i in indices)
 +            mtp_tokens = 0
 +            for i, row, limit in zip(indices, rows, limits):
 +                row = row[:limit]
@@ -2991,6 +3078,8 @@
 +                        row = row[:j + 1]
 +                        break
 +                outputs[i] = row
++                self.stats['warm_requests' if batch.req_ids[i] in self.proposed else 'cold_requests'] += 1
++                self.proposed.add(batch.req_ids[i])
 +                mtp_tokens += len(row)
 +                if self.acceptance is not None:
 +                    self.acceptance.offer(batch.req_ids[i], row,
@@ -3000,10 +3089,12 @@
 +            self.stats['draft_tokens'] += mtp_tokens
 +            self.stats['head_positions'] += self.heads.processed_positions - before
 +            logger.debug('ASR_MTP_STEP requests=%d draft_tokens=%d new_head_positions=%d '
-+                         'graph_batches_total=%d eager_batches_total=%d graph_stats=%s',
++                         'graph_batches_total=%d eager_batches_total=%d graph_stats=%s '
++                         'cold_requests=%d warm_requests=%d cold_heads=%d warm_heads=%d',
 +                         len(states), mtp_tokens, self.heads.processed_positions - before,
 +                         self.stats['graph_head_batches'], self.stats['eager_head_batches'],
-+                         self.graphs.stats if self.graphs is not None else {})
++                         self.graphs.stats if self.graphs is not None else {},
++                         cold_count, len(states) - cold_count, self.cold_heads, self.warm_heads)
 +            if self.profile_stages:
 +                logger.info(
 +                    'ASR_MTP_HOST_STAGE requests=%d groups=%d single_group=%s '
@@ -3067,7 +3158,7 @@
 +               'verify_base_signature', 'graph_mode', 'graph_context_tokens',
 +               'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size',
 +               'native_fusion', 'profile_stages', 'kv_cache_backend',
-+               'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend', 'acceptance_stats'}
++               'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend', 'acceptance_stats', 'cold_heads', 'warm_heads'}
 +    if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
 +        raise ValueError('invalid additional_config.asr_mtp settings')
 +    for name, default in (('native_fusion', True), ('profile_stages', False), ('acceptance_stats', False)):
@@ -3108,6 +3199,10 @@
 +    if type(trained) is not int or trained < 1:
 +        raise ValueError('invalid checkpoint num_heads')
 +    heads = min(settings.get('num_heads', trained), trained, runner.speculative_config.num_speculative_tokens)
++    phase_depths = (settings.get('cold_heads', heads), settings.get('warm_heads', min(3, heads)))
++    for name, value in zip(('cold_heads', 'warm_heads'), phase_depths):
++        if type(value) is not int or not 0 < value <= heads:
++            raise ValueError(f'asr_mtp.{name} must be between 1 and loaded num_heads')
 +    selected = {name: value for name, value in weights.items()
 +                if any(name.startswith(f'blocks.{i}.') for i in range(heads))}
 +    with torch.device('meta'):
@@ -3130,7 +3225,7 @@
 +            from .asr_mtp_paged_cache import PagedCacheArena
 +        except ImportError:
 +            from asr_mtp_paged_cache import PagedCacheArena
-+        probe = graph_options(settings, context=cap, slots=1, max_batch=1)
++        probe = graph_options(settings, context=cap, slots=1, max_batch=1, head_counts=phase_depths)
 +        if probe is None or not probe.tokens:
 +            raise ValueError('asr_mtp.kv_cache_backend=paged requires full token graphs')
 +        dummy_tokens = max(probe.tokens) + 1
@@ -3145,7 +3240,7 @@
 +    if slots < 1:
 +        raise ValueError('asr_mtp.cache_mib cannot hold one request slot')
 +    options = graph_options(settings, context=cap, slots=slots,
-+                            max_batch=getattr(runner, 'max_num_reqs', slots))
++                            max_batch=getattr(runner, 'max_num_reqs', slots), head_counts=phase_depths)
 +    if options is not None:
 +        validate_graph_runner(runner)
 +    arena = arena_class(text, heads, max_context=cap, slots=slots,
@@ -3168,11 +3263,12 @@
 +                             language.compute_logits)
 +    worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits,
 +                       eos, graphs=graphs, profile_stages=settings.get('profile_stages', False),
-+                       acceptance_stats=settings.get('acceptance_stats', False))
++                       acceptance_stats=settings.get('acceptance_stats', False),
++                       cold_heads=phase_depths[0], warm_heads=phase_depths[1])
 +    logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
 +                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s '
 +                'native_fusion=%s profile_stages=%s kv_cache_backend=%s kv_write_backend=%s '
-+                'qkv_rope_backend=%s row_write_backend=%s acceptance_stats=%s',
++                'qkv_rope_backend=%s row_write_backend=%s acceptance_stats=%s cold_heads=%d warm_heads=%d',
 +                heads, cap, slots, getattr(arena, 'cache_bytes',
 +                    arena.storage.numel() * arena.storage.element_size()) / 1024 ** 2,
 +                settings['checkpoint'], settings.get('verify_base_signature', False),
@@ -3183,7 +3279,7 @@
 +                native_fusion, settings.get('profile_stages', False), kv_backend,
 +                getattr(arena, 'write_backend', 'separate_scatter_nd'),
 +                model.qkv_rope.backend if native_fusion else 'legacy',
-+                settings.get('row_write_backend', 'auto'), settings.get('acceptance_stats', False))
++                settings.get('row_write_backend', 'auto'), settings.get('acceptance_stats', False), *phase_depths)
 +    return worker
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_metrics.py

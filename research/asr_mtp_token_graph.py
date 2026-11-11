@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Packed auxiliary MTP graphs keyed only by total fresh-token capacity."""
+"""Packed auxiliary MTP graphs keyed by execution depth and fresh-token capacity."""
 
 import logging
 from collections import Counter
@@ -10,11 +10,13 @@ import torch
 
 try:
     from .asr_mtp_fused import add_rms_norm
+    from .asr_mtp_graph import captured_depth, depth_key
     from .asr_mtp_heads import project_norm_rope
     from .asr_mtp_row_copy import prepare_row_writer
     from .asr_mtp_token_attention import PackedAttention, PackedNPUCapture
 except ImportError:
     from asr_mtp_fused import add_rms_norm
+    from asr_mtp_graph import captured_depth, depth_key
     from asr_mtp_heads import project_norm_rope
     from asr_mtp_row_copy import prepare_row_writer
     from asr_mtp_token_attention import PackedAttention, PackedNPUCapture
@@ -53,8 +55,17 @@ class PackedMTPProgram:
         token_size,
         context_size,
         row_write_backend="auto",
+        execution_heads=None,
     ):
         cfg = heads.config
+        self.execution_heads = (
+            heads.num_heads if execution_heads is None else execution_heads
+        )
+        if (
+            type(self.execution_heads) is not int
+            or not 0 < self.execution_heads <= heads.num_heads
+        ):
+            raise ValueError("invalid MTP execution depth")
         if (
             type(max_batch) is not int
             or not 0 < max_batch <= arena.storage.shape[0]
@@ -170,7 +181,7 @@ class PackedMTPProgram:
             cfg.head_dim,
             device=device,
             dtype=dtype,
-            heads=count,
+            heads=self.execution_heads,
             **extra,
         )
 
@@ -187,7 +198,7 @@ class PackedMTPProgram:
         for state, tokens, limit in zip(states, inputs, limits):
             if (
                 type(limit) is not int
-                or not 0 < limit <= h
+                or not 0 < limit <= self.execution_heads
                 or not 0 < state.length <= self.context
                 or len(tokens) != state.length + 1
                 or any(
@@ -272,10 +283,12 @@ class PackedMTPProgram:
                     else self.arena.block_rows[-1]
                     for i in order[: len(segment[0])]
                 ]
-                for order, segment in zip(orders, segments)
+                for order, segment in zip(
+                    orders[: self.execution_heads], segments[: self.execution_heads]
+                )
             ]
             self.attention.set_tables(tables)
-        for d, (q_ends, kv_ends) in enumerate(segments):
+        for d, (q_ends, kv_ends) in enumerate(segments[: self.execution_heads]):
             self.attention.stage(d, q_ends, kv_ends)
 
     def _segments(self, index, ends):
@@ -328,7 +341,7 @@ class PackedMTPProgram:
         )
         stride = self.arena.storage.shape[1] // self.row_width
         sequence = self.sequence.clone()
-        for d, block in enumerate(self.heads.blocks):
+        for d, block in enumerate(self.heads.blocks[: self.execution_heads]):
             depth = d + 1
             segment, relative = self._segments(self.token_index, self.q_ends[d])
             request = self.order[d].index_select(0, segment)
@@ -481,35 +494,44 @@ class TokenMTPGraphs:
         states = []
         try:
             states = [self.arena.acquire() for _ in range(self.options.max_batch)]
-            for tokens in reversed(self.options.tokens):
-                count = min(self.options.max_batch, tokens)
-                warm = states[:count]
-                available = min(tokens, count * self.options.context)
-                for i, state in enumerate(warm):
-                    fresh = min(self.options.context, available - (count - i - 1))
-                    available -= fresh
-                    state.length = self.options.context
-                    for head in state.heads:
-                        head.valid = state.length - fresh
-                program = PackedMTPProgram(
-                    self.heads,
-                    self.arena,
-                    self.embedding,
-                    self.logits,
-                    max_batch=self.options.max_batch,
-                    token_size=tokens,
-                    context_size=self.options.context,
-                    row_write_backend=getattr(
-                        self.options, "row_write_backend", "auto"
-                    ),
-                )
-                program.profile_stages = getattr(self.options, "profile_stages", False)
-                program.stage(
-                    warm,
-                    [[0] * (s.length + 1) for s in warm],
-                    [self.heads.num_heads] * count,
-                )
-                self.entries[tokens] = program, capture.capture(program)
+            for depth in reversed(
+                getattr(self.options, "head_counts", ()) or (self.heads.num_heads,)
+            ):
+                for tokens in reversed(self.options.tokens):
+                    count = min(self.options.max_batch, tokens)
+                    warm = states[:count]
+                    available = min(tokens, count * self.options.context)
+                    for i, state in enumerate(warm):
+                        fresh = min(self.options.context, available - (count - i - 1))
+                        available -= fresh
+                        state.length = self.options.context
+                        for head in state.heads:
+                            head.valid = state.length - fresh
+                    program = PackedMTPProgram(
+                        self.heads,
+                        self.arena,
+                        self.embedding,
+                        self.logits,
+                        max_batch=self.options.max_batch,
+                        token_size=tokens,
+                        context_size=self.options.context,
+                        row_write_backend=getattr(
+                            self.options, "row_write_backend", "auto"
+                        ),
+                        execution_heads=depth,
+                    )
+                    program.profile_stages = getattr(
+                        self.options, "profile_stages", False
+                    )
+                    program.stage(
+                        warm,
+                        [[0] * (s.length + 1) for s in warm],
+                        [depth] * count,
+                    )
+                    self.entries[depth_key(self.options, depth, tokens)] = (
+                        program,
+                        capture.capture(program),
+                    )
         finally:
             for state in states:
                 self.arena.release(state)
@@ -522,7 +544,7 @@ class TokenMTPGraphs:
         logger.info(
             "ASR_MTP_GRAPH_READY layout=tokens graphs=%d max_batch=%d token_sizes=%s "
             "query_capacities=%s context=%d capture_ms=%.2f reserved_mib=%.2f "
-            "row_write_backend=%s row_width=%d",
+            "row_write_backend=%s row_width=%d head_counts=%s",
             len(self.entries),
             self.options.max_batch,
             self.options.tokens,
@@ -532,6 +554,7 @@ class TokenMTPGraphs:
             self.reserved_bytes / 1024**2,
             next(iter(self.entries.values()))[0].row_write_backend,
             next(iter(self.entries.values()))[0].row_width,
+            getattr(self.options, "head_counts", ()) or (self.heads.num_heads,),
         )
 
     @torch.inference_mode()
@@ -543,7 +566,8 @@ class TokenMTPGraphs:
             return None
         if len(states) != len(inputs) or len(states) != len(limits):
             raise ValueError("aligned MTP graph requests required")
-        if max(limits) != self.heads.num_heads:
+        depth = captured_depth(self.options, self.heads.num_heads, max(limits))
+        if depth is None:
             self.stats["miss_budget"] += 1
             return None
         history = max(state.length for state in states)
@@ -571,7 +595,7 @@ class TokenMTPGraphs:
         if bucket is None:
             self.stats["miss_tokens"] += 1
             return None
-        program, replay = self.entries[bucket]
+        program, replay = self.entries[depth_key(self.options, depth, bucket)]
         profiled = getattr(self.options, "profile_stages", False)
         stage_started = perf_counter() if profiled else None
         program.stage(states, inputs, limits)
@@ -601,6 +625,7 @@ class TokenMTPGraphs:
                 timings.get("task_updates", 0),
                 timings.get("task_update_reuses", 0),
             )
+        self.stats[f"replays_h{depth}"] += 1
         self.stats["replays"] += 1
         self.stats["requests"] += len(states)
         if self.stats["replays"] == 1:
@@ -613,6 +638,6 @@ class TokenMTPGraphs:
                 program.query_capacity,
                 program.kv_capacity,
                 self.options.context,
-                self.heads.num_heads,
+                depth,
             )
         return program.output[: len(states)]

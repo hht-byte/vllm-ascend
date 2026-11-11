@@ -1,12 +1,12 @@
 """CPU integration checks for the online worker drafter, not a replay script."""
 import importlib.util
 import os
-from pathlib import Path
 import sys
-from types import SimpleNamespace
 import unittest
 from copy import deepcopy
+from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(os.environ.get('SPEC_ASR_TEST_ROOT',
@@ -77,7 +77,10 @@ class EngineHeadsTests(unittest.TestCase):
     def setUp(self):
         import torch
         from transformers import Qwen3Config
-        from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RotaryEmbedding
+        from transformers.models.qwen3.modeling_qwen3 import (
+            Qwen3DecoderLayer,
+            Qwen3RotaryEmbedding,
+        )
         sys.path.insert(0, str(ROOT))
         from spec_asr.mtp import SequentialMTP
         self.t = torch
@@ -156,7 +159,7 @@ class EngineHeadsTests(unittest.TestCase):
         return worker, runner
 
     def test_initial_external_mismatch_uses_only_confirmed_prefill_hidden(self):
-        worker, runner = self.make_worker()
+        worker, _runner = self.make_worker()
         t = self.t
         hidden = t.randn(7, 8)  # prompt(4) plus rejected external draft(3)
         step = SimpleNamespace(num_scheduled_tokens={'a': 7})
@@ -378,7 +381,8 @@ class EngineHeadsTests(unittest.TestCase):
 
     def test_auxiliary_load_has_optional_fingerprint_and_strict_head_shapes(self):
         import tempfile
-        from asr_mtp_worker import load_worker, base_signature
+
+        from asr_mtp_worker import base_signature, load_worker
         t = self.t
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
             root = Path(directory)
@@ -429,6 +433,13 @@ class EngineHeadsTests(unittest.TestCase):
             self.assertIsNotNone(packed.acceptance)
             self.assertEqual(packed.arena.graph_storage.numel() - packed.arena.scratch_offset, 520)
             self.assertFalse(packed.graphs.ready)
+            self.assertEqual((packed.cold_heads, packed.warm_heads), (2, 2))
+            phased = load_worker(runner, target, {
+                **settings, 'graph_mode': 'full', 'graph_token_sizes': [8, 32],
+                'cold_heads': 2, 'warm_heads': 1,
+            })
+            self.assertEqual((phased.cold_heads, phased.warm_heads), (2, 1))
+            self.assertEqual(phased.graphs.options.head_counts, (1, 2))
             paged = load_worker(runner, target, {
                 **settings, 'graph_mode': 'full', 'graph_context_tokens': 16,
                 'graph_token_sizes': [8, 32, 64], 'kv_cache_backend': 'paged',
@@ -444,6 +455,8 @@ class EngineHeadsTests(unittest.TestCase):
                               {'qkv_rope_backend': 'unknown'},
                               {'row_write_backend': 'unknown'},
                               {'acceptance_stats': 'true'},
+                              {'cold_heads': 3}, {'warm_heads': 3}, {'warm_heads': True},
+                              {'cold_heads': 0}, {'warm_heads': '1'},
                               {'graph_token_sizes': [1000000]}):
                 with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                     load_worker(runner, target, {
@@ -474,9 +487,9 @@ class EngineHeadsTests(unittest.TestCase):
 
     def test_worker_loop_uses_target_drive_without_an_extra_correction_forward(self):
         import numpy as np
-        from transformers.models.qwen3.modeling_qwen3 import Qwen3Model
         from asr_mtp_heads import BatchedMTPHeads, CacheArena
         from asr_mtp_worker import MTPWorker
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3Model
         t = self.t
         target = Qwen3Model(self.config).eval()
         prompt = [3, 4, 5, 6]

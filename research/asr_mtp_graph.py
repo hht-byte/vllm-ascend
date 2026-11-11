@@ -43,6 +43,7 @@ class GraphOptions:
     tokens: tuple[int, ...] = ()
     profile_stages: bool = False
     row_write_backend: str = "auto"
+    head_counts: tuple[int, ...] = ()
 
     def scratch_elements(self, config):
         # A positive dummy query must cover the full non-PA TND KV tail even
@@ -55,7 +56,9 @@ class GraphOptions:
         )
 
 
-def graph_options(settings, *, context, slots, max_batch):
+def graph_options(settings, *, context, slots, max_batch, head_counts=()):
+    head_counts = tuple(sorted(set(head_counts)))
+    variants = max(1, len(head_counts))
     row_write_backend = settings.get("row_write_backend", "auto")
     if row_write_backend not in ("auto", "triton", "scatter_nd"):
         raise ValueError("asr_mtp.row_write_backend must be auto, triton or scatter_nd")
@@ -89,12 +92,12 @@ def graph_options(settings, *, context, slots, max_batch):
                 "asr_mtp.graph_token_sizes must contain positive token capacities"
             )
         tokens = tuple(sorted(set(tokens)))
-        if len(tokens) > MAX_MTP_GRAPHS:
+        if len(tokens) * variants > MAX_MTP_GRAPHS:
             raise ValueError(
                 f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}"
             )
         return GraphOptions(
-            batch, (), capacity, tokens, profile_stages, row_write_backend
+            batch, (), capacity, tokens, profile_stages, row_write_backend, head_counts
         )
     queries = settings.get("graph_query_sizes", (min(8, capacity), min(64, capacity)))
     if (
@@ -106,7 +109,7 @@ def graph_options(settings, *, context, slots, max_batch):
             "asr_mtp.graph_query_sizes must contain positive query capacities"
         )
     queries = tuple(sorted(set(queries)))
-    if batch * len(queries) > MAX_MTP_GRAPHS:
+    if batch * len(queries) * variants > MAX_MTP_GRAPHS:
         raise ValueError(f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}")
     return GraphOptions(
         batch,
@@ -114,7 +117,19 @@ def graph_options(settings, *, context, slots, max_batch):
         capacity,
         profile_stages=profile_stages,
         row_write_backend=row_write_backend,
+        head_counts=head_counts,
     )
+
+
+def captured_depth(options, heads, limit):
+    depths = getattr(options, "head_counts", ())
+    if not depths:
+        return heads if limit == heads else None
+    return next((depth for depth in depths if limit <= depth), None)
+
+
+def depth_key(options, depth, key):
+    return (depth, key) if getattr(options, "head_counts", ()) else key
 
 
 class FixedMTPProgram:
@@ -137,8 +152,17 @@ class FixedMTPProgram:
         query_size,
         context_size,
         row_write_backend="auto",
+        execution_heads=None,
     ):
         cfg = heads.config
+        self.execution_heads = (
+            heads.num_heads if execution_heads is None else execution_heads
+        )
+        if (
+            type(self.execution_heads) is not int
+            or not 0 < self.execution_heads <= heads.num_heads
+        ):
+            raise ValueError("invalid MTP execution depth")
         if not 0 < query_size <= context_size <= arena.max_context:
             raise ValueError("invalid fixed MTP query/context capacity")
         if not 0 < batch_size <= arena.storage.shape[0]:
@@ -221,7 +245,7 @@ class FixedMTPProgram:
         for state, tokens, limit in zip(states, inputs, limits):
             if (
                 type(limit) is not int
-                or not 0 < limit <= depth
+                or not 0 < limit <= self.execution_heads
                 or not 0 < state.length <= self.context
                 or len(tokens) != state.length + 1
             ):
@@ -292,7 +316,7 @@ class FixedMTPProgram:
         base = metadata[:, 0] * (self.arena.storage.shape[1] // self.row_width)
         lengths, limits = metadata[:, 1], metadata[:, 2 + heads]
         sequence = metadata[:, 3 + heads :].clone()
-        for depth, block in enumerate(self.heads.blocks, 1):
+        for depth, block in enumerate(self.heads.blocks[: self.execution_heads], 1):
             starts = metadata[:, 1 + depth]
             active = limits >= depth
             anchors = starts[:, None] + self.query_index[None, :]
@@ -464,32 +488,38 @@ class MTPGraphs:
                 states.append(self.arena.acquire())
             # Largest first to reuse temporary pool allocations. Live graph
             # inputs/outputs are deliberately outside that shared pool.
-            for queries in reversed(self.options.queries):
-                for count in range(self.options.max_batch, 0, -1):
-                    warm = states[:count]
-                    for state in warm:
-                        state.length = self.options.context
-                        for head in state.heads:
-                            head.valid = self.options.context - queries
-                    program = FixedMTPProgram(
-                        self.heads,
-                        self.arena,
-                        self.embedding,
-                        self.logits,
-                        batch_size=count,
-                        query_size=queries,
-                        context_size=self.options.context,
-                        row_write_backend=getattr(
-                            self.options, "row_write_backend", "auto"
-                        ),
-                    )
-                    program.stage(
-                        warm,
-                        [[0] * (state.length + 1) for state in warm],
-                        [self.heads.num_heads] * count,
-                    )
-                    replay = capture.capture(program)
-                    self.entries[count, queries] = program, replay
+            for depth in reversed(
+                getattr(self.options, "head_counts", ()) or (self.heads.num_heads,)
+            ):
+                for queries in reversed(self.options.queries):
+                    for count in range(self.options.max_batch, 0, -1):
+                        warm = states[:count]
+                        for state in warm:
+                            state.length = self.options.context
+                            for head in state.heads:
+                                head.valid = self.options.context - queries
+                        program = FixedMTPProgram(
+                            self.heads,
+                            self.arena,
+                            self.embedding,
+                            self.logits,
+                            batch_size=count,
+                            query_size=queries,
+                            context_size=self.options.context,
+                            row_write_backend=getattr(
+                                self.options, "row_write_backend", "auto"
+                            ),
+                            execution_heads=depth,
+                        )
+                        program.stage(
+                            warm,
+                            [[0] * (state.length + 1) for state in warm],
+                            [depth] * count,
+                        )
+                        replay = capture.capture(program)
+                        self.entries[
+                            depth_key(self.options, depth, (count, queries))
+                        ] = program, replay
         finally:
             for state in states:
                 self.arena.release(state)
@@ -503,7 +533,7 @@ class MTPGraphs:
             self.reserved_bytes = max(0, torch.npu.memory_reserved() - reserved_before)
         logger.info(
             "ASR_MTP_GRAPH_READY graphs=%d max_batch=%d query_sizes=%s context=%d "
-            "capture_ms=%.2f reserved_mib=%.2f row_write_backend=%s",
+            "capture_ms=%.2f reserved_mib=%.2f row_write_backend=%s head_counts=%s",
             len(self.entries),
             self.options.max_batch,
             self.options.queries,
@@ -511,6 +541,7 @@ class MTPGraphs:
             (perf_counter() - start_time) * 1000,
             self.reserved_bytes / 1024**2,
             next(iter(self.entries.values()))[0].row_write_backend,
+            getattr(self.options, "head_counts", ()) or (self.heads.num_heads,),
         )
 
     @torch.inference_mode()
@@ -520,7 +551,8 @@ class MTPGraphs:
         if not states or len(states) > self.options.max_batch:
             self.stats["miss_batch"] += 1
             return None
-        if max(limits) != self.heads.num_heads:
+        depth = captured_depth(self.options, self.heads.num_heads, max(limits))
+        if depth is None:
             self.stats["miss_budget"] += 1
             return None
         max_context = max(state.length for state in states)
@@ -554,10 +586,13 @@ class MTPGraphs:
         if queries is None:
             self.stats["miss_query"] += 1
             return None
-        program, replay = self.entries[len(states), queries]
+        program, replay = self.entries[
+            depth_key(self.options, depth, (len(states), queries))
+        ]
         program.stage(states, inputs, limits)
         replay()
         program.commit(states, limits)
+        self.stats[f"replays_h{depth}"] += 1
         self.stats["replays"] += 1
         self.stats["requests"] += len(states)
         if self.stats["replays"] == 1:
@@ -566,6 +601,6 @@ class MTPGraphs:
                 len(states),
                 queries,
                 self.options.context,
-                self.heads.num_heads,
+                depth,
             )
         return program.output
