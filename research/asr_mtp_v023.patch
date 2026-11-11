@@ -1388,7 +1388,7 @@
 +        return replay
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_token_graph.py
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,607 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Packed auxiliary MTP graphs keyed only by total fresh-token capacity."""
 +
@@ -1454,7 +1454,12 @@
 +        self.embedding, self.logits = embedding, logits
 +        self.max_batch, self.tokens, self.context = max_batch, token_size, context_size
 +        self.query_capacity = query_capacity
-+        self.kv_capacity = max_batch * context_size + query_capacity
++        self.paged_kv = getattr(arena, "paged_kv", False)
++        self.kv_capacity = (
++            arena.token_capacity
++            if self.paged_kv
++            else max_batch * context_size + query_capacity
++        )
 +        self.row_width = gcd(cfg.hidden_size, cfg.head_dim)
 +        row_elements = arena.graph_storage.numel() // self.row_width * self.row_width
 +        self.cache_rows = arena.graph_storage[:row_elements].view(-1, self.row_width)
@@ -1488,7 +1493,9 @@
 +        self.sequence = view((requests, self.sequence_width))
 +        self.output = torch.empty((max_batch, count), device=device, dtype=torch.long)
 +        self.token_index = torch.arange(query_capacity, device=device)
-+        self.key_index = torch.arange(self.kv_capacity, device=device)
++        self.key_index = (
++            None if self.paged_kv else torch.arange(self.kv_capacity, device=device)
++        )
 +        self.hidden_index = torch.arange(
 +            cfg.hidden_size // self.row_width, device=device
 +        )
@@ -1518,13 +1525,27 @@
 +                / cfg.head_dim
 +            )
 +        )
-+        self.attention = PackedAttention(
++        attention_class, extra = PackedAttention, {}
++        if self.paged_kv:
++            try:
++                from .asr_mtp_paged_attention import PagedAttention
++            except ImportError:
++                from asr_mtp_paged_attention import PagedAttention
++            attention_class = PagedAttention
++            extra = {
++                "max_batch": max_batch,
++                "block_size": arena.block_size,
++                "num_blocks": arena.total_blocks,
++                "max_blocks": len(arena.block_rows[0]),
++            }
++        self.attention = attention_class(
 +            cfg.num_attention_heads,
 +            cfg.num_key_value_heads,
 +            cfg.head_dim,
 +            device=device,
 +            dtype=dtype,
 +            heads=count,
++            **extra,
 +        )
 +
 +    def stage(self, states, inputs, limits):
@@ -1576,7 +1597,11 @@
 +            # Its zero KV segment covers the remaining physical K/V capacity,
 +            # satisfying strict non-PA TND tilers without changing tensor shapes.
 +            q_ends.append(self.query_capacity)
-+            kv_ends.append(self.kv_capacity)
++            kv_ends.append(
++                kv_total + self.query_capacity - q_total
++                if self.paged_kv
++                else self.kv_capacity
++            )
 +            order.append(self.max_batch)
 +            segments.append((tuple(q_ends), tuple(kv_ends)))
 +            q_rows.append(q_ends + [self.query_capacity] * (r - len(q_ends)))
@@ -1613,6 +1638,17 @@
 +            payload, dtype=torch.long, pin_memory=self.metadata.device.type == "npu"
 +        )
 +        self.metadata.copy_(host, non_blocking=True)
++        if self.paged_kv:
++            tables = [
++                [
++                    self.arena.block_rows[slots[i]]
++                    if i < n
++                    else self.arena.block_rows[-1]
++                    for i in order[: len(segment[0])]
++                ]
++                for order, segment in zip(orders, segments)
++            ]
++            self.attention.set_tables(tables)
 +        for d, (q_ends, kv_ends) in enumerate(segments):
 +            self.attention.stage(d, q_ends, kv_ends)
 +
@@ -1659,7 +1695,11 @@
 +        cfg, count = self.heads.config, self.heads.num_heads
 +        cap, width = self.arena.max_context, cfg.hidden_size
 +        hidden_width = cap * width // self.row_width
-+        kv_width = cfg.num_key_value_heads * cap * cfg.head_dim // self.row_width
++        kv_width = (
++            0
++            if self.paged_kv
++            else cfg.num_key_value_heads * cap * cfg.head_dim // self.row_width
++        )
 +        stride = self.arena.storage.shape[1] // self.row_width
 +        sequence = self.sequence.clone()
 +        for d, block in enumerate(self.heads.blocks):
@@ -1701,42 +1741,24 @@
 +            )
 +            q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
 +            hidden_base = base + hidden_width + d * (hidden_width + 2 * kv_width)
-+            key_base, value_base = (
-+                hidden_base + hidden_width,
-+                hidden_base + hidden_width + kv_width,
-+            )
-+            for offset, value in ((key_base, k), (value_base, v)):
-+                self._write(
-+                    self._kv_indices(offset, positions),
-+                    value,
-+                    valid[:, None, None],
-+                    self.kv_sink,
++            if self.paged_kv:
++                slot = self.slots.index_select(0, request)
++                addresses = torch.where(
++                    valid,
++                    slot * self.arena.slot_capacity + anchor,
++                    self.arena.dummy_base + self.token_index,
++                ).to(torch.int32)
++                self.arena.write_kv(
++                    d,
++                    torch.where(valid[:, None, None], k, 0),
++                    torch.where(valid[:, None, None], v, 0),
++                    addresses,
 +                )
-+            key_segment, key_position = self._segments(self.key_index, self.kv_ends[d])
-+            key_request = self.order[d].index_select(0, key_segment)
-+            key_valid = self.limits.index_select(0, key_request) >= depth
-+            key_position = key_position.clamp(0, cap - 1)
-+            key_hidden_base = (
-+                self.slots.index_select(0, key_request) * stride
-+                + hidden_width
-+                + d * (hidden_width + 2 * kv_width)
-+            )
-+            past_k = torch.where(
-+                key_valid[:, None, None],
-+                self._read(
-+                    self._kv_indices(key_hidden_base + hidden_width, key_position)
-+                ),
-+                0,
-+            )
-+            past_v = torch.where(
-+                key_valid[:, None, None],
-+                self._read(
-+                    self._kv_indices(
-+                        key_hidden_base + hidden_width + kv_width, key_position
-+                    )
-+                ),
-+                0,
-+            )
++                past_k, past_v = self.arena.attention_kv(d)
++            else:
++                past_k, past_v = self._contiguous_kv(
++                    d, k, v, hidden_base, positions, valid
++                )
 +            attended = self.attention(d, q, past_k, past_v, cfg.head_dim**-0.5)
 +            normed_residual, residual = add_rms_norm(
 +                block.decoder.post_attention_layernorm,
@@ -1763,6 +1785,48 @@
 +                    self.hidden_sink,
 +                )
 +        return self.output
++
++    def _contiguous_kv(self, d, k, v, hidden_base, positions, valid):
++        cfg, cap = self.heads.config, self.arena.max_context
++        hidden_width = cap * cfg.hidden_size // self.row_width
++        kv_width = cfg.num_key_value_heads * cap * cfg.head_dim // self.row_width
++        stride = self.arena.storage.shape[1] // self.row_width
++        depth = d + 1
++        key_base, value_base = (
++            hidden_base + hidden_width,
++            hidden_base + hidden_width + kv_width,
++        )
++        for offset, value in ((key_base, k), (value_base, v)):
++            self._write(
++                self._kv_indices(offset, positions),
++                value,
++                valid[:, None, None],
++                self.kv_sink,
++            )
++        key_segment, key_position = self._segments(self.key_index, self.kv_ends[d])
++        key_request = self.order[d].index_select(0, key_segment)
++        key_valid = self.limits.index_select(0, key_request) >= depth
++        key_position = key_position.clamp(0, cap - 1)
++        key_hidden_base = (
++            self.slots.index_select(0, key_request) * stride
++            + hidden_width
++            + d * (hidden_width + 2 * kv_width)
++        )
++        past_k = torch.where(
++            key_valid[:, None, None],
++            self._read(self._kv_indices(key_hidden_base + hidden_width, key_position)),
++            0,
++        )
++        past_v = torch.where(
++            key_valid[:, None, None],
++            self._read(
++                self._kv_indices(
++                    key_hidden_base + hidden_width + kv_width, key_position
++                )
++            ),
++            0,
++        )
++        return past_k, past_v
 +
 +    def commit(self, states, limits):
 +        for state, limit in zip(states, limits):
@@ -1933,8 +1997,338 @@
 +            )
 +        return program.output[: len(states)]
 --- /dev/null
++++ b/vllm_ascend/spec_decode/asr_mtp_paged_cache.py
+@@ -0,0 +1,193 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Fixed auxiliary pages, independent of target KV/block allocation."""
++
++import inspect
++from math import ceil
++
++import torch
++
++try:
++    from .asr_mtp_heads import CacheArena, HeadHistory, RequestHistory
++except ImportError:
++    from asr_mtp_heads import CacheArena, HeadHistory, RequestHistory
++
++
++def scatter_pa_supports_nd(operation):
++    """Inspect once at startup; old NZ-only ScatterPa schemas lack cache_mode."""
++    try:
++        parameters = inspect.signature(operation).parameters
++        if "cache_mode" in parameters:
++            return True
++        if not any(
++            p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
++        ):
++            return False
++    except (TypeError, ValueError):
++        pass
++    packet = getattr(torch.ops.npu, "npu_scatter_pa_kv_cache", None)
++    schema = getattr(getattr(packet, "default", None), "_schema", None)
++    return schema is not None and any(a.name == "cache_mode" for a in schema.arguments)
++
++
++class PagedCacheArena(CacheArena):
++    """Hidden-only flat arena and one shared ND paged KV allocation.
++
++    HeadHistory exposes strided views into the same pages for eager fallback.
++    Graphs never convert the whole historical cache into contiguous TND data.
++    Padding writes use distinct dummy token slots, not a live page or -1 slot.
++    """
++
++    @staticmethod
++    def budget_elements(config, heads, context, block_size, dummy_tokens):
++        rounded = ceil(context / block_size) * block_size
++        dummy = ceil(dummy_tokens / block_size) * block_size
++        kv_width = config.num_key_value_heads * config.head_dim
++        return (
++            (heads + 1) * context * config.hidden_size + 2 * heads * rounded * kv_width,
++            2 * heads * dummy * kv_width,
++        )
++
++    def __init__(
++        self,
++        config,
++        heads,
++        *,
++        max_context,
++        slots,
++        block_size,
++        dummy_tokens,
++        device,
++        dtype,
++        scratch_elements=0,
++        write_backend="auto",
++        npu_api=None,
++    ):
++        if any(
++            type(n) is not int or n < 1
++            for n in (heads, max_context, slots, block_size, dummy_tokens)
++        ):
++            raise ValueError("paged MTP cache dimensions must be positive integers")
++        if type(scratch_elements) is not int or scratch_elements < 0:
++            raise ValueError("paged MTP scratch_elements must be nonnegative")
++        if write_backend not in ("auto", "scatter_pa", "scatter_nd"):
++            raise ValueError(
++                "asr_mtp.kv_write_backend must be auto, scatter_pa or scatter_nd"
++            )
++        self.config, self.num_heads, self.max_context = config, heads, max_context
++        self.block_size = block_size
++        self.blocks_per_slot = ceil(max_context / block_size)
++        self.slot_capacity = self.blocks_per_slot * block_size
++        self.dummy_blocks = ceil(dummy_tokens / block_size)
++        self.dummy_base = slots * self.slot_capacity
++        self.total_blocks = slots * self.blocks_per_slot + self.dummy_blocks
++        self.token_capacity = self.total_blocks * block_size
++        self.paged_kv = True
++        hidden_per_slot = (heads + 1) * max_context * config.hidden_size
++        self.scratch_offset = slots * hidden_per_slot
++        self.graph_storage = torch.empty(
++            self.scratch_offset + scratch_elements, device=device, dtype=dtype
++        )
++        self.storage = self.graph_storage[: self.scratch_offset].view(
++            slots, hidden_per_slot
++        )
++        self.kv = torch.zeros(
++            (
++                heads,
++                2,
++                self.total_blocks,
++                block_size,
++                config.num_key_value_heads,
++                config.head_dim,
++            ),
++            device=device,
++            dtype=dtype,
++        )
++        width = max(self.blocks_per_slot, self.dummy_blocks)
++        self.block_rows = []
++        for i in range(slots + 1):
++            begin = i * self.blocks_per_slot
++            count = self.blocks_per_slot if i < slots else self.dummy_blocks
++            self.block_rows.append(
++                tuple(range(begin, begin + count)) + (begin,) * (width - count)
++            )
++        self.free, self.leased = list(reversed(range(slots))), set()
++        self.api = npu_api
++        if self.storage.device.type == "npu" and self.api is None:
++            import torch_npu
++
++            self.api = torch_npu
++        self.scatter_pa = None
++        self.scatter_nd = None
++        if self.api is not None:
++            operation = getattr(self.api, "npu_scatter_pa_kv_cache", None)
++            if (
++                write_backend != "scatter_nd"
++                and operation is not None
++                and scatter_pa_supports_nd(operation)
++            ):
++                self.scatter_pa = operation
++            elif write_backend == "scatter_pa":
++                raise ValueError(
++                    "paged MTP scatter_pa requires the ND cache_mode=Norm API"
++                )
++            if self.scatter_pa is None:
++                self.scatter_nd = getattr(self.api, "npu_scatter_nd_update_", None)
++                if not callable(self.scatter_nd):
++                    raise ValueError(
++                        "paged MTP requires a combined ScatterNd or ND ScatterPa writer"
++                    )
++        self.write_backend = (
++            "scatter_pa" if self.scatter_pa is not None else "scatter_nd"
++        )
++
++    @property
++    def cache_bytes(self):
++        return (self.scratch_offset + self.kv.numel()) * self.storage.element_size()
++
++    def acquire(self):
++        if not self.free:
++            return None
++        slot = self.free.pop()
++        self.leased.add(slot)
++        hidden = self.storage[slot].view(
++            self.num_heads + 1, self.max_context, self.config.hidden_size
++        )
++        begin = slot * self.blocks_per_slot
++        histories = []
++        for d in range(self.num_heads):
++            views = []
++            for kind in range(2):
++                values = self.kv[d, kind, begin : begin + self.blocks_per_slot].view(
++                    self.slot_capacity,
++                    self.config.num_key_value_heads,
++                    self.config.head_dim,
++                )
++                views.append(values[: self.max_context].permute(1, 0, 2))
++            histories.append(HeadHistory(hidden[d + 1], *views))
++        return RequestHistory(slot, hidden[0], histories)
++
++    def write_kv(self, head, key, value, slot_mapping):
++        """One write call per head, proportional to fresh positions only."""
++        if self.scatter_pa is not None:
++            self.scatter_pa(
++                key=key.contiguous(),
++                value=value.contiguous(),
++                key_cache=self.kv[head, 0],
++                value_cache=self.kv[head, 1],
++                slot_mapping=slot_mapping,
++                cache_mode="Norm",
++            )
++            return
++        indices = torch.cat((slot_mapping, slot_mapping + self.token_capacity)).long()
++        updates = torch.cat((key, value)).reshape(2 * key.shape[0], -1)
++        destination = self.kv[head].view(2 * self.token_capacity, -1)
++        if self.scatter_nd is not None:
++            self.scatter_nd(destination, indices[:, None], updates)
++        else:
++            destination.index_copy_(0, indices, updates)
++
++    def attention_kv(self, head):
++        return tuple(
++            self.kv[head, kind].view(self.total_blocks, self.block_size, -1)
++            for kind in range(2)
++        )
+--- /dev/null
++++ b/vllm_ascend/spec_decode/asr_mtp_paged_attention.py
+@@ -0,0 +1,131 @@
++# SPDX-License-Identifier: Apache-2.0
++"""FIA TND queries reading auxiliary PA cache directly through fixed block tables."""
++
++import torch
++from torch.nn import functional as F
++
++try:
++    from .asr_mtp_token_attention import PackedAttention
++except ImportError:
++    from asr_mtp_token_attention import PackedAttention
++
++
++class PagedAttention(PackedAttention):
++    def __init__(self, *args, max_batch, block_size, num_blocks, max_blocks, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.block_size, self.num_blocks = block_size, num_blocks
++        self.tables = torch.zeros(
++            (self.heads, max_batch + 1, max_blocks),
++            dtype=torch.int32,
++            device=self.device,
++        )
++        self.table_rows = None
++        self.kv_lengths = {}
++
++    def set_tables(self, rows):
++        """Upload all heads in one transfer; values originate in CPU slot metadata."""
++        if len(rows) != self.heads:
++            raise ValueError("paged MTP needs block tables for every head")
++        payload = []
++        for table in rows:
++            if not table or len(table) > self.tables.shape[1]:
++                raise ValueError("paged MTP block table batch mismatch")
++            for row in table:
++                if len(row) != self.tables.shape[2] or any(
++                    type(b) is not int or not 0 <= b < self.num_blocks for b in row
++                ):
++                    raise ValueError("paged MTP block id or row width out of range")
++                payload.extend(row)
++            payload.extend(
++                [0] * ((self.tables.shape[1] - len(table)) * self.tables.shape[2])
++            )
++        normalized = tuple(tuple(tuple(row) for row in table) for table in rows)
++        if normalized == self.table_rows:
++            return
++        host = torch.tensor(
++            payload, dtype=torch.int32, pin_memory=self.device.type == "npu"
++        )
++        self.tables.view(-1).copy_(host, non_blocking=True)
++        self.table_rows = normalized
++
++    def stage(self, head, q_ends, kv_ends):
++        super().stage(head, q_ends, kv_ends)
++        previous = (0, *kv_ends[:-1])
++        self.kv_lengths[head] = tuple(
++            end - begin for begin, end in zip(previous, kv_ends)
++        )
++
++    def _validate(self, head, query, key, value):
++        if head not in self.lengths or self.table_rows is None:
++            raise ValueError("paged MTP lengths and block tables must be staged")
++        q_ends, _ = self.lengths[head]
++        if (
++            query.ndim != 3
++            or query.shape[1:] != (self.num_heads, self.head_dim)
++            or q_ends[-1] != query.shape[0]
++            or key.shape
++            != (self.num_blocks, self.block_size, self.num_kv_heads * self.head_dim)
++            or value.shape != key.shape
++            or len(self.table_rows[head]) != len(q_ends)
++            or max(self.kv_lengths[head]) > self.tables.shape[2] * self.block_size
++            or any(
++                t.device != self.device
++                or t.dtype != self.dtype
++                or not t.is_contiguous()
++                for t in (query, key, value)
++            )
++        ):
++            raise ValueError("paged MTP query/cache/table geometry mismatch")
++
++    def _arguments(self, head, query, key, value, scale):
++        result = super()._arguments(head, query, key, value, scale)
++        result.update(
++            block_table=self.tables[head, : len(self.lengths[head][0])],
++            block_size=self.block_size,
++            actual_seq_lengths_kv=self.kv_lengths[head],
++        )
++        return result
++
++    @torch.inference_mode()
++    def __call__(self, head, query, key, value, scale):
++        if self.is_npu:
++            return super().__call__(head, query, key, value, scale)
++        self._validate(head, query, key, value)
++        # CPU-only correctness reference. Production FIA reads these pages
++        # itself; there is no index_select/history materialization on NPU.
++        result, start = torch.empty_like(query), 0
++        groups = self.num_heads // self.num_kv_heads
++        for i, (end, length) in enumerate(
++            zip(self.lengths[head][0], self.kv_lengths[head])
++        ):
++            blocks = self.table_rows[head][i][
++                : (length + self.block_size - 1) // self.block_size
++            ]
++            index = torch.tensor(blocks, dtype=torch.long)
++            k = (
++                key.index_select(0, index)
++                .reshape(-1, self.num_kv_heads, self.head_dim)[:length]
++                .transpose(0, 1)
++            )
++            v = (
++                value.index_select(0, index)
++                .reshape(-1, self.num_kv_heads, self.head_dim)[:length]
++                .transpose(0, 1)
++            )
++            q_length = end - start
++            mask = (
++                torch.arange(length)[None]
++                <= torch.arange(q_length)[:, None] + length - q_length
++            )
++            result[start:end].copy_(
++                F.scaled_dot_product_attention(
++                    query[start:end].transpose(0, 1),
++                    k.repeat_interleave(groups, 0),
++                    v.repeat_interleave(groups, 0),
++                    attn_mask=mask[None],
++                    dropout_p=0.0,
++                    scale=scale,
++                ).transpose(0, 1)
++            )
++            start = end
++        return result
+--- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_worker.py
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,445 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Worker-local external draft -> MTP handoff for the v0.23 sync runner."""
 +import hashlib
@@ -2278,12 +2672,22 @@
 +    allowed = {'checkpoint', 'num_heads', 'max_context_tokens', 'cache_mib', 'max_requests',
 +               'verify_base_signature', 'graph_mode', 'graph_context_tokens',
 +               'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size',
-+               'native_fusion', 'profile_stages'}
++               'native_fusion', 'profile_stages', 'kv_cache_backend',
++               'kv_block_size', 'kv_write_backend'}
 +    if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
 +        raise ValueError('invalid additional_config.asr_mtp settings')
 +    for name, default in (('native_fusion', True), ('profile_stages', False)):
 +        if type(settings.get(name, default)) is not bool:
 +            raise ValueError(f'asr_mtp.{name} must be a bool')
++    kv_backend = settings.get('kv_cache_backend', 'tnd')
++    if kv_backend not in ('tnd', 'paged'):
++        raise ValueError('asr_mtp.kv_cache_backend must be tnd or paged')
++    block_size = settings.get('kv_block_size', 128)
++    if type(block_size) is not int or block_size not in (128, 256, 512):
++        raise ValueError('asr_mtp.kv_block_size must be 128, 256 or 512')
++    writer = settings.get('kv_write_backend', 'auto')
++    if writer not in ('auto', 'scatter_pa', 'scatter_nd'):
++        raise ValueError('asr_mtp.kv_write_backend must be auto, scatter_pa or scatter_nd')
 +    for name, default in (('num_heads', 5), ('max_context_tokens', 512),
 +                          ('cache_mib', 512), ('max_requests', 64)):
 +        if type(settings.get(name, default)) is not int or settings.get(name, default) < 1:
@@ -2311,17 +2715,36 @@
 +    model = model.to(device=runner.device, dtype=runner.dtype).eval().requires_grad_(False)
 +    native_fusion = prepare_fused_heads(model, enabled=settings.get('native_fusion', True))
 +    cap = settings.get('max_context_tokens', 512)
-+    per_slot = CacheArena.elements_per_position(text, heads) * cap * torch.empty((), dtype=runner.dtype).element_size()
-+    slots = min(settings.get('max_requests', 64), settings.get('cache_mib', 512) * 1024 ** 2 // per_slot)
++    arena_class, arena_kwargs = CacheArena, {}
++    fixed_elements = 0
++    slot_elements = CacheArena.elements_per_position(text, heads) * cap
++    if kv_backend == 'paged':
++        try:
++            from .asr_mtp_paged_cache import PagedCacheArena
++        except ImportError:
++            from asr_mtp_paged_cache import PagedCacheArena
++        probe = graph_options(settings, context=cap, slots=1, max_batch=1)
++        if probe is None or not probe.tokens:
++            raise ValueError('asr_mtp.kv_cache_backend=paged requires full token graphs')
++        dummy_tokens = max(probe.tokens) + 1
++        slot_elements, fixed_elements = PagedCacheArena.budget_elements(
++            text, heads, cap, block_size, dummy_tokens)
++        arena_class = PagedCacheArena
++        arena_kwargs = {'block_size': block_size, 'dummy_tokens': dummy_tokens,
++                        'write_backend': writer}
++    item_size = torch.empty((), dtype=runner.dtype).element_size()
++    available_elements = settings.get('cache_mib', 512) * 1024 ** 2 // item_size - fixed_elements
++    slots = min(settings.get('max_requests', 64), available_elements // slot_elements)
 +    if slots < 1:
 +        raise ValueError('asr_mtp.cache_mib cannot hold one request slot')
 +    options = graph_options(settings, context=cap, slots=slots,
 +                            max_batch=getattr(runner, 'max_num_reqs', slots))
 +    if options is not None:
 +        validate_graph_runner(runner)
-+    arena = CacheArena(text, heads, max_context=cap, slots=slots,
-+                       device=runner.device, dtype=runner.dtype,
-+                       scratch_elements=options.scratch_elements(text) if options else 0)
++    arena = arena_class(text, heads, max_context=cap, slots=slots,
++                        device=runner.device, dtype=runner.dtype,
++                        scratch_elements=options.scratch_elements(text) if options else 0,
++                        **arena_kwargs)
 +    language = target.get_language_model() if hasattr(target, 'get_language_model') else target.language_model
 +    eos = getattr(text, 'eos_token_id', None)
 +    eos = set(eos if isinstance(eos, (tuple, list)) else [eos]) - {None}
@@ -2340,14 +2763,16 @@
 +                       eos, graphs=graphs, profile_stages=settings.get('profile_stages', False))
 +    logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
 +                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s '
-+                'native_fusion=%s profile_stages=%s',
-+                heads, cap, slots, arena.storage.numel() * arena.storage.element_size() / 1024 ** 2,
++                'native_fusion=%s profile_stages=%s kv_cache_backend=%s kv_write_backend=%s',
++                heads, cap, slots, getattr(arena, 'cache_bytes',
++                    arena.storage.numel() * arena.storage.element_size()) / 1024 ** 2,
 +                settings['checkpoint'], settings.get('verify_base_signature', False),
 +                settings.get('graph_mode', 'off'),
 +                (arena.graph_storage.numel() - arena.scratch_offset) *
 +                arena.storage.element_size() / 1024 ** 2,
 +                'tokens' if options is not None and options.tokens else 'rectangular',
-+                native_fusion, settings.get('profile_stages', False))
++                native_fusion, settings.get('profile_stages', False), kv_backend,
++                getattr(arena, 'write_backend', 'separate_scatter_nd'))
 +    return worker
 --- /dev/null
 +++ b/vllm_ascend/patch/worker/patch_external_draft_mtp.py

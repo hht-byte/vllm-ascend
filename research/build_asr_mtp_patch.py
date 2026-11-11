@@ -102,6 +102,8 @@ def make_patch(root):
         'vllm_ascend/spec_decode/asr_mtp_graph.py': directory / 'asr_mtp_graph.py',
         'vllm_ascend/spec_decode/asr_mtp_token_attention.py': directory / 'asr_mtp_token_attention.py',
         'vllm_ascend/spec_decode/asr_mtp_token_graph.py': directory / 'asr_mtp_token_graph.py',
+        'vllm_ascend/spec_decode/asr_mtp_paged_cache.py': directory / 'asr_mtp_paged_cache.py',
+        'vllm_ascend/spec_decode/asr_mtp_paged_attention.py': directory / 'asr_mtp_paged_attention.py',
         'vllm_ascend/spec_decode/asr_mtp_worker.py': directory / 'asr_mtp_worker.py',
         'vllm_ascend/patch/worker/patch_external_draft_mtp.py': directory / 'patch_external_draft_mtp.py',
     }

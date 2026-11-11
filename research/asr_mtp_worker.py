@@ -341,12 +341,22 @@ def load_worker(runner, target, settings):
     allowed = {'checkpoint', 'num_heads', 'max_context_tokens', 'cache_mib', 'max_requests',
                'verify_base_signature', 'graph_mode', 'graph_context_tokens',
                'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size',
-               'native_fusion', 'profile_stages'}
+               'native_fusion', 'profile_stages', 'kv_cache_backend',
+               'kv_block_size', 'kv_write_backend'}
     if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
         raise ValueError('invalid additional_config.asr_mtp settings')
     for name, default in (('native_fusion', True), ('profile_stages', False)):
         if type(settings.get(name, default)) is not bool:
             raise ValueError(f'asr_mtp.{name} must be a bool')
+    kv_backend = settings.get('kv_cache_backend', 'tnd')
+    if kv_backend not in ('tnd', 'paged'):
+        raise ValueError('asr_mtp.kv_cache_backend must be tnd or paged')
+    block_size = settings.get('kv_block_size', 128)
+    if type(block_size) is not int or block_size not in (128, 256, 512):
+        raise ValueError('asr_mtp.kv_block_size must be 128, 256 or 512')
+    writer = settings.get('kv_write_backend', 'auto')
+    if writer not in ('auto', 'scatter_pa', 'scatter_nd'):
+        raise ValueError('asr_mtp.kv_write_backend must be auto, scatter_pa or scatter_nd')
     for name, default in (('num_heads', 5), ('max_context_tokens', 512),
                           ('cache_mib', 512), ('max_requests', 64)):
         if type(settings.get(name, default)) is not int or settings.get(name, default) < 1:
@@ -374,17 +384,36 @@ def load_worker(runner, target, settings):
     model = model.to(device=runner.device, dtype=runner.dtype).eval().requires_grad_(False)
     native_fusion = prepare_fused_heads(model, enabled=settings.get('native_fusion', True))
     cap = settings.get('max_context_tokens', 512)
-    per_slot = CacheArena.elements_per_position(text, heads) * cap * torch.empty((), dtype=runner.dtype).element_size()
-    slots = min(settings.get('max_requests', 64), settings.get('cache_mib', 512) * 1024 ** 2 // per_slot)
+    arena_class, arena_kwargs = CacheArena, {}
+    fixed_elements = 0
+    slot_elements = CacheArena.elements_per_position(text, heads) * cap
+    if kv_backend == 'paged':
+        try:
+            from .asr_mtp_paged_cache import PagedCacheArena
+        except ImportError:
+            from asr_mtp_paged_cache import PagedCacheArena
+        probe = graph_options(settings, context=cap, slots=1, max_batch=1)
+        if probe is None or not probe.tokens:
+            raise ValueError('asr_mtp.kv_cache_backend=paged requires full token graphs')
+        dummy_tokens = max(probe.tokens) + 1
+        slot_elements, fixed_elements = PagedCacheArena.budget_elements(
+            text, heads, cap, block_size, dummy_tokens)
+        arena_class = PagedCacheArena
+        arena_kwargs = {'block_size': block_size, 'dummy_tokens': dummy_tokens,
+                        'write_backend': writer}
+    item_size = torch.empty((), dtype=runner.dtype).element_size()
+    available_elements = settings.get('cache_mib', 512) * 1024 ** 2 // item_size - fixed_elements
+    slots = min(settings.get('max_requests', 64), available_elements // slot_elements)
     if slots < 1:
         raise ValueError('asr_mtp.cache_mib cannot hold one request slot')
     options = graph_options(settings, context=cap, slots=slots,
                             max_batch=getattr(runner, 'max_num_reqs', slots))
     if options is not None:
         validate_graph_runner(runner)
-    arena = CacheArena(text, heads, max_context=cap, slots=slots,
-                       device=runner.device, dtype=runner.dtype,
-                       scratch_elements=options.scratch_elements(text) if options else 0)
+    arena = arena_class(text, heads, max_context=cap, slots=slots,
+                        device=runner.device, dtype=runner.dtype,
+                        scratch_elements=options.scratch_elements(text) if options else 0,
+                        **arena_kwargs)
     language = target.get_language_model() if hasattr(target, 'get_language_model') else target.language_model
     eos = getattr(text, 'eos_token_id', None)
     eos = set(eos if isinstance(eos, (tuple, list)) else [eos]) - {None}
@@ -403,12 +432,14 @@ def load_worker(runner, target, settings):
                        eos, graphs=graphs, profile_stages=settings.get('profile_stages', False))
     logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
                 'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s '
-                'native_fusion=%s profile_stages=%s',
-                heads, cap, slots, arena.storage.numel() * arena.storage.element_size() / 1024 ** 2,
+                'native_fusion=%s profile_stages=%s kv_cache_backend=%s kv_write_backend=%s',
+                heads, cap, slots, getattr(arena, 'cache_bytes',
+                    arena.storage.numel() * arena.storage.element_size()) / 1024 ** 2,
                 settings['checkpoint'], settings.get('verify_base_signature', False),
                 settings.get('graph_mode', 'off'),
                 (arena.graph_storage.numel() - arena.scratch_offset) *
                 arena.storage.element_size() / 1024 ** 2,
                 'tokens' if options is not None and options.tokens else 'rectangular',
-                native_fusion, settings.get('profile_stages', False))
+                native_fusion, settings.get('profile_stages', False), kv_backend,
+                getattr(arena, 'write_backend', 'separate_scatter_nd'))
     return worker

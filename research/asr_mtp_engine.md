@@ -2,7 +2,7 @@
 
 本实现运行在 **vLLM worker 内**。加载用户提供的 `asr-mtp` checkpoint 中的辅助 heads，共享已加载目标模型的 embedding 和 logits 计算；不加载第二个 ASR 主干，不使用 HF `generate()`，不重新编码音频。回滚和 Prespec 的完整草稿仍先由已有 first-verify scheduler 补丁排入首次目标执行。随后，无论部分失配还是草稿耗尽，worker 从实际确认的目标上下文进入 MTP，后续草稿继续交给原有目标模型 / rejection sampler 验证。MTP 启用的请求不再进行旧 aligned/ngram 重接。
 
-新增代码包含七个可部署模块和 `worker.py` 中的启动注册：[补丁](asr_mtp_v023.patch)。不重写 `model_runner_v1.py`、目标模型、scheduler 或 paged KV 管理。安装必须在现有 [first-verify 补丁](external_draft_first_verify_v023.md)之上。
+新增代码包含九个可部署模块和 `worker.py` 中的启动注册：[补丁](asr_mtp_v023.patch)。不重写 `model_runner_v1.py`、目标模型、scheduler 或 paged KV 管理。安装必须在现有 [first-verify 补丁](external_draft_first_verify_v023.md)之上。
 
 ## 1. 安装到引擎
 
@@ -28,6 +28,8 @@ git apply /tmp/asr-mtp.patch
 | `asr_mtp_graph.py` | `vllm_ascend/spec_decode/asr_mtp_graph.py` |
 | `asr_mtp_token_graph.py` | `vllm_ascend/spec_decode/asr_mtp_token_graph.py` |
 | `asr_mtp_token_attention.py` | `vllm_ascend/spec_decode/asr_mtp_token_attention.py` |
+| `asr_mtp_paged_cache.py` | `vllm_ascend/spec_decode/asr_mtp_paged_cache.py` |
+| `asr_mtp_paged_attention.py` | `vllm_ascend/spec_decode/asr_mtp_paged_attention.py` |
 | `asr_mtp_worker.py` | `vllm_ascend/spec_decode/asr_mtp_worker.py` |
 | `patch_external_draft_mtp.py` | `vllm_ascend/patch/worker/patch_external_draft_mtp.py` |
 | 注册 import | `vllm_ascend/worker/worker.py`，紧接 `NPUModelRunner` 的导入；受 0.23 版本条件保护 |
@@ -258,13 +260,88 @@ rg -n 'ASR_MTP_CONFIG|ASR_MTP_HOST_STAGE|ASR_MTP_GRAPH_HOST_STAGE' "$LOG"
 
 设备测试已包含原生融合与矩形图、packed FIA 同图 replay，覆盖变输入、请求重排、桶切换和拒绝后的缓存裁剪。本机无 NPU，相关用例只能跳过；需在 910B 上不跳过地执行，再核对完整输出、接受率、commit P95/P99 和图外时间线。
 
+### 分页辅助 KV：合并写入与直接读取
+
+新增可选 `kv_cache_backend="paged"`，要求已启用 `graph_mode="full"` 和
+`graph_token_sizes`。默认 `"tnd"` 保留原布局用于对照。沿用现有工厂接口，
+在调用 `mtp_engine_config()` 之前合并：
+
+```python
+additional = dict(base_config.get("additional_config") or {})
+settings = dict(additional.get("asr_mtp") or {})
+settings.update({
+    "graph_mode": "full",
+    "graph_token_sizes": [8, 32, 64, 128, 256, 512],
+    "kv_cache_backend": "paged",   # tnd 恢复原连续 KV 整理路径
+    "kv_block_size": 128,           # 允许 128、256、512
+    "kv_write_backend": "auto",    # auto / scatter_pa / scatter_nd
+})
+additional["asr_mtp"] = settings
+base_config["additional_config"] = additional
+base_config = mtp_engine_config(
+    base_config, mtp_enabled=mtp_enabled, mtp_checkpoint=mtp_checkpoint,
+)
+```
+
+每个辅助请求槽固定占用若干独立 KV blocks，不使用目标模型块分配器。
+持久 hidden 与 KV 分开布局；eager 回退通过共享存储视图读写同一份分页 KV，
+不会在图与 eager 之间复制整段历史，也不保留第二份有效 KV。失配仍只裁剪
+各 head 的 `valid`，随后覆盖尾部；释放槽时重置有效长度，不清零整块显存。
+
+每个 head 将新增 K/V 合并写入，FIA 通过 `block_table` 直接读取持久页面。
+五头图的历史 K/V 显式 gather 从 10 次降为 0，K/V 写入从 10 次调用降为 5 次。
+hidden 的 5 次读取、4 次写入，以及 token 更新、最后 hidden 抽取仍然存在；
+这些计数是程序级调用，不能等同于设备 kernel 数或同比时延改善。
+eager 回退仍采用原有连续 attention 整理；上述读写消融针对分页图执行。
+
+`auto` 在启动检查 `npu_scatter_pa_kv_cache` 是否支持 ND 的
+`cache_mode="Norm"`；支持则采用专用 K/V 联合写入。不支持时使用一次合并
+K/V 的 `npu_scatter_nd_update_`，仍直接用 PA 读取缓存。显式 `scatter_pa`
+要求该接口存在，不能使用旧版 NZ-only 算子解释 ND 缓存；显式 `scatter_nd`
+可用于同一分页布局下消融写入方式。旧 [7.2.0 算子 schema](https://gitcode.com/Ascend/op-plugin/blob/7.2.0/op_plugin/config/op_plugin_functions.yaml)
+没有 `cache_mode`，因此不能仅凭算子名称判断支持。
+
+FIA 的 Q 仍为 TND 累计边界，PA 的 KV 长度传每请求长度，而非历史长度累加。
+各 head 的 block table 根据当前请求顺序与预算紧凑排列，一次上传所有 head，
+表未变化时省去重复上传；长度变化继续走图 task update。块表只使用已有 CPU
+slot 元数据，不读取设备 token/长度。padding 使用独立 scratch 页和唯一地址，
+不覆盖 live cache；正长度 dummy 段保留，PA 不要求 KV 总物理容量等于序列长度和。
+接口依据见 [Ascend FIA 文档](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_fused_infer_attention_score.md)。
+
+`cache_mib` 包含按 block size 向上取整的 live KV、持久 hidden 和 dummy KV 页，
+不含权重、图工作区和图元数据。同预算下可用槽数可能减少，须核对启动的
+`ASR_MTP_CONFIG kv_cache_backend=... kv_write_backend=... cache_slots=...`。
+图仍只按 token 桶捕获，块表不按 request ID 建图，不等待凑批。
+
+已安装原生融合版（源码 `a5e591b9c`）时应用引擎交付目录中的聚焦升级：
+
+```bash
+git apply --check examples/910b/asr_mtp_paged_kv_v023.patch
+git apply examples/910b/asr_mtp_paged_kv_v023.patch
+```
+
+新安装、累计图升级、行缓存到 token 升级补丁已包含本次改动，不叠加聚焦补丁。
+其他源码版本请对实际目录重新导出。部署后按原流程重启 worker；本次实现
+没有连接或重启服务。设备测试覆盖分页 writer/FIA 同图、变 batch/边界、混合预算
+与失配；本机无 NPU，尚未验证 910B 时延和数值。
+
+```bash
+rg -n 'ASR_MTP_CONFIG|ASR_MTP_GRAPH_READY|ASR_MTP_HOST_STAGE' "$LOG"
+PYTHONPATH=research python -m unittest test_asr_mtp_paged -v
+PYTHONPATH=research python -m unittest test_asr_mtp_token_graph.ActualPackedNPUReplayTests -v
+```
+
+保持 checkpoint、head 数、图档位、并发和输入相同，比较 `tnd/paged` 的
+完整输出、接受率、图外时间、prefill/decode、commit P95/P99 及显存。
+显式历史搬运减少并不保证 PA 算子在短上下文下更快。
+
 ### 支持范围与缓存
 
 初版支持 TP=PP=PCP=DCP=1、无量化 / LoRA 的 Qwen3-ASR、同步调度和贪心 `n=1`。不支持的引擎配置在权重加载时拒绝，不能自动退成另一种投机算法。禁用 prefix caching 是因为仅有命中的目标 KV 无法恢复 MTP 所需的完整目标 hidden 历史；不重新 prefill 来弥补。chunked prefill 可以保留每次已计算的 hidden 行。其他模型或 RoPE scaling 不在此版本范围。
 
 checkpoint 按 supplied `asr-mtp` 的 `{"metadata": ..., "mtp": ...}` 格式读取，只装载所用辅助 heads，严格校验辅助头 state_dict。**默认关闭主模型的 `base_signature` 指纹校验**；Qwen3-ASR 架构与辅助头参数形状检查保留。MTP 训练冻结主模型，运行时共享服务已加载的目标模型，所有辅助草稿仍交由目标 verifier 验证。
 
-缓存 arena 在 `load_model` 中按字节预算预分配，纳入引擎目标 KV 定容之前的显存统计；profile 阶段执行最坏辅助 batch 来统计临时内存。`cache_mib` **不包含辅助权重和临时 attention 工作区**，实际总增量显存大于该数值。实际槽数是 `min(max_requests, floor(cache_mib / 每槽字节数))`，启动日志 `ASR_MTP_CONFIG` 给出实际值。
+缓存 arena 在 `load_model` 中按字节预算预分配，纳入引擎目标 KV 定容之前的显存统计；profile 阶段执行最坏辅助 batch 来统计临时内存。`cache_mib` **不包含辅助权重和临时 attention 工作区**，实际总增量显存大于该数值。实际槽数是 `min(max_requests, floor((cache_mib - 固定 scratch 页字节数) / 每槽字节数))`；原 TND 布局的固定 scratch 页预算为 0。启动日志 `ASR_MTP_CONFIG` 给出实际值。
 
 用户提供的是葡语训练 checkpoint；其他语言的接受率和净收益需要单独测量，不能从葡语结果外推。
 

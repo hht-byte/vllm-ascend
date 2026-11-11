@@ -63,7 +63,12 @@ class PackedMTPProgram:
         self.embedding, self.logits = embedding, logits
         self.max_batch, self.tokens, self.context = max_batch, token_size, context_size
         self.query_capacity = query_capacity
-        self.kv_capacity = max_batch * context_size + query_capacity
+        self.paged_kv = getattr(arena, "paged_kv", False)
+        self.kv_capacity = (
+            arena.token_capacity
+            if self.paged_kv
+            else max_batch * context_size + query_capacity
+        )
         self.row_width = gcd(cfg.hidden_size, cfg.head_dim)
         row_elements = arena.graph_storage.numel() // self.row_width * self.row_width
         self.cache_rows = arena.graph_storage[:row_elements].view(-1, self.row_width)
@@ -97,7 +102,9 @@ class PackedMTPProgram:
         self.sequence = view((requests, self.sequence_width))
         self.output = torch.empty((max_batch, count), device=device, dtype=torch.long)
         self.token_index = torch.arange(query_capacity, device=device)
-        self.key_index = torch.arange(self.kv_capacity, device=device)
+        self.key_index = (
+            None if self.paged_kv else torch.arange(self.kv_capacity, device=device)
+        )
         self.hidden_index = torch.arange(
             cfg.hidden_size // self.row_width, device=device
         )
@@ -127,13 +134,27 @@ class PackedMTPProgram:
                 / cfg.head_dim
             )
         )
-        self.attention = PackedAttention(
+        attention_class, extra = PackedAttention, {}
+        if self.paged_kv:
+            try:
+                from .asr_mtp_paged_attention import PagedAttention
+            except ImportError:
+                from asr_mtp_paged_attention import PagedAttention
+            attention_class = PagedAttention
+            extra = {
+                "max_batch": max_batch,
+                "block_size": arena.block_size,
+                "num_blocks": arena.total_blocks,
+                "max_blocks": len(arena.block_rows[0]),
+            }
+        self.attention = attention_class(
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
             cfg.head_dim,
             device=device,
             dtype=dtype,
             heads=count,
+            **extra,
         )
 
     def stage(self, states, inputs, limits):
@@ -185,7 +206,11 @@ class PackedMTPProgram:
             # Its zero KV segment covers the remaining physical K/V capacity,
             # satisfying strict non-PA TND tilers without changing tensor shapes.
             q_ends.append(self.query_capacity)
-            kv_ends.append(self.kv_capacity)
+            kv_ends.append(
+                kv_total + self.query_capacity - q_total
+                if self.paged_kv
+                else self.kv_capacity
+            )
             order.append(self.max_batch)
             segments.append((tuple(q_ends), tuple(kv_ends)))
             q_rows.append(q_ends + [self.query_capacity] * (r - len(q_ends)))
@@ -222,6 +247,17 @@ class PackedMTPProgram:
             payload, dtype=torch.long, pin_memory=self.metadata.device.type == "npu"
         )
         self.metadata.copy_(host, non_blocking=True)
+        if self.paged_kv:
+            tables = [
+                [
+                    self.arena.block_rows[slots[i]]
+                    if i < n
+                    else self.arena.block_rows[-1]
+                    for i in order[: len(segment[0])]
+                ]
+                for order, segment in zip(orders, segments)
+            ]
+            self.attention.set_tables(tables)
         for d, (q_ends, kv_ends) in enumerate(segments):
             self.attention.stage(d, q_ends, kv_ends)
 
@@ -268,7 +304,11 @@ class PackedMTPProgram:
         cfg, count = self.heads.config, self.heads.num_heads
         cap, width = self.arena.max_context, cfg.hidden_size
         hidden_width = cap * width // self.row_width
-        kv_width = cfg.num_key_value_heads * cap * cfg.head_dim // self.row_width
+        kv_width = (
+            0
+            if self.paged_kv
+            else cfg.num_key_value_heads * cap * cfg.head_dim // self.row_width
+        )
         stride = self.arena.storage.shape[1] // self.row_width
         sequence = self.sequence.clone()
         for d, block in enumerate(self.heads.blocks):
@@ -310,42 +350,24 @@ class PackedMTPProgram:
             )
             q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
             hidden_base = base + hidden_width + d * (hidden_width + 2 * kv_width)
-            key_base, value_base = (
-                hidden_base + hidden_width,
-                hidden_base + hidden_width + kv_width,
-            )
-            for offset, value in ((key_base, k), (value_base, v)):
-                self._write(
-                    self._kv_indices(offset, positions),
-                    value,
-                    valid[:, None, None],
-                    self.kv_sink,
+            if self.paged_kv:
+                slot = self.slots.index_select(0, request)
+                addresses = torch.where(
+                    valid,
+                    slot * self.arena.slot_capacity + anchor,
+                    self.arena.dummy_base + self.token_index,
+                ).to(torch.int32)
+                self.arena.write_kv(
+                    d,
+                    torch.where(valid[:, None, None], k, 0),
+                    torch.where(valid[:, None, None], v, 0),
+                    addresses,
                 )
-            key_segment, key_position = self._segments(self.key_index, self.kv_ends[d])
-            key_request = self.order[d].index_select(0, key_segment)
-            key_valid = self.limits.index_select(0, key_request) >= depth
-            key_position = key_position.clamp(0, cap - 1)
-            key_hidden_base = (
-                self.slots.index_select(0, key_request) * stride
-                + hidden_width
-                + d * (hidden_width + 2 * kv_width)
-            )
-            past_k = torch.where(
-                key_valid[:, None, None],
-                self._read(
-                    self._kv_indices(key_hidden_base + hidden_width, key_position)
-                ),
-                0,
-            )
-            past_v = torch.where(
-                key_valid[:, None, None],
-                self._read(
-                    self._kv_indices(
-                        key_hidden_base + hidden_width + kv_width, key_position
-                    )
-                ),
-                0,
-            )
+                past_k, past_v = self.arena.attention_kv(d)
+            else:
+                past_k, past_v = self._contiguous_kv(
+                    d, k, v, hidden_base, positions, valid
+                )
             attended = self.attention(d, q, past_k, past_v, cfg.head_dim**-0.5)
             normed_residual, residual = add_rms_norm(
                 block.decoder.post_attention_layernorm,
@@ -372,6 +394,48 @@ class PackedMTPProgram:
                     self.hidden_sink,
                 )
         return self.output
+
+    def _contiguous_kv(self, d, k, v, hidden_base, positions, valid):
+        cfg, cap = self.heads.config, self.arena.max_context
+        hidden_width = cap * cfg.hidden_size // self.row_width
+        kv_width = cfg.num_key_value_heads * cap * cfg.head_dim // self.row_width
+        stride = self.arena.storage.shape[1] // self.row_width
+        depth = d + 1
+        key_base, value_base = (
+            hidden_base + hidden_width,
+            hidden_base + hidden_width + kv_width,
+        )
+        for offset, value in ((key_base, k), (value_base, v)):
+            self._write(
+                self._kv_indices(offset, positions),
+                value,
+                valid[:, None, None],
+                self.kv_sink,
+            )
+        key_segment, key_position = self._segments(self.key_index, self.kv_ends[d])
+        key_request = self.order[d].index_select(0, key_segment)
+        key_valid = self.limits.index_select(0, key_request) >= depth
+        key_position = key_position.clamp(0, cap - 1)
+        key_hidden_base = (
+            self.slots.index_select(0, key_request) * stride
+            + hidden_width
+            + d * (hidden_width + 2 * kv_width)
+        )
+        past_k = torch.where(
+            key_valid[:, None, None],
+            self._read(self._kv_indices(key_hidden_base + hidden_width, key_position)),
+            0,
+        )
+        past_v = torch.where(
+            key_valid[:, None, None],
+            self._read(
+                self._kv_indices(
+                    key_hidden_base + hidden_width + kv_width, key_position
+                )
+            ),
+            0,
+        )
+        return past_k, past_v
 
     def commit(self, states, limits):
         for state, limit in zip(states, limits):

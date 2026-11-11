@@ -419,6 +419,24 @@ class EngineHeadsTests(unittest.TestCase):
             self.assertTrue(packed.graphs.options.profile_stages)
             self.assertEqual(packed.arena.graph_storage.numel() - packed.arena.scratch_offset, 520)
             self.assertFalse(packed.graphs.ready)
+            paged = load_worker(runner, target, {
+                **settings, 'graph_mode': 'full', 'graph_context_tokens': 16,
+                'graph_token_sizes': [8, 32, 64], 'kv_cache_backend': 'paged',
+                'kv_write_backend': 'scatter_nd', 'kv_block_size': 128,
+            })
+            self.assertTrue(paged.arena.paged_kv)
+            self.assertEqual(paged.arena.slot_capacity, 128)
+            self.assertEqual(paged.arena.dummy_base, 256)
+            self.assertLessEqual(paged.arena.cache_bytes, 1024 ** 2)
+            for overrides in ({'graph_mode': 'off'}, {'graph_token_sizes': []},
+                              {'kv_block_size': 64}, {'kv_write_backend': 'unknown'},
+                              {'kv_cache_backend': 'unknown'},
+                              {'graph_token_sizes': [1000000]}):
+                with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                    load_worker(runner, target, {
+                        **settings, 'graph_mode': 'full', 'graph_token_sizes': [8, 32],
+                        'kv_cache_backend': 'paged', **overrides,
+                    })
             (root / 'config.json').write_text('{"changed":true}', encoding='utf-8')
             self.assertEqual(load_worker(runner, target, settings).heads.num_heads, 2)
             settings['verify_base_signature'] = True
