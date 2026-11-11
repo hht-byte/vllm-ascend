@@ -138,6 +138,24 @@ def rotate_half(tensor):
     return torch.cat((-right, left), dim=-1)
 
 
+def project_norm_rope(heads, attn, normed, anchors, depth, inverse, context):
+    """Shared QKV path; only padding positions are clamped for cached tables."""
+    prepared = getattr(heads, 'qkv_rope', None)
+    if prepared is not None:
+        return prepared(attn, normed, anchors.clamp(0, context - 1) + depth)
+    cfg, leading = heads.config, normed.shape[:-1]
+    q_raw, k_raw, v_raw = project_qkv(attn, normed)
+    q = attn.q_norm(q_raw.reshape(*leading, cfg.num_attention_heads, cfg.head_dim))
+    k = attn.k_norm(k_raw.reshape(*leading, cfg.num_key_value_heads, cfg.head_dim))
+    v = v_raw.reshape(*leading, cfg.num_key_value_heads, cfg.head_dim)
+    # MTP's three positional axes are identical: ordinary half-style RoPE.
+    frequencies = (anchors + depth).float().unsqueeze(-1) * inverse
+    angles = torch.cat((frequencies, frequencies), -1)
+    cos, sin = (angles.cos().to(normed.dtype).unsqueeze(-2),
+                angles.sin().to(normed.dtype).unsqueeze(-2))
+    return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin, v
+
+
 class BatchedMTPHeads(nn.Module):
     def __init__(self, config, num_heads):
         super().__init__()
@@ -193,19 +211,9 @@ class BatchedMTPHeads(nn.Module):
                                            block.token_norm(token_embeddings)), -1))
             normed = block.decoder.input_layernorm(fused)
             attn = block.decoder.self_attn
-            q_raw, k_raw, v_raw = project_qkv(attn, normed)
-            q = attn.q_norm(q_raw.view(count, queries, cfg.num_attention_heads,
-                                                     cfg.head_dim)).transpose(1, 2)
-            k = attn.k_norm(k_raw.view(count, queries, cfg.num_key_value_heads,
-                                                     cfg.head_dim)).transpose(1, 2)
-            v = v_raw.view(count, queries, cfg.num_key_value_heads,
-                                        cfg.head_dim).transpose(1, 2)
-            # All three MRoPE axes in SequentialMTP use the same depth+anchor;
-            # their interleaving therefore reduces to ordinary default RoPE.
-            frequencies = (anchors + depth).float().unsqueeze(-1) * inverse
-            angles = torch.cat((frequencies, frequencies), -1)
-            cos, sin = angles.cos().to(dtype)[:, None], angles.sin().to(dtype)[:, None]
-            q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
+            q, k, v = project_norm_rope(self, attn, normed, anchors, depth, inverse,
+                                      states[0].target.shape[0])
+            q, k, v = (part.transpose(1, 2) for part in (q, k, v))
             past_k = torch.zeros((count, cfg.num_key_value_heads, keys, cfg.head_dim),
                                  device=device, dtype=dtype)
             past_v = torch.zeros_like(past_k)

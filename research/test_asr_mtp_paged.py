@@ -185,6 +185,44 @@ class PagedProgramTests(PackedFixture, unittest.TestCase):
         prepare_fused_heads(self.fixed.requires_grad_(False))
         self.test_mixed_prefixes_budgets_and_rejection_match_contiguous_reference()
 
+    def test_precomputed_rope_clamps_padding_when_token_bucket_exceeds_context(self):
+        from asr_mtp_fused import prepare_fused_heads
+        from asr_mtp_paged_cache import PagedCacheArena
+        from asr_mtp_qkv_rope import prepare_qkv_rope
+        from asr_mtp_token_graph import PackedMTPProgram
+
+        self.new = PagedCacheArena(
+            self.cfg,
+            3,
+            max_context=17,
+            slots=4,
+            block_size=4,
+            dummy_tokens=1025,
+            device="cpu",
+            dtype=torch.float32,
+            scratch_elements=1025 * self.cfg.hidden_size,
+        )
+        self.program = PackedMTPProgram(
+            self.fixed,
+            self.new,
+            self.embed,
+            self.logits,
+            max_batch=3,
+            token_size=1024,
+            context_size=17,
+        )
+        self.b = [self.new.acquire() for _ in self.a]
+        for left, right in zip(self.a, self.b):
+            right.length = left.length
+            right.target[: left.length] = left.target[: left.length]
+        prepare_fused_heads(self.fixed.requires_grad_(False))
+        self.fixed.qkv_rope = prepare_qkv_rope(
+            self.fixed, max_context=17, backend="torch"
+        )
+        self.assertEqual(self.fixed.qkv_rope.position_capacity, 21)
+        with torch.inference_mode():
+            self.compare(self.a, self.b, [r + [4] for r in self.ids], [3, 2, 1])
+
     def test_device_program_only_reads_hidden_and_jointly_writes_kv_once_per_head(self):
         reads, writes = [], []
         original_read = self.program._read

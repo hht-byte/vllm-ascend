@@ -2,7 +2,7 @@
 
 本实现运行在 **vLLM worker 内**。加载用户提供的 `asr-mtp` checkpoint 中的辅助 heads，共享已加载目标模型的 embedding 和 logits 计算；不加载第二个 ASR 主干，不使用 HF `generate()`，不重新编码音频。回滚和 Prespec 的完整草稿仍先由已有 first-verify scheduler 补丁排入首次目标执行。随后，无论部分失配还是草稿耗尽，worker 从实际确认的目标上下文进入 MTP，后续草稿继续交给原有目标模型 / rejection sampler 验证。MTP 启用的请求不再进行旧 aligned/ngram 重接。
 
-新增代码包含九个可部署模块和 `worker.py` 中的启动注册：[补丁](asr_mtp_v023.patch)。不重写 `model_runner_v1.py`、目标模型、scheduler 或 paged KV 管理。安装必须在现有 [first-verify 补丁](external_draft_first_verify_v023.md)之上。
+新增代码包含十二个可部署模块和 `worker.py` 中的启动注册：[补丁](asr_mtp_v023.patch)。不重写 `model_runner_v1.py`、目标模型、scheduler 或 paged KV 管理。安装必须在现有 [first-verify 补丁](external_draft_first_verify_v023.md)之上。
 
 ## 1. 安装到引擎
 
@@ -25,6 +25,9 @@ git apply /tmp/asr-mtp.patch
 | --- | --- |
 | `asr_mtp_heads.py` | `vllm_ascend/spec_decode/asr_mtp_heads.py` |
 | `asr_mtp_fused.py` | `vllm_ascend/spec_decode/asr_mtp_fused.py` |
+| `asr_mtp_qkv_rope.py` | `vllm_ascend/spec_decode/asr_mtp_qkv_rope.py` |
+| `asr_mtp_row_copy.py` | `vllm_ascend/spec_decode/asr_mtp_row_copy.py` |
+| `asr_mtp_row_copy_kernel.py` | `vllm_ascend/spec_decode/asr_mtp_row_copy_kernel.py` |
 | `asr_mtp_graph.py` | `vllm_ascend/spec_decode/asr_mtp_graph.py` |
 | `asr_mtp_token_graph.py` | `vllm_ascend/spec_decode/asr_mtp_token_graph.py` |
 | `asr_mtp_token_attention.py` | `vllm_ascend/spec_decode/asr_mtp_token_attention.py` |
@@ -334,6 +337,88 @@ PYTHONPATH=research python -m unittest test_asr_mtp_token_graph.ActualPackedNPUR
 保持 checkpoint、head 数、图档位、并发和输入相同，比较 `tnd/paged` 的
 完整输出、接受率、图外时间、prefill/decode、commit P95/P99 及显存。
 显式历史搬运减少并不保证 PA 算子在短上下文下更快。
+
+### QKV/RoPE 融合与稀疏 hidden 行写入
+
+这次优化只调整辅助头内部算子和 flat arena 的行写入。eager、矩形图、
+packed token 图共用 QKV/RoPE helper；不改变目标模型、scheduler、head 数、
+候选预算或已有分页 KV 的 `scatter_pa` writer。仍在三参数工厂调用之前合并：
+
+```python
+additional = dict(base_config.get("additional_config") or {})
+settings = dict(additional.get("asr_mtp") or {})
+settings.update({
+    "qkv_rope_backend": "auto",   # auto / torch / native / triton
+    "row_write_backend": "auto",  # auto / triton / scatter_nd
+})
+additional["asr_mtp"] = settings
+base_config["additional_config"] = additional
+base_config = mtp_engine_config(
+    base_config, mtp_enabled=mtp_enabled, mtp_checkpoint=mtp_checkpoint,
+)
+```
+
+| `qkv_rope_backend` | 行为与比较边界 |
+| --- | --- |
+| `auto`（默认） | 有 `npu_rotary_mul` 时选择 native RoPE；否则选 Torch。保留分开的 Q/K RMSNorm，不自动选择联合 Triton kernel。 |
+| `torch` | 保留 Q/K norm 和原 multiply/add RoPE 的低精度舍入顺序，用于对照。 |
+| `native` | 在 Q/K norm 后用 `npu_rotary_mul(rotary_mode="half")`，接口缺失则启动失败。 |
+| `triton` | 显式选择已注册的 `triton_split_qkv_rmsnorm_mrope`，联合 split QKV、Q/K RMSNorm 和 RoPE；接口或形状不兼容则启动失败。 |
+
+联合 kernel 使用 FP32 完成 norm/rotation 后再 cast，可能与原分阶段低精度
+舍入不同，必须显式开启并核对输出和接受率。不能用旧的硬编码 BF16
+split-QKV kernel 处理当前 FP16 服务。projection bias 在 packed Linear 中只加
+一次，联合接口的 norm affine bias 保持 `None`，避免重复偏置。
+
+位置表在最终设备和 dtype 上启动时预算、预计算，不在 replay 中做 sin/cos、
+设备标量读取或 CPU 长度同步。表容量覆盖 `context_cap + head 数 + 1`。
+padding anchor 先按 arena 的 `context_cap` 裁剪，再加 head depth；不能用
+token bucket 容量作为历史上限，因 1024-token 桶可大于 512-token cache cap。
+`native_fusion=False` 时 `auto/torch` 保留旧数学路径且不安装 helper；显式
+`native/triton` 则拒绝启动，避免消融配置实际仍启用融合。
+
+`row_write_backend` 独立控制 flat arena `_write`，分页模式下主要是 hidden
+写入。`auto` 在 NPU 启动时优先选择 Triton 稀疏行 copy；CPU 继续用
+`index_copy_`。仅缺少 Triton import 时回退旧 `npu_scatter_nd_update_`；
+显式 `triton` 缺失则启动失败。运行时/JIT 错误直接报出，不吞掉错误后换算子。
+`scatter_nd` 保留原 writer，供同布局消融。
+
+新 copy kernel 只读取更新行的索引和值，并写入相应 destination 行，不读取、
+扫描、克隆或清零整个 destination。live 和 padding scratch 地址唯一性由调用
+方保证。用户这轮 `(1097744,128)` 的 FP16 destination 对应 hidden arena：
+
+```text
+22 slots × 512 context × 6 hidden stages × 2048 / 128
+  + (1024 + 1) scratch positions × 2048 / 128 = 1,097,744 rows
+2320 update rows / (2048 / 128) = 145 positions
+```
+
+约 268 MiB destination 只更新 580 KiB；145 个位置对应 144-token 桶加一个
+dummy。这些形状能定位 hidden 写入，不能证明旧 ScatterND 内部全量扫描或
+复制了 destination。分页 K/V 已走专用 `scatter_pa`，不会被该开关替换。
+
+已安装分页版（源码 `f9bf28b42`）应用引擎交付目录中的聚焦升级：
+
+```bash
+git apply --check examples/910b/asr_mtp_native_ops_v023.patch
+git apply examples/910b/asr_mtp_native_ops_v023.patch
+```
+
+新安装的完整补丁、累计图升级和行缓存到 token 升级已包含它，不连续叠加。
+其他版本对实际安装目录重新导出；新增三个 helper 模块也必须一起部署。
+`ASR_MTP_CONFIG` 中 `qkv_rope_backend` 是实际选择，`row_write_backend`
+是请求配置；`ASR_MTP_GRAPH_READY row_write_backend` 是图实际 writer：
+
+```bash
+rg -n 'ASR_MTP_CONFIG|ASR_MTP_GRAPH_READY' "$LOG"
+PYTHONPATH=research python -m unittest test_asr_mtp_qkv_rope test_asr_mtp_row_copy -v
+PYTHONPATH=research python -m unittest test_asr_mtp_token_graph.ActualPackedNPUReplayTests -v
+```
+
+helper 数学/分派测试和整链 NPU 条件测试覆盖融合、行写入与分页 replay。
+本机没有 NPU，CPU 通过不能代替 910B 数值、捕图和性能验收。对比保持负载、
+checkpoint、head 数、桶和预算一致，分别切换 RoPE 和 row writer，核对完整
+输出、接受率、prefill/decode、commit P95/P99 和图外时间线。
 
 ### 支持范围与缓存
 

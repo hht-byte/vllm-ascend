@@ -448,9 +448,18 @@ class GraphDispatchTests(TinyMTPFixture, unittest.TestCase):
         from asr_mtp_graph import graph_options
 
         self.assertIsNone(graph_options({}, context=512, slots=23, max_batch=20))
+        for extra in ({}, {"graph_token_sizes": [8, 32]}):
+            options = graph_options(
+                {"graph_mode": "full", "row_write_backend": "triton", **extra},
+                context=512,
+                slots=23,
+                max_batch=20,
+            )
+            self.assertEqual(options.row_write_backend, "triton")
         for settings in (
             {"graph_mode": "bad"},
             {"graph_mode": True},
+            {"graph_mode": "full", "row_write_backend": "invalid"},
             {"graph_mode": "full", "graph_query_sizes": [0]},
             {"graph_mode": "full", "graph_context_tokens": 1024},
             {"graph_mode": "full", "graph_max_batch_size": True},

@@ -9,12 +9,14 @@ from time import perf_counter
 import torch
 
 try:
-    from .asr_mtp_fused import add_rms_norm, project_qkv
-    from .asr_mtp_heads import rotate_half
+    from .asr_mtp_fused import add_rms_norm
+    from .asr_mtp_heads import project_norm_rope
+    from .asr_mtp_row_copy import prepare_row_writer
     from .asr_mtp_token_attention import PackedAttention, PackedNPUCapture
 except ImportError:
-    from asr_mtp_fused import add_rms_norm, project_qkv
-    from asr_mtp_heads import rotate_half
+    from asr_mtp_fused import add_rms_norm
+    from asr_mtp_heads import project_norm_rope
+    from asr_mtp_row_copy import prepare_row_writer
     from asr_mtp_token_attention import PackedAttention, PackedNPUCapture
 
 logger = logging.getLogger(__name__)
@@ -41,7 +43,16 @@ class PackedMTPProgram:
     """
 
     def __init__(
-        self, heads, arena, embedding, logits, *, max_batch, token_size, context_size
+        self,
+        heads,
+        arena,
+        embedding,
+        logits,
+        *,
+        max_batch,
+        token_size,
+        context_size,
+        row_write_backend="auto",
     ):
         cfg = heads.config
         if (
@@ -73,13 +84,9 @@ class PackedMTPProgram:
         row_elements = arena.graph_storage.numel() // self.row_width * self.row_width
         self.cache_rows = arena.graph_storage[:row_elements].view(-1, self.row_width)
         device, dtype = arena.storage.device, arena.storage.dtype
-        self.npu_row_update = None
-        if device.type == "npu":
-            import torch_npu
-
-            self.npu_row_update = getattr(torch_npu, "npu_scatter_nd_update_", None)
-            if self.npu_row_update is None:
-                raise ValueError("MTP graphs require torch_npu.npu_scatter_nd_update_")
+        self.npu_row_update, self.row_write_backend = prepare_row_writer(
+            device, backend=row_write_backend
+        )
         count, requests = heads.num_heads, max_batch + 1
         self.sequence_width = context_size + count + 1
         size = 5 * count * requests + 3 * requests + requests * self.sequence_width
@@ -334,21 +341,9 @@ class PackedMTPProgram:
             )
             normed = block.decoder.input_layernorm(fused)
             attn = block.decoder.self_attn
-            q_raw, k_raw, v_raw = project_qkv(attn, normed)
-            q = attn.q_norm(
-                q_raw.view(self.query_capacity, cfg.num_attention_heads, cfg.head_dim)
+            q, k, v = project_norm_rope(
+                self.heads, attn, normed, anchor, depth, self.inverse, cap
             )
-            k = attn.k_norm(
-                k_raw.view(self.query_capacity, cfg.num_key_value_heads, cfg.head_dim)
-            )
-            v = v_raw.view(self.query_capacity, cfg.num_key_value_heads, cfg.head_dim)
-            frequencies = (anchor + depth).float().unsqueeze(-1) * self.inverse
-            angles = torch.cat((frequencies, frequencies), -1)
-            cos, sin = (
-                angles.cos().to(fused.dtype)[:, None],
-                angles.sin().to(fused.dtype)[:, None],
-            )
-            q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
             hidden_base = base + hidden_width + d * (hidden_width + 2 * kv_width)
             if self.paged_kv:
                 slot = self.slots.index_select(0, request)
@@ -494,6 +489,9 @@ class TokenMTPGraphs:
                     max_batch=self.options.max_batch,
                     token_size=tokens,
                     context_size=self.options.context,
+                    row_write_backend=getattr(
+                        self.options, "row_write_backend", "auto"
+                    ),
                 )
                 program.profile_stages = getattr(self.options, "profile_stages", False)
                 program.stage(
@@ -513,7 +511,8 @@ class TokenMTPGraphs:
             self.reserved_bytes = max(0, torch.npu.memory_reserved() - reserved)
         logger.info(
             "ASR_MTP_GRAPH_READY layout=tokens graphs=%d max_batch=%d token_sizes=%s "
-            "query_capacities=%s context=%d capture_ms=%.2f reserved_mib=%.2f",
+            "query_capacities=%s context=%d capture_ms=%.2f reserved_mib=%.2f "
+            "row_write_backend=%s",
             len(self.entries),
             self.options.max_batch,
             self.options.tokens,
@@ -521,6 +520,7 @@ class TokenMTPGraphs:
             self.options.context,
             (perf_counter() - started) * 1000,
             self.reserved_bytes / 1024**2,
+            next(iter(self.entries.values()))[0].row_write_backend,
         )
 
     @torch.inference_mode()

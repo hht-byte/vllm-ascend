@@ -22,7 +22,7 @@
 +    install_worker_memory_hook(NPUWorker)
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_heads.py
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,248 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Checkpoint-compatible shifted MTP heads, batched inside the engine worker.
 +
@@ -163,6 +163,24 @@
 +    return torch.cat((-right, left), dim=-1)
 +
 +
++def project_norm_rope(heads, attn, normed, anchors, depth, inverse, context):
++    """Shared QKV path; only padding positions are clamped for cached tables."""
++    prepared = getattr(heads, 'qkv_rope', None)
++    if prepared is not None:
++        return prepared(attn, normed, anchors.clamp(0, context - 1) + depth)
++    cfg, leading = heads.config, normed.shape[:-1]
++    q_raw, k_raw, v_raw = project_qkv(attn, normed)
++    q = attn.q_norm(q_raw.reshape(*leading, cfg.num_attention_heads, cfg.head_dim))
++    k = attn.k_norm(k_raw.reshape(*leading, cfg.num_key_value_heads, cfg.head_dim))
++    v = v_raw.reshape(*leading, cfg.num_key_value_heads, cfg.head_dim)
++    # MTP's three positional axes are identical: ordinary half-style RoPE.
++    frequencies = (anchors + depth).float().unsqueeze(-1) * inverse
++    angles = torch.cat((frequencies, frequencies), -1)
++    cos, sin = (angles.cos().to(normed.dtype).unsqueeze(-2),
++                angles.sin().to(normed.dtype).unsqueeze(-2))
++    return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin, v
++
++
 +class BatchedMTPHeads(nn.Module):
 +    def __init__(self, config, num_heads):
 +        super().__init__()
@@ -218,19 +236,9 @@
 +                                           block.token_norm(token_embeddings)), -1))
 +            normed = block.decoder.input_layernorm(fused)
 +            attn = block.decoder.self_attn
-+            q_raw, k_raw, v_raw = project_qkv(attn, normed)
-+            q = attn.q_norm(q_raw.view(count, queries, cfg.num_attention_heads,
-+                                                     cfg.head_dim)).transpose(1, 2)
-+            k = attn.k_norm(k_raw.view(count, queries, cfg.num_key_value_heads,
-+                                                     cfg.head_dim)).transpose(1, 2)
-+            v = v_raw.view(count, queries, cfg.num_key_value_heads,
-+                                        cfg.head_dim).transpose(1, 2)
-+            # All three MRoPE axes in SequentialMTP use the same depth+anchor;
-+            # their interleaving therefore reduces to ordinary default RoPE.
-+            frequencies = (anchors + depth).float().unsqueeze(-1) * inverse
-+            angles = torch.cat((frequencies, frequencies), -1)
-+            cos, sin = angles.cos().to(dtype)[:, None], angles.sin().to(dtype)[:, None]
-+            q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
++            q, k, v = project_norm_rope(self, attn, normed, anchors, depth, inverse,
++                                      states[0].target.shape[0])
++            q, k, v = (part.transpose(1, 2) for part in (q, k, v))
 +            past_k = torch.zeros((count, cfg.num_key_value_heads, keys, cfg.head_dim),
 +                                 device=device, dtype=dtype)
 +            past_v = torch.zeros_like(past_k)
@@ -455,8 +463,351 @@
 +        activated = mlp._mtp_native_ops.npu_swiglu(packed)
 +    return mlp.down_proj(activated)
 --- /dev/null
++++ b/vllm_ascend/spec_decode/asr_mtp_qkv_rope.py
+@@ -0,0 +1,211 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Startup-only QKV/RoPE dispatch for frozen auxiliary MTP heads.
++
++Prepare after ``prepare_fused_heads`` and final device/dtype placement. This
++helper reuses its packed projection storage; it never packs or changes model
++parameters. Moving the model or assigning new Parameters after preparation is
++unsupported. The returned object may be installed as ``heads.qkv_rope``.
++
++``auto`` chooses native half-style RoPE when available, preserving the existing
++separate Q/K normalization and its output rounding. ``torch`` retains the old
++normalization and multiply/add order. ``triton`` is an explicit precision
++tradeoff: the existing Ascend MRoPE kernel computes normalization and rotation
++in FP32 before its final cast. It is never selected automatically.
++
++Position tables are calculated once on the final device. Runtime only selects
++device rows; it performs no trigonometry, scalar extraction, or CPU bounds
++check. Callers must clamp invalid padding anchors to [0, max_context-1] before
++adding head depth; valid anchors must obey the same context bound.
++"""
++
++import importlib
++import inspect
++
++import torch
++from torch.nn import functional as F
++
++_JOINT_ARGUMENTS = (
++    "qkv", "q_weight", "k_weight", "cos_sin", "num_q_heads",
++    "num_kv_heads", "head_size", "eps", "mrope_section",
++    "is_interleaved", "rope_dim", "q_bias", "k_bias", "has_gate",
++)
++
++
++def _joint_operator():
++    # Engine startup imports vllm_ascend.ops when Triton is supported. Do not
++    # trigger worker imports or register global operators from this helper.
++    return getattr(torch.ops.vllm, "triton_split_qkv_rmsnorm_mrope", None)
++
++
++def _validate_joint_signature(operator):
++    schemas = getattr(operator, "_schemas", None)
++    if schemas:
++        if not any(
++            tuple(argument.name for argument in schema.arguments) == _JOINT_ARGUMENTS
++            for schema in schemas.values()
++        ):
++            raise ValueError("MTP Triton QKV/RoPE operator signature differs")
++        return
++    try:
++        signature = inspect.signature(operator)
++    except (TypeError, ValueError) as exc:
++        raise ValueError("MTP Triton QKV/RoPE operator signature unavailable") from exc
++    try:
++        signature.bind(**dict.fromkeys(_JOINT_ARGUMENTS))
++    except TypeError as exc:
++        raise ValueError("MTP Triton QKV/RoPE operator signature differs") from exc
++
++
++def _power_of_two(value):
++    return value > 0 and value & (value - 1) == 0
++
++
++class QKVRope:
++    """Fixed-device projection, Q/K normalization, and half-style rotation."""
++
++    def __init__(self, heads, max_context, backend, native_ops, fused_op):
++        cfg = heads.config
++        self.backend = backend
++        self.num_q_heads = cfg.num_attention_heads
++        self.num_kv_heads = cfg.num_key_value_heads
++        self.head_dim = cfg.head_dim
++        self.hidden_size = cfg.hidden_size
++        self.position_capacity = max_context + heads.num_heads + 1
++        self._native = native_ops
++        self._joint = fused_op
++        self._attentions = {id(block.decoder.self_attn) for block in heads.blocks}
++        first = heads.blocks[0].decoder.self_attn._mtp_qkv_weight
++        self.device, self.dtype = first.device, first.dtype
++        inverse = 1.0 / (cfg.rope_theta ** (torch.arange(
++            0, self.head_dim, 2, device=self.device, dtype=torch.float32
++        ) / self.head_dim))
++        frequencies = torch.arange(
++            self.position_capacity, device=self.device, dtype=torch.float32
++        )[:, None] * inverse
++        if backend == "triton":
++            # Existing op expects [3,T,D] with each row [cos_half,sin_half].
++            # All axes share the same position for MTP's ordinary RoPE.
++            cache = torch.cat((frequencies.cos(), frequencies.sin()), -1)
++            self.table = cache.unsqueeze(0).repeat(3, 1, 1).contiguous()
++        else:
++            angles = torch.cat((frequencies, frequencies), -1)
++            # Separate coefficient planes keep both selected [T,D] tensors
++            # contiguous views after one index_select. Native RoPE accepts
++            # noncontiguous inputs too, but this avoids backend stride handling
++            # or an implicit contiguous conversion on every head invocation.
++            self.table = torch.stack(
++                (angles.cos().to(self.dtype), angles.sin().to(self.dtype)), 0
++            ).contiguous()
++
++    @torch.inference_mode()
++    def __call__(self, attn, normed, positions):
++        if id(attn) not in self._attentions:
++            raise ValueError("MTP QKV/RoPE attention was not prepared")
++        if normed.shape[-1] != self.hidden_size:
++            raise ValueError("MTP QKV/RoPE hidden shape differs")
++        leading = normed.shape[:-1]
++        if positions.shape != leading:
++            raise ValueError("MTP QKV/RoPE position shape must match token shape")
++        if positions.dtype not in (torch.int32, torch.int64):
++            raise TypeError("MTP QKV/RoPE positions must have integer dtype")
++        if (positions.device != self.device or normed.device != self.device
++                or normed.dtype != self.dtype):
++            raise ValueError("MTP QKV/RoPE device/dtype differs from startup placement")
++        flat_positions = positions.reshape(-1)
++        # Projection bias is applied once here. The joint kernel's q_bias and
++        # k_bias mean post-normalization bias and must remain None.
++        packed = F.linear(normed, attn._mtp_qkv_weight, attn._mtp_qkv_bias)
++        if self.backend == "triton":
++            selected = self.table.index_select(1, flat_positions)
++            q, k, v, _ = self._joint(
++                qkv=packed.reshape(-1, packed.shape[-1]),
++                q_weight=attn.q_norm.weight,
++                k_weight=attn.k_norm.weight,
++                cos_sin=selected,
++                num_q_heads=self.num_q_heads,
++                num_kv_heads=self.num_kv_heads,
++                head_size=self.head_dim,
++                eps=attn.q_norm.eps,
++                mrope_section=[self.head_dim // 2, 0, 0],
++                is_interleaved=False,
++                rope_dim=self.head_dim,
++                q_bias=None,
++                k_bias=None,
++                has_gate=False,
++            )
++            return tuple(value.reshape(*leading, count, self.head_dim)
++                         for value, count in ((q, self.num_q_heads),
++                                              (k, self.num_kv_heads),
++                                              (v, self.num_kv_heads)))
++        q, k, v = packed.split(attn._mtp_qkv_sizes, -1)
++        q = attn.q_norm(q.reshape(*leading, self.num_q_heads, self.head_dim))
++        k = attn.k_norm(k.reshape(*leading, self.num_kv_heads, self.head_dim))
++        v = v.reshape(*leading, self.num_kv_heads, self.head_dim)
++        selected = self.table.index_select(1, flat_positions)
++        cos, sin = selected.unbind(0)
++        if self.backend == "native":
++            cos, sin = (part.reshape(1, -1, 1, self.head_dim) for part in (cos, sin))
++            rotated = []
++            for value, count in ((q, self.num_q_heads), (k, self.num_kv_heads)):
++                output = self._native.npu_rotary_mul(
++                    value.reshape(1, -1, count, self.head_dim), cos, sin,
++                    rotary_mode="half",
++                )
++                rotated.append(output.reshape(*leading, count, self.head_dim))
++            return rotated[0], rotated[1], v
++        cos, sin = (part.reshape(*leading, 1, self.head_dim) for part in (cos, sin))
++        return self._rotate(q, cos, sin), self._rotate(k, cos, sin), v
++
++    @staticmethod
++    def _rotate(value, cos, sin):
++        left, right = value.chunk(2, dim=-1)
++        return value * cos + torch.cat((-right, left), -1) * sin
++
++
++@torch.no_grad()
++def prepare_qkv_rope(heads, *, max_context, backend="auto", native_ops=None,
++                     fused_op=None):
++    """Return a prepared callable without registering state or repacking weights.
++
++    Explicit native/Triton requests fail during startup when unsupported;
++    ``auto`` may fall back to Torch if native RoPE is unavailable. Optional
++    API-compatible backends allow real-math CPU contract tests.
++    """
++    if backend not in ("auto", "torch", "native", "triton"):
++        raise ValueError("MTP QKV/RoPE backend must be auto, torch, native or triton")
++    if type(max_context) is not int or max_context < 1:
++        raise ValueError("MTP QKV/RoPE max_context must be a positive integer")
++    if heads.training or any(parameter.requires_grad for parameter in heads.parameters()):
++        raise ValueError("MTP QKV/RoPE preparation requires frozen eval heads")
++    if not heads.blocks or any(
++        getattr(block.decoder.self_attn, "_mtp_qkv_weight", None) is None
++        for block in heads.blocks
++    ):
++        raise ValueError("prepare_fused_heads must run before MTP QKV/RoPE preparation")
++    cfg = heads.config
++    first = heads.blocks[0].decoder.self_attn._mtp_qkv_weight
++    if native_ops is None and first.device.type == "npu" and backend in ("auto", "native"):
++        try:
++            native_ops = importlib.import_module("torch_npu")
++        except ImportError:
++            native_ops = None
++    native_available = callable(getattr(native_ops, "npu_rotary_mul", None))
++    if backend == "auto":
++        backend = "native" if native_available else "torch"
++    if backend == "native" and not native_available:
++        raise ValueError("MTP native RoPE requires npu_rotary_mul")
++    if backend == "triton":
++        if (cfg.head_dim not in (128, 256)
++                or first.dtype not in (torch.float16, torch.bfloat16)
++                or not _power_of_two(cfg.num_attention_heads * cfg.head_dim)
++                or not _power_of_two(cfg.num_key_value_heads * cfg.head_dim)):
++            raise ValueError("unsupported MTP Triton QKV/RoPE geometry or dtype")
++        if any(block.decoder.self_attn.q_norm.eps is None
++               or block.decoder.self_attn.q_norm.eps != block.decoder.self_attn.k_norm.eps
++               for block in heads.blocks):
++            raise ValueError("MTP Triton QKV/RoPE requires equal explicit Q/K norm epsilon")
++        fused_op = fused_op if fused_op is not None else _joint_operator()
++        if not callable(fused_op):
++            raise ValueError("MTP Triton split QKV RMSNorm MRoPE operator is unavailable")
++        _validate_joint_signature(fused_op)
++    return QKVRope(heads, max_context, backend, native_ops, fused_op)
+--- /dev/null
++++ b/vllm_ascend/spec_decode/asr_mtp_row_copy.py
+@@ -0,0 +1,97 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Startup-selected sparse auxiliary row writes, without destination scans.
++
++The caller guarantees unique, in-range addresses, including distinct padding
++sinks. Only tensor metadata is checked on the host. No per-row device reads,
++destination clone/initialization, synchronization, or runtime exception fallback
++is added. Warm this writer through the existing profile/capture preparation.
++"""
++
++import importlib
++
++import torch
++
++
++def _geometry(cache, addresses, updates):
++    if (
++        cache.ndim != 2
++        or updates.ndim != 2
++        or cache.shape[1] != updates.shape[1]
++        or cache.shape[1] < 1
++        or addresses.ndim not in (1, 2)
++        or (addresses.ndim == 2 and addresses.shape[1] != 1)
++        or addresses.numel() != updates.shape[0]
++        or addresses.dtype not in (torch.int32, torch.int64)
++        or updates.dtype != cache.dtype
++        or updates.device != cache.device
++        or addresses.device != cache.device
++        or not all(value.is_contiguous() for value in (cache, addresses, updates))
++    ):
++        raise ValueError(
++            "MTP row writer requires aligned contiguous cache/addresses/updates"
++        )
++    return updates.shape[0], updates.shape[1]
++
++
++def _load_triton_writer():
++    utilities = importlib.import_module("vllm.triton_utils")
++    if not getattr(utilities, "HAS_TRITON", False):
++        raise ImportError("vLLM Triton backend is unavailable")
++    name = ".asr_mtp_row_copy_kernel" if __package__ else "asr_mtp_row_copy_kernel"
++    implementation = importlib.import_module(name, package=__package__ or None)
++    kernel, triton = implementation.row_copy_kernel, utilities.triton
++
++    def write(cache, addresses, updates):
++        rows, width = _geometry(cache, addresses, updates)
++        if not rows:
++            return
++        columns = triton.next_power_of_2(width)
++        tile_rows = max(1, min(16, 4096 // columns))
++        kernel[(triton.cdiv(rows, tile_rows),)](
++            cache,
++            addresses,
++            updates,
++            ROWS=rows,
++            WIDTH=width,
++            DEST_ROWS=cache.shape[0],
++            BLOCK_ROWS=tile_rows,
++            BLOCK_COLS=columns,
++        )
++
++    return write
++
++
++def prepare_row_writer(device, *, backend="auto"):
++    """Return ``(writer, name)``; CPU keeps the caller's index_copy_ reference.
++
++    ``auto`` selects Triton if it can be imported, otherwise the old NPU API.
++    Explicit ``triton`` fails at startup when unavailable. Import selection is
++    performed once, not inside the writer or graph replay. A runtime/JIT error
++    propagates instead of silently switching semantics or adding synchronization.
++    """
++    if backend not in ("auto", "triton", "scatter_nd"):
++        raise ValueError("MTP row write backend must be auto, triton or scatter_nd")
++    kind = device.split(":", 1)[0] if isinstance(device, str) else device.type
++    if kind == "cpu":
++        return None, "index_copy"
++    if kind != "npu":
++        raise ValueError("MTP row writer requires a CPU or NPU device")
++    if backend != "scatter_nd":
++        try:
++            return _load_triton_writer(), "triton"
++        except ImportError as error:
++            if backend == "triton":
++                raise RuntimeError("MTP triton row writer is unavailable") from error
++    api = importlib.import_module("torch_npu")
++    operation = getattr(api, "npu_scatter_nd_update_", None)
++    if operation is None:
++        raise RuntimeError("MTP ScatterNd row writer is unavailable")
++    if not callable(operation):
++        raise TypeError("MTP ScatterNd row writer API must be callable")
++
++    def write(cache, addresses, updates):
++        rows, _ = _geometry(cache, addresses, updates)
++        if rows:
++            operation(cache, addresses.reshape(-1, 1), updates)
++
++    return write, "scatter_nd"
+--- /dev/null
++++ b/vllm_ascend/spec_decode/asr_mtp_row_copy_kernel.py
+@@ -0,0 +1,26 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Sparse row-copy kernel imported only by the NPU startup writer factory."""
++
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def row_copy_kernel(
++    cache,
++    addresses,
++    updates,
++    ROWS: tl.constexpr,
++    WIDTH: tl.constexpr,
++    DEST_ROWS: tl.constexpr,
++    BLOCK_ROWS: tl.constexpr,
++    BLOCK_COLS: tl.constexpr,
++):
++    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
++    column = tl.arange(0, BLOCK_COLS)
++    destination = tl.load(addresses + row, mask=row < ROWS, other=0).to(tl.int64)
++    valid = (row[:, None] < ROWS) & (column[None, :] < WIDTH)
++    value = tl.load(
++        updates + row[:, None] * WIDTH + column[None, :], mask=valid, other=0
++    )
++    valid = valid & (destination[:, None] >= 0) & (destination[:, None] < DEST_ROWS)
++    tl.store(cache + destination[:, None] * WIDTH + column[None, :], value, mask=valid)
+--- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_graph.py
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,571 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Bounded, independent auxiliary graphs; target forward/verification is untouched."""
 +
@@ -470,11 +821,13 @@
 +from torch.nn import functional as F
 +
 +try:
-+    from .asr_mtp_fused import add_rms_norm, project_qkv
-+    from .asr_mtp_heads import rotate_half
++    from .asr_mtp_fused import add_rms_norm
++    from .asr_mtp_heads import project_norm_rope
++    from .asr_mtp_row_copy import prepare_row_writer
 +except ImportError:
-+    from asr_mtp_fused import add_rms_norm, project_qkv
-+    from asr_mtp_heads import rotate_half
++    from asr_mtp_fused import add_rms_norm
++    from asr_mtp_heads import project_norm_rope
++    from asr_mtp_row_copy import prepare_row_writer
 +
 +logger = logging.getLogger(__name__)
 +MAX_MTP_GRAPHS = 64
@@ -499,6 +852,7 @@
 +    context: int
 +    tokens: tuple[int, ...] = ()
 +    profile_stages: bool = False
++    row_write_backend: str = "auto"
 +
 +    def scratch_elements(self, config):
 +        # A positive dummy query must cover the full non-PA TND KV tail even
@@ -512,6 +866,9 @@
 +
 +
 +def graph_options(settings, *, context, slots, max_batch):
++    row_write_backend = settings.get("row_write_backend", "auto")
++    if row_write_backend not in ("auto", "triton", "scatter_nd"):
++        raise ValueError("asr_mtp.row_write_backend must be auto, triton or scatter_nd")
 +    profile_stages = settings.get("profile_stages", False)
 +    if type(profile_stages) is not bool:
 +        raise ValueError("asr_mtp.profile_stages must be a bool")
@@ -546,7 +903,9 @@
 +            raise ValueError(
 +                f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}"
 +            )
-+        return GraphOptions(batch, (), capacity, tokens, profile_stages)
++        return GraphOptions(
++            batch, (), capacity, tokens, profile_stages, row_write_backend
++        )
 +    queries = settings.get("graph_query_sizes", (min(8, capacity), min(64, capacity)))
 +    if (
 +        not isinstance(queries, (list, tuple))
@@ -559,7 +918,13 @@
 +    queries = tuple(sorted(set(queries)))
 +    if batch * len(queries) > MAX_MTP_GRAPHS:
 +        raise ValueError(f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}")
-+    return GraphOptions(batch, queries, capacity, profile_stages=profile_stages)
++    return GraphOptions(
++        batch,
++        queries,
++        capacity,
++        profile_stages=profile_stages,
++        row_write_backend=row_write_backend,
++    )
 +
 +
 +class FixedMTPProgram:
@@ -572,7 +937,16 @@
 +    """
 +
 +    def __init__(
-+        self, heads, arena, embedding, logits, *, batch_size, query_size, context_size
++        self,
++        heads,
++        arena,
++        embedding,
++        logits,
++        *,
++        batch_size,
++        query_size,
++        context_size,
++        row_write_backend="auto",
 +    ):
 +        cfg = heads.config
 +        if not 0 < query_size <= context_size <= arena.max_context:
@@ -595,13 +969,9 @@
 +        self.row_width = gcd(cfg.hidden_size, cfg.head_dim)
 +        row_elements = arena.graph_storage.numel() // self.row_width * self.row_width
 +        self.cache_rows = arena.graph_storage[:row_elements].view(-1, self.row_width)
-+        self.npu_row_update = None
-+        if device.type == "npu":
-+            import torch_npu
-+
-+            self.npu_row_update = getattr(torch_npu, "npu_scatter_nd_update_", None)
-+            if self.npu_row_update is None:
-+                raise ValueError("MTP graphs require torch_npu.npu_scatter_nd_update_")
++        self.npu_row_update, self.row_write_backend = prepare_row_writer(
++            device, backend=row_write_backend
++        )
 +        self.metadata = torch.zeros(
 +            (batch_size, 3 + heads.num_heads + context_size + heads.num_heads + 1),
 +            device=device,
@@ -757,25 +1127,10 @@
 +            )
 +            normed = block.decoder.input_layernorm(fused)
 +            attn = block.decoder.self_attn
-+            q_raw, k_raw, v_raw = project_qkv(attn, normed)
-+            q = attn.q_norm(
-+                q_raw.view(
-+                    self.batch, self.queries, cfg.num_attention_heads, cfg.head_dim
-+                )
-+            ).transpose(1, 2)
-+            k = attn.k_norm(
-+                k_raw.view(
-+                    self.batch, self.queries, cfg.num_key_value_heads, cfg.head_dim
-+                )
-+            ).transpose(1, 2)
-+            v = v_raw.view(
-+                self.batch, self.queries, cfg.num_key_value_heads, cfg.head_dim
-+            ).transpose(1, 2)
-+            frequencies = (anchors + depth).float().unsqueeze(-1) * self.inverse
-+            angles = torch.cat((frequencies, frequencies), -1)
-+            cos = angles.cos().to(fused.dtype)[:, None]
-+            sin = angles.sin().to(fused.dtype)[:, None]
-+            q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
++            q, k, v = project_norm_rope(
++                self.heads, attn, normed, anchors, depth, self.inverse, cap
++            )
++            q, k, v = (part.transpose(1, 2) for part in (q, k, v))
 +            hidden_base = (
 +                base + hidden_width + (depth - 1) * (hidden_width + 2 * kv_width)
 +            )
@@ -934,6 +1289,9 @@
 +                        batch_size=count,
 +                        query_size=queries,
 +                        context_size=self.options.context,
++                        row_write_backend=getattr(
++                            self.options, "row_write_backend", "auto"
++                        ),
 +                    )
 +                    program.stage(
 +                        warm,
@@ -955,13 +1313,14 @@
 +            self.reserved_bytes = max(0, torch.npu.memory_reserved() - reserved_before)
 +        logger.info(
 +            "ASR_MTP_GRAPH_READY graphs=%d max_batch=%d query_sizes=%s context=%d "
-+            "capture_ms=%.2f reserved_mib=%.2f",
++            "capture_ms=%.2f reserved_mib=%.2f row_write_backend=%s",
 +            len(self.entries),
 +            self.options.max_batch,
 +            self.options.queries,
 +            self.options.context,
 +            (perf_counter() - start_time) * 1000,
 +            self.reserved_bytes / 1024**2,
++            next(iter(self.entries.values()))[0].row_write_backend,
 +        )
 +
 +    @torch.inference_mode()
@@ -1400,12 +1759,14 @@
 +import torch
 +
 +try:
-+    from .asr_mtp_fused import add_rms_norm, project_qkv
-+    from .asr_mtp_heads import rotate_half
++    from .asr_mtp_fused import add_rms_norm
++    from .asr_mtp_heads import project_norm_rope
++    from .asr_mtp_row_copy import prepare_row_writer
 +    from .asr_mtp_token_attention import PackedAttention, PackedNPUCapture
 +except ImportError:
-+    from asr_mtp_fused import add_rms_norm, project_qkv
-+    from asr_mtp_heads import rotate_half
++    from asr_mtp_fused import add_rms_norm
++    from asr_mtp_heads import project_norm_rope
++    from asr_mtp_row_copy import prepare_row_writer
 +    from asr_mtp_token_attention import PackedAttention, PackedNPUCapture
 +
 +logger = logging.getLogger(__name__)
@@ -1432,7 +1793,16 @@
 +    """
 +
 +    def __init__(
-+        self, heads, arena, embedding, logits, *, max_batch, token_size, context_size
++        self,
++        heads,
++        arena,
++        embedding,
++        logits,
++        *,
++        max_batch,
++        token_size,
++        context_size,
++        row_write_backend="auto",
 +    ):
 +        cfg = heads.config
 +        if (
@@ -1464,13 +1834,9 @@
 +        row_elements = arena.graph_storage.numel() // self.row_width * self.row_width
 +        self.cache_rows = arena.graph_storage[:row_elements].view(-1, self.row_width)
 +        device, dtype = arena.storage.device, arena.storage.dtype
-+        self.npu_row_update = None
-+        if device.type == "npu":
-+            import torch_npu
-+
-+            self.npu_row_update = getattr(torch_npu, "npu_scatter_nd_update_", None)
-+            if self.npu_row_update is None:
-+                raise ValueError("MTP graphs require torch_npu.npu_scatter_nd_update_")
++        self.npu_row_update, self.row_write_backend = prepare_row_writer(
++            device, backend=row_write_backend
++        )
 +        count, requests = heads.num_heads, max_batch + 1
 +        self.sequence_width = context_size + count + 1
 +        size = 5 * count * requests + 3 * requests + requests * self.sequence_width
@@ -1725,21 +2091,9 @@
 +            )
 +            normed = block.decoder.input_layernorm(fused)
 +            attn = block.decoder.self_attn
-+            q_raw, k_raw, v_raw = project_qkv(attn, normed)
-+            q = attn.q_norm(
-+                q_raw.view(self.query_capacity, cfg.num_attention_heads, cfg.head_dim)
++            q, k, v = project_norm_rope(
++                self.heads, attn, normed, anchor, depth, self.inverse, cap
 +            )
-+            k = attn.k_norm(
-+                k_raw.view(self.query_capacity, cfg.num_key_value_heads, cfg.head_dim)
-+            )
-+            v = v_raw.view(self.query_capacity, cfg.num_key_value_heads, cfg.head_dim)
-+            frequencies = (anchor + depth).float().unsqueeze(-1) * self.inverse
-+            angles = torch.cat((frequencies, frequencies), -1)
-+            cos, sin = (
-+                angles.cos().to(fused.dtype)[:, None],
-+                angles.sin().to(fused.dtype)[:, None],
-+            )
-+            q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
 +            hidden_base = base + hidden_width + d * (hidden_width + 2 * kv_width)
 +            if self.paged_kv:
 +                slot = self.slots.index_select(0, request)
@@ -1885,6 +2239,9 @@
 +                    max_batch=self.options.max_batch,
 +                    token_size=tokens,
 +                    context_size=self.options.context,
++                    row_write_backend=getattr(
++                        self.options, "row_write_backend", "auto"
++                    ),
 +                )
 +                program.profile_stages = getattr(self.options, "profile_stages", False)
 +                program.stage(
@@ -1904,7 +2261,8 @@
 +            self.reserved_bytes = max(0, torch.npu.memory_reserved() - reserved)
 +        logger.info(
 +            "ASR_MTP_GRAPH_READY layout=tokens graphs=%d max_batch=%d token_sizes=%s "
-+            "query_capacities=%s context=%d capture_ms=%.2f reserved_mib=%.2f",
++            "query_capacities=%s context=%d capture_ms=%.2f reserved_mib=%.2f "
++            "row_write_backend=%s",
 +            len(self.entries),
 +            self.options.max_batch,
 +            self.options.tokens,
@@ -1912,6 +2270,7 @@
 +            self.options.context,
 +            (perf_counter() - started) * 1000,
 +            self.reserved_bytes / 1024**2,
++            next(iter(self.entries.values()))[0].row_write_backend,
 +        )
 +
 +    @torch.inference_mode()
@@ -2328,7 +2687,7 @@
 +        return result
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_worker.py
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,461 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Worker-local external draft -> MTP handoff for the v0.23 sync runner."""
 +import hashlib
@@ -2673,12 +3032,19 @@
 +               'verify_base_signature', 'graph_mode', 'graph_context_tokens',
 +               'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size',
 +               'native_fusion', 'profile_stages', 'kv_cache_backend',
-+               'kv_block_size', 'kv_write_backend'}
++               'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend'}
 +    if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
 +        raise ValueError('invalid additional_config.asr_mtp settings')
 +    for name, default in (('native_fusion', True), ('profile_stages', False)):
 +        if type(settings.get(name, default)) is not bool:
 +            raise ValueError(f'asr_mtp.{name} must be a bool')
++    qkv_rope_backend = settings.get('qkv_rope_backend', 'auto')
++    if qkv_rope_backend not in ('auto', 'torch', 'native', 'triton'):
++        raise ValueError('asr_mtp.qkv_rope_backend must be auto, torch, native or triton')
++    if not settings.get('native_fusion', True) and qkv_rope_backend in ('native', 'triton'):
++        raise ValueError('asr_mtp.qkv_rope_backend requires native_fusion=True')
++    if settings.get('row_write_backend', 'auto') not in ('auto', 'triton', 'scatter_nd'):
++        raise ValueError('asr_mtp.row_write_backend must be auto, triton or scatter_nd')
 +    kv_backend = settings.get('kv_cache_backend', 'tnd')
 +    if kv_backend not in ('tnd', 'paged'):
 +        raise ValueError('asr_mtp.kv_cache_backend must be tnd or paged')
@@ -2715,6 +3081,12 @@
 +    model = model.to(device=runner.device, dtype=runner.dtype).eval().requires_grad_(False)
 +    native_fusion = prepare_fused_heads(model, enabled=settings.get('native_fusion', True))
 +    cap = settings.get('max_context_tokens', 512)
++    if native_fusion:
++        try:
++            from .asr_mtp_qkv_rope import prepare_qkv_rope
++        except ImportError:
++            from asr_mtp_qkv_rope import prepare_qkv_rope
++        model.qkv_rope = prepare_qkv_rope(model, max_context=cap, backend=qkv_rope_backend)
 +    arena_class, arena_kwargs = CacheArena, {}
 +    fixed_elements = 0
 +    slot_elements = CacheArena.elements_per_position(text, heads) * cap
@@ -2763,7 +3135,8 @@
 +                       eos, graphs=graphs, profile_stages=settings.get('profile_stages', False))
 +    logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
 +                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s '
-+                'native_fusion=%s profile_stages=%s kv_cache_backend=%s kv_write_backend=%s',
++                'native_fusion=%s profile_stages=%s kv_cache_backend=%s kv_write_backend=%s '
++                'qkv_rope_backend=%s row_write_backend=%s',
 +                heads, cap, slots, getattr(arena, 'cache_bytes',
 +                    arena.storage.numel() * arena.storage.element_size()) / 1024 ** 2,
 +                settings['checkpoint'], settings.get('verify_base_signature', False),
@@ -2772,7 +3145,9 @@
 +                arena.storage.element_size() / 1024 ** 2,
 +                'tokens' if options is not None and options.tokens else 'rectangular',
 +                native_fusion, settings.get('profile_stages', False), kv_backend,
-+                getattr(arena, 'write_backend', 'separate_scatter_nd'))
++                getattr(arena, 'write_backend', 'separate_scatter_nd'),
++                model.qkv_rope.backend if native_fusion else 'legacy',
++                settings.get('row_write_backend', 'auto'))
 +    return worker
 --- /dev/null
 +++ b/vllm_ascend/patch/worker/patch_external_draft_mtp.py

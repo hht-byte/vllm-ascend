@@ -402,9 +402,16 @@ class EngineHeadsTests(unittest.TestCase):
             self.assertEqual(worker.arena.storage.shape[0], 2)
             self.assertIs(worker.embedding, self.embed)
             self.assertTrue(worker.heads._mtp_fused_prepared)
+            self.assertEqual(worker.heads.qkv_rope.backend, 'torch')
             self.assertFalse(worker.profile_stages)
             unfused = load_worker(runner, target, {**settings, 'native_fusion': False})
             self.assertFalse(getattr(unfused.heads, '_mtp_fused_prepared', False))
+            self.assertIsNone(getattr(unfused.heads, 'qkv_rope', None))
+            for option in ('native', 'triton'):
+                with self.assertRaisesRegex(ValueError, 'native_fusion'):
+                    load_worker(runner, target, {
+                        **settings, 'native_fusion': False, 'qkv_rope_backend': option,
+                    })
             timed = load_worker(runner, target, {**settings, 'profile_stages': True})
             self.assertTrue(timed.profile_stages)
             for name in ('native_fusion', 'profile_stages'):
@@ -413,10 +420,12 @@ class EngineHeadsTests(unittest.TestCase):
             packed = load_worker(runner, target, {
                 **settings, 'graph_mode': 'full', 'graph_context_tokens': 16,
                 'graph_token_sizes': [8, 32, 64], 'profile_stages': True,
+                'row_write_backend': 'scatter_nd', 'qkv_rope_backend': 'torch',
             })
             self.assertEqual(type(packed.graphs).__name__, 'TokenMTPGraphs')
             self.assertEqual(packed.graphs.options.tokens, (8, 32, 64))
             self.assertTrue(packed.graphs.options.profile_stages)
+            self.assertEqual(packed.graphs.options.row_write_backend, 'scatter_nd')
             self.assertEqual(packed.arena.graph_storage.numel() - packed.arena.scratch_offset, 520)
             self.assertFalse(packed.graphs.ready)
             paged = load_worker(runner, target, {
@@ -431,6 +440,8 @@ class EngineHeadsTests(unittest.TestCase):
             for overrides in ({'graph_mode': 'off'}, {'graph_token_sizes': []},
                               {'kv_block_size': 64}, {'kv_write_backend': 'unknown'},
                               {'kv_cache_backend': 'unknown'},
+                              {'qkv_rope_backend': 'unknown'},
+                              {'row_write_backend': 'unknown'},
                               {'graph_token_sizes': [1000000]}):
                 with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                     load_worker(runner, target, {

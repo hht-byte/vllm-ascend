@@ -10,11 +10,22 @@ from test_asr_mtp_token_graph import PackedFixture
 class FusionPathChecks:
     def check_path(self, *, eager=False):
         from asr_mtp_fused import prepare_fused_heads
+        from asr_mtp_qkv_rope import prepare_qkv_rope
         from torch.nn import functional as F
 
         model = self.eager if eager else self.fixed
         model.requires_grad_(False)
         prepare_fused_heads(model)
+        prepared = prepare_qkv_rope(
+            model, max_context=self.new.max_context, backend="torch"
+        )
+        selected = []
+
+        def qkv_rope(attn, normed, positions):
+            selected.append(positions.shape)
+            return prepared(attn, normed, positions)
+
+        model.qkv_rope = qkv_rope
         rows = [row + [4] for row in self.ids]
         limits = [3] * len(rows)
         with (
@@ -31,6 +42,7 @@ class FusionPathChecks:
                 self.program.commit(self.b, limits)
         # Fusion + packed QKV + O + packed gate/up + down + LM head.
         self.assertEqual(linear.call_count, 6 * model.num_heads)
+        self.assertEqual(len(selected), model.num_heads)
         with self.t.inference_mode():
             if eager:
                 self.program.stage(self.b, rows, limits)

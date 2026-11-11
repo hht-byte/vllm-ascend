@@ -11,11 +11,13 @@ import torch
 from torch.nn import functional as F
 
 try:
-    from .asr_mtp_fused import add_rms_norm, project_qkv
-    from .asr_mtp_heads import rotate_half
+    from .asr_mtp_fused import add_rms_norm
+    from .asr_mtp_heads import project_norm_rope
+    from .asr_mtp_row_copy import prepare_row_writer
 except ImportError:
-    from asr_mtp_fused import add_rms_norm, project_qkv
-    from asr_mtp_heads import rotate_half
+    from asr_mtp_fused import add_rms_norm
+    from asr_mtp_heads import project_norm_rope
+    from asr_mtp_row_copy import prepare_row_writer
 
 logger = logging.getLogger(__name__)
 MAX_MTP_GRAPHS = 64
@@ -40,6 +42,7 @@ class GraphOptions:
     context: int
     tokens: tuple[int, ...] = ()
     profile_stages: bool = False
+    row_write_backend: str = "auto"
 
     def scratch_elements(self, config):
         # A positive dummy query must cover the full non-PA TND KV tail even
@@ -53,6 +56,9 @@ class GraphOptions:
 
 
 def graph_options(settings, *, context, slots, max_batch):
+    row_write_backend = settings.get("row_write_backend", "auto")
+    if row_write_backend not in ("auto", "triton", "scatter_nd"):
+        raise ValueError("asr_mtp.row_write_backend must be auto, triton or scatter_nd")
     profile_stages = settings.get("profile_stages", False)
     if type(profile_stages) is not bool:
         raise ValueError("asr_mtp.profile_stages must be a bool")
@@ -87,7 +93,9 @@ def graph_options(settings, *, context, slots, max_batch):
             raise ValueError(
                 f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}"
             )
-        return GraphOptions(batch, (), capacity, tokens, profile_stages)
+        return GraphOptions(
+            batch, (), capacity, tokens, profile_stages, row_write_backend
+        )
     queries = settings.get("graph_query_sizes", (min(8, capacity), min(64, capacity)))
     if (
         not isinstance(queries, (list, tuple))
@@ -100,7 +108,13 @@ def graph_options(settings, *, context, slots, max_batch):
     queries = tuple(sorted(set(queries)))
     if batch * len(queries) > MAX_MTP_GRAPHS:
         raise ValueError(f"asr_mtp graph count must be between 1 and {MAX_MTP_GRAPHS}")
-    return GraphOptions(batch, queries, capacity, profile_stages=profile_stages)
+    return GraphOptions(
+        batch,
+        queries,
+        capacity,
+        profile_stages=profile_stages,
+        row_write_backend=row_write_backend,
+    )
 
 
 class FixedMTPProgram:
@@ -113,7 +127,16 @@ class FixedMTPProgram:
     """
 
     def __init__(
-        self, heads, arena, embedding, logits, *, batch_size, query_size, context_size
+        self,
+        heads,
+        arena,
+        embedding,
+        logits,
+        *,
+        batch_size,
+        query_size,
+        context_size,
+        row_write_backend="auto",
     ):
         cfg = heads.config
         if not 0 < query_size <= context_size <= arena.max_context:
@@ -136,13 +159,9 @@ class FixedMTPProgram:
         self.row_width = gcd(cfg.hidden_size, cfg.head_dim)
         row_elements = arena.graph_storage.numel() // self.row_width * self.row_width
         self.cache_rows = arena.graph_storage[:row_elements].view(-1, self.row_width)
-        self.npu_row_update = None
-        if device.type == "npu":
-            import torch_npu
-
-            self.npu_row_update = getattr(torch_npu, "npu_scatter_nd_update_", None)
-            if self.npu_row_update is None:
-                raise ValueError("MTP graphs require torch_npu.npu_scatter_nd_update_")
+        self.npu_row_update, self.row_write_backend = prepare_row_writer(
+            device, backend=row_write_backend
+        )
         self.metadata = torch.zeros(
             (batch_size, 3 + heads.num_heads + context_size + heads.num_heads + 1),
             device=device,
@@ -298,25 +317,10 @@ class FixedMTPProgram:
             )
             normed = block.decoder.input_layernorm(fused)
             attn = block.decoder.self_attn
-            q_raw, k_raw, v_raw = project_qkv(attn, normed)
-            q = attn.q_norm(
-                q_raw.view(
-                    self.batch, self.queries, cfg.num_attention_heads, cfg.head_dim
-                )
-            ).transpose(1, 2)
-            k = attn.k_norm(
-                k_raw.view(
-                    self.batch, self.queries, cfg.num_key_value_heads, cfg.head_dim
-                )
-            ).transpose(1, 2)
-            v = v_raw.view(
-                self.batch, self.queries, cfg.num_key_value_heads, cfg.head_dim
-            ).transpose(1, 2)
-            frequencies = (anchors + depth).float().unsqueeze(-1) * self.inverse
-            angles = torch.cat((frequencies, frequencies), -1)
-            cos = angles.cos().to(fused.dtype)[:, None]
-            sin = angles.sin().to(fused.dtype)[:, None]
-            q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
+            q, k, v = project_norm_rope(
+                self.heads, attn, normed, anchors, depth, self.inverse, cap
+            )
+            q, k, v = (part.transpose(1, 2) for part in (q, k, v))
             hidden_base = (
                 base + hidden_width + (depth - 1) * (hidden_width + 2 * kv_width)
             )
@@ -475,6 +479,9 @@ class MTPGraphs:
                         batch_size=count,
                         query_size=queries,
                         context_size=self.options.context,
+                        row_write_backend=getattr(
+                            self.options, "row_write_backend", "auto"
+                        ),
                     )
                     program.stage(
                         warm,
@@ -496,13 +503,14 @@ class MTPGraphs:
             self.reserved_bytes = max(0, torch.npu.memory_reserved() - reserved_before)
         logger.info(
             "ASR_MTP_GRAPH_READY graphs=%d max_batch=%d query_sizes=%s context=%d "
-            "capture_ms=%.2f reserved_mib=%.2f",
+            "capture_ms=%.2f reserved_mib=%.2f row_write_backend=%s",
             len(self.entries),
             self.options.max_batch,
             self.options.queries,
             self.options.context,
             (perf_counter() - start_time) * 1000,
             self.reserved_bytes / 1024**2,
+            next(iter(self.entries.values()))[0].row_write_backend,
         )
 
     @torch.inference_mode()

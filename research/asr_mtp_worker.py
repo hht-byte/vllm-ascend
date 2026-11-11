@@ -342,12 +342,19 @@ def load_worker(runner, target, settings):
                'verify_base_signature', 'graph_mode', 'graph_context_tokens',
                'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size',
                'native_fusion', 'profile_stages', 'kv_cache_backend',
-               'kv_block_size', 'kv_write_backend'}
+               'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend'}
     if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
         raise ValueError('invalid additional_config.asr_mtp settings')
     for name, default in (('native_fusion', True), ('profile_stages', False)):
         if type(settings.get(name, default)) is not bool:
             raise ValueError(f'asr_mtp.{name} must be a bool')
+    qkv_rope_backend = settings.get('qkv_rope_backend', 'auto')
+    if qkv_rope_backend not in ('auto', 'torch', 'native', 'triton'):
+        raise ValueError('asr_mtp.qkv_rope_backend must be auto, torch, native or triton')
+    if not settings.get('native_fusion', True) and qkv_rope_backend in ('native', 'triton'):
+        raise ValueError('asr_mtp.qkv_rope_backend requires native_fusion=True')
+    if settings.get('row_write_backend', 'auto') not in ('auto', 'triton', 'scatter_nd'):
+        raise ValueError('asr_mtp.row_write_backend must be auto, triton or scatter_nd')
     kv_backend = settings.get('kv_cache_backend', 'tnd')
     if kv_backend not in ('tnd', 'paged'):
         raise ValueError('asr_mtp.kv_cache_backend must be tnd or paged')
@@ -384,6 +391,12 @@ def load_worker(runner, target, settings):
     model = model.to(device=runner.device, dtype=runner.dtype).eval().requires_grad_(False)
     native_fusion = prepare_fused_heads(model, enabled=settings.get('native_fusion', True))
     cap = settings.get('max_context_tokens', 512)
+    if native_fusion:
+        try:
+            from .asr_mtp_qkv_rope import prepare_qkv_rope
+        except ImportError:
+            from asr_mtp_qkv_rope import prepare_qkv_rope
+        model.qkv_rope = prepare_qkv_rope(model, max_context=cap, backend=qkv_rope_backend)
     arena_class, arena_kwargs = CacheArena, {}
     fixed_elements = 0
     slot_elements = CacheArena.elements_per_position(text, heads) * cap
@@ -432,7 +445,8 @@ def load_worker(runner, target, settings):
                        eos, graphs=graphs, profile_stages=settings.get('profile_stages', False))
     logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
                 'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s '
-                'native_fusion=%s profile_stages=%s kv_cache_backend=%s kv_write_backend=%s',
+                'native_fusion=%s profile_stages=%s kv_cache_backend=%s kv_write_backend=%s '
+                'qkv_rope_backend=%s row_write_backend=%s',
                 heads, cap, slots, getattr(arena, 'cache_bytes',
                     arena.storage.numel() * arena.storage.element_size()) / 1024 ** 2,
                 settings['checkpoint'], settings.get('verify_base_signature', False),
@@ -441,5 +455,7 @@ def load_worker(runner, target, settings):
                 arena.storage.element_size() / 1024 ** 2,
                 'tokens' if options is not None and options.tokens else 'rectangular',
                 native_fusion, settings.get('profile_stages', False), kv_backend,
-                getattr(arena, 'write_backend', 'separate_scatter_nd'))
+                getattr(arena, 'write_backend', 'separate_scatter_nd'),
+                model.qkv_rope.backend if native_fusion else 'legacy',
+                settings.get('row_write_backend', 'auto'))
     return worker
