@@ -25,6 +25,53 @@ def graph_inputs(support='ALWAYS'):
 
 
 class WorkerPatchTests(unittest.TestCase):
+    def test_graph_capture_precedes_original_profile_and_is_reserved_once(self):
+        runner, namespace = self.graph_runner()
+        events = []
+        graphs = SimpleNamespace(ready=False, reserved_bytes=200, allocated_bytes=160)
+
+        def prepare():
+            events.append('capture')
+            graphs.ready = True
+
+        graphs.prepare = prepare
+        runner.drafter.online = SimpleNamespace(graphs=graphs)
+
+        class Worker:
+            def determine_available_memory(self):
+                events.append('profile')
+                if not graphs.ready:
+                    raise AssertionError('graphs must be resident before target activation profiling')
+                self.available_kv_cache_memory_bytes = 1000
+                return 1000
+
+        namespace['install_worker_memory_hook'](Worker)
+        worker = Worker()
+        worker.model_runner = runner
+        worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=None)
+        self.assertEqual(worker.determine_available_memory(), 800)
+        self.assertEqual(worker.available_kv_cache_memory_bytes, 800)
+        self.assertEqual(events, ['capture', 'profile'])
+        self.assertEqual(worker.determine_available_memory(), 800)
+        self.assertEqual(events, ['capture', 'profile', 'profile'])
+
+    def test_remaining_pool_reservation_still_rejects_insufficient_budget(self):
+        runner, namespace = self.graph_runner()
+        graphs = SimpleNamespace(ready=True, reserved_bytes=200, allocated_bytes=160)
+        runner.drafter.online = SimpleNamespace(graphs=graphs)
+
+        class Worker:
+            def determine_available_memory(self):
+                graphs.ready = True
+                return 30
+
+        namespace['install_worker_memory_hook'](Worker)
+        worker = Worker()
+        worker.model_runner = runner
+        worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=None)
+        with self.assertRaisesRegex(ValueError, 'graph'):
+            worker.determine_available_memory()
+
     def test_auxiliary_graph_reservation_reduces_only_automatic_kv_budget(self):
         runner, namespace = self.graph_runner()
         graphs = SimpleNamespace(ready=True, reserved_bytes=200)
@@ -95,7 +142,7 @@ class WorkerPatchTests(unittest.TestCase):
                    runner_module.__name__: runner_module}
         namespace = {'__name__': 'isolated_mtp_patch'}
         with patch.dict(sys.modules, modules):
-            exec(Path(__file__).with_name('patch_external_draft_mtp.py').read_text(encoding='utf-8'), namespace)
+            exec(Path(__file__).with_name('patch_external_draft_mtp.py').read_text(encoding='utf-8'), namespace)  # noqa: S102
         return Runner, namespace
 
     def graph_runner(self, *, mtp=True, mode='FULL'):

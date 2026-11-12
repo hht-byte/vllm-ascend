@@ -139,14 +139,22 @@ git apply examples/910b/asr_mtp_cache_rows_v023.patch
 
 该补丁只升级 MTP 图模块，不增加启动参数。完整新安装补丁和累计图升级补丁已经包含此改动，不要再叠加聚焦升级；旧版模块不同则对实际安装目录重新导出。按原流程重启 worker 后生效。
 
-显存：先捕获，再运行最坏 eager profile。worker 的启动计量额外从自动 KV 预算扣除捕获前后保留的 reserved memory 增量，包含私有图池和静态缓冲；这是保守预留，部分静态缓冲可能已计入 activation peak，因此可用 KV 会略少。`cache_mib` 不包含该图池、scratch 和辅助权重。显式指定 `kv_cache_memory_bytes` 时保留用户手工预算，需自行为图池留出空间。捕获失败直接报启动错误；运行时图已执行部分操作后不会冒险重试 eager。
+显存：启动 memory hook 先捕获 MTP 图，再进入原始目标模型 profiling 上下文。
+这样 profiling 的基线已包含常驻图张量，activation peak 增量测量图常驻时的运行激活；
+结束后再从自动 KV 预算单独扣除一次完整图池 reserved 增量（含静态缓冲和私有池空闲段）。
+旧版在 profiling 内捕获图，静态张量既进入峰值增量，又被整笔 reserved 预留重复扣减，
+在 3/5 两套图时可能触发虚假的预算不足。仅去掉内存检查、或减掉 live allocated 后继续使用
+旧顺序都不可靠，因为目标模型先前的激活峰值未必与图张量同时存在。
+`cache_mib` 不包含该图池、scratch 和辅助权重。显式指定 `kv_cache_memory_bytes` 时保留
+用户手工预算，需自行为图池留出空间。捕获失败直接报启动错误；运行时图已执行部分操作后
+不会冒险重试 eager。
 
 启动和首次实际命中应看到：
 
 ```text
 ASR_MTP_CONFIG ... graph_mode=full graph_scratch_mib=...
 ASR_MTP_GRAPH_READY graphs=16 ... reserved_mib=...
-ASR_MTP_GRAPH_MEMORY reserved_mib=... manual_kv=False
+ASR_MTP_GRAPH_MEMORY reserved_mib=... allocated_mib=... capture_before_profile=True base_available_mib=... adjusted_available_mib=... manual_kv=False
 ASR_MTP_GRAPH_REPLAY batch=... query=... context=... heads=...
 ```
 
@@ -569,3 +577,28 @@ PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
 PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
   python -m unittest discover -s examples/910b/tests -p test_asr_mtp_token_graph.py -v
 ```
+
+## 图内存预算不足
+
+从已安装 cold/warm 版本更新显存计量，使用引擎交付目录的
+`asr_mtp_graph_memory_v023.patch`，包含两个图模块、worker 和启动 memory hook。
+其他累计安装路径也已包含修正；选择与实际安装版本匹配的一条，不叠加。
+
+```bash
+rg -n 'ASR_MTP_GRAPH_READY|ASR_MTP_GRAPH_MEMORY|Available KV cache memory' "$LOG"
+```
+
+`reserved_mib` 是图的实际 retained pool 预留，`allocated_mib` 是捕获新增的 live tensor
+分配。`base_available_mib` 是图已常驻后的原始 profiling 结果；自动预算使用
+`adjusted_available_mib = base_available_mib - reserved_mib`。结果仍不足则继续拒绝启动。
+这次修正不减少实际图内存，也不保证所有配置都能启动。
+
+例如用户日志 31 个 token 桶 × 两个深度 = 62 张图，占 15658 MiB（约 15.29 GiB）。
+若修正后实际容量仍不足，可先保留最大桶 1024、缩减中间档位试验：
+
+```python
+mtp_settings["graph_token_sizes"] = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
+```
+
+此时共 18 张图；实际显存变化不是按图数严格线性缩放，较粗桶会增加 padding，
+须比较同负载下的显存、接受长度和 commit 时延。

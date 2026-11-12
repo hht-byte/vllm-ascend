@@ -163,9 +163,9 @@ class MTPWorker:
             raise RuntimeError('MTP memory profiling must precede live requests')
         if self.profiled:
             return
-        # Graph buffers must already be resident when the eager fallback's
-        # activation peak is measured. Private pool reservation is accounted
-        # separately by the startup-only worker memory hook.
+        # The startup memory hook prepares these graphs before the outer target
+        # profiling interval. Keep direct profile() calls idempotent as well.
+        # Private pool reservation is accounted separately by that worker hook.
         if self.graphs is not None:
             self.graphs.prepare()
         before = self.heads.processed_positions, self.heads.reused_positions

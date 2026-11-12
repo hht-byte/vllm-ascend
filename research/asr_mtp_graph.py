@@ -462,6 +462,7 @@ class MTPGraphs:
         self.ready = False
         self.capture_backend = None
         self.reserved_bytes = 0
+        self.allocated_bytes = 0
 
     @torch.inference_mode()
     def prepare(self, capture=None):
@@ -479,6 +480,7 @@ class MTPGraphs:
             torch.npu.synchronize()
             torch.npu.empty_cache()
         reserved_before = torch.npu.memory_reserved() if is_npu else 0
+        allocated_before = torch.npu.memory_allocated() if is_npu else 0
         before = self.heads.processed_positions, self.heads.reused_positions
         start_time = perf_counter()
         self.arena.storage.zero_()
@@ -531,15 +533,19 @@ class MTPGraphs:
             # and graph buffers. Reserve their full delta conservatively.
             torch.npu.empty_cache()
             self.reserved_bytes = max(0, torch.npu.memory_reserved() - reserved_before)
+            self.allocated_bytes = max(
+                0, torch.npu.memory_allocated() - allocated_before
+            )
         logger.info(
             "ASR_MTP_GRAPH_READY graphs=%d max_batch=%d query_sizes=%s context=%d "
-            "capture_ms=%.2f reserved_mib=%.2f row_write_backend=%s head_counts=%s",
+            "capture_ms=%.2f reserved_mib=%.2f allocated_mib=%.2f row_write_backend=%s head_counts=%s",
             len(self.entries),
             self.options.max_batch,
             self.options.queries,
             self.options.context,
             (perf_counter() - start_time) * 1000,
             self.reserved_bytes / 1024**2,
+            self.allocated_bytes / 1024**2,
             next(iter(self.entries.values()))[0].row_write_backend,
             getattr(self.options, "head_counts", ()) or (self.heads.num_heads,),
         )

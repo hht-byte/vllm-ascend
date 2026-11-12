@@ -471,6 +471,7 @@ class TokenMTPGraphs:
         self.ready = False
         self.capture_backend = None
         self.reserved_bytes = 0
+        self.allocated_bytes = 0
 
     @torch.inference_mode()
     def prepare(self, capture=None):
@@ -488,6 +489,7 @@ class TokenMTPGraphs:
             torch.npu.synchronize()
             torch.npu.empty_cache()
         reserved = torch.npu.memory_reserved() if is_npu else 0
+        allocated = torch.npu.memory_allocated() if is_npu else 0
         before = self.heads.processed_positions, self.heads.reused_positions
         started = perf_counter()
         self.arena.storage.zero_()
@@ -541,10 +543,11 @@ class TokenMTPGraphs:
             torch.npu.synchronize()
             torch.npu.empty_cache()
             self.reserved_bytes = max(0, torch.npu.memory_reserved() - reserved)
+            self.allocated_bytes = max(0, torch.npu.memory_allocated() - allocated)
         logger.info(
             "ASR_MTP_GRAPH_READY layout=tokens graphs=%d max_batch=%d token_sizes=%s "
             "query_capacities=%s context=%d capture_ms=%.2f reserved_mib=%.2f "
-            "row_write_backend=%s row_width=%d head_counts=%s",
+            "allocated_mib=%.2f row_write_backend=%s row_width=%d head_counts=%s",
             len(self.entries),
             self.options.max_batch,
             self.options.tokens,
@@ -552,6 +555,7 @@ class TokenMTPGraphs:
             self.options.context,
             (perf_counter() - started) * 1000,
             self.reserved_bytes / 1024**2,
+            self.allocated_bytes / 1024**2,
             next(iter(self.entries.values()))[0].row_write_backend,
             next(iter(self.entries.values()))[0].row_width,
             getattr(self.options, "head_counts", ()) or (self.heads.num_heads,),

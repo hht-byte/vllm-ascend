@@ -136,22 +136,42 @@ def install_worker_memory_hook(cls):
     if tuple(inspect.signature(original).parameters) != ('self',):
         raise RuntimeError('ASR MTP graph memory hook requires the v0.23 worker API')
 
-    def determine(self):
-        available = original(self)
-        drafter = getattr(self.model_runner, 'drafter', None)
+    def worker_graphs(worker):
+        drafter = getattr(worker.model_runner, 'drafter', None)
         online = drafter.online if isinstance(drafter, AscendExternalDraftMTPProposer) else None
-        graphs = getattr(online, 'graphs', None)
+        return getattr(online, 'graphs', None)
+
+    def determine(self):
+        graphs = worker_graphs(self)
+        if graphs is not None and not graphs.ready:
+            # Capture before the original profiler resets its allocated-byte
+            # peak. Its baseline then includes graph tensors, so the peak delta
+            # measures activations coexisting with those resident graphs.
+            graphs.prepare()
+        available = original(self)
+        graphs = worker_graphs(self)
         if graphs is None or not graphs.ready:
             return available
+        # Resident graph memory predates the profiling interval, so reserve it
+        # once, in full. Merely subtracting a live-allocation delta from this
+        # reserve would miss coexistence with a target peak before graph capture.
         reserve = graphs.reserved_bytes
+        allocated = getattr(graphs, 'allocated_bytes', 0)
         manual = bool(self.cache_config.kv_cache_memory_bytes)
-        logger.info('ASR_MTP_GRAPH_MEMORY reserved_mib=%.2f manual_kv=%s',
-                    reserve / 1024 ** 2, manual)
+        adjusted = available if manual else available - reserve
+        logger.info('ASR_MTP_GRAPH_MEMORY reserved_mib=%.2f allocated_mib=%.2f '
+                    'capture_before_profile=True base_available_mib=%.2f '
+                    'adjusted_available_mib=%.2f manual_kv=%s',
+                    reserve / 1024 ** 2, allocated / 1024 ** 2,
+                    available / 1024 ** 2, adjusted / 1024 ** 2, manual)
         if manual:
             return available  # Explicit user KV bytes remain authoritative.
         if available <= reserve:
-            raise ValueError('insufficient automatic KV budget after reserving ASR MTP graphs')
-        self.available_kv_cache_memory_bytes = available - reserve
+            raise ValueError('insufficient automatic KV budget after reserving ASR MTP graphs: '
+                             f'available={available / 1024 ** 2:.2f} MiB, '
+                             f'graph_reserve={reserve / 1024 ** 2:.2f} MiB, '
+                             f'graph_allocated={allocated / 1024 ** 2:.2f} MiB')
+        self.available_kv_cache_memory_bytes = adjusted
         return self.available_kv_cache_memory_bytes
 
     cls.determine_available_memory = determine
