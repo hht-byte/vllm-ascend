@@ -25,13 +25,13 @@ class MTPServiceConfigTests(unittest.TestCase):
         self.assertNotIn('asr_mtp', disabled['additional_config'])
 
     def base(self):
-        return dict(
-            model='/target', max_num_seqs=20,
-            speculative_config=dict(
-                method='custom_class', num_speculative_tokens=15,
-                model='vllm_ascend.spec_decode.external_draft_proposer.AscendExternalDraftProposer'),
-            additional_config={'other_extension': {'keep': 1}},
-        )
+        return {
+            'model': '/target', 'max_num_seqs': 20,
+            'speculative_config': {
+                'method': 'custom_class', 'num_speculative_tokens': 15,
+                'model': 'vllm_ascend.spec_decode.external_draft_proposer.AscendExternalDraftProposer'},
+            'additional_config': {'other_extension': {'keep': 1}},
+        }
 
     def test_cli_defaults_and_independent_shadow_flag(self):
         parser = argparse.ArgumentParser()
@@ -71,15 +71,20 @@ class MTPServiceConfigTests(unittest.TestCase):
         base = self.base()
         base['additional_config']['asr_mtp'] = {
             'checkpoint': '/old.pt', 'num_heads': 3, 'cache_mib': 128,
+            'chunk_cold_heads': 2, 'finish_cold_heads': 3, 'finish_warm_heads': 2,
             'max_requests': 20, 'max_context_tokens': 256,
             'verify_base_signature': True,
         }
+        original = deepcopy(base)
         result = mtp_engine_config(base, mtp_enabled=True)
         self.assertEqual(result['additional_config']['asr_mtp'],
                          base['additional_config']['asr_mtp'])
         updated = mtp_engine_config(base, mtp_enabled=True, mtp_checkpoint='/new.pt')
         self.assertEqual(updated['additional_config']['asr_mtp']['checkpoint'], '/new.pt')
         self.assertEqual(updated['additional_config']['asr_mtp']['num_heads'], 3)
+        for key in ('chunk_cold_heads', 'finish_cold_heads', 'finish_warm_heads'):
+            self.assertEqual(updated['additional_config']['asr_mtp'][key],
+                             original['additional_config']['asr_mtp'][key])
 
     def test_on_requires_checkpoint_and_external_draft_backend(self):
         with self.assertRaisesRegex(ValueError, 'checkpoint'):

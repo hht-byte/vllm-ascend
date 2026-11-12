@@ -440,6 +440,13 @@ class EngineHeadsTests(unittest.TestCase):
             })
             self.assertEqual((phased.cold_heads, phased.warm_heads), (2, 1))
             self.assertEqual(phased.graphs.options.head_counts, (1, 2))
+            typed = load_worker(runner, target, {
+                **settings, 'graph_mode': 'full', 'graph_token_sizes': [8, 32],
+                'cold_heads': 1, 'warm_heads': 1, 'finish_cold_heads': 2,
+            })
+            self.assertEqual(typed.request_heads, {'chunk': (1, 1), 'finish': (2, 1)})
+            self.assertEqual(typed.graphs.options.head_counts, (1, 2))
+            self.assertEqual((typed.cold_heads, typed.warm_heads), (1, 1))
             paged = load_worker(runner, target, {
                 **settings, 'graph_mode': 'full', 'graph_context_tokens': 16,
                 'graph_token_sizes': [8, 32, 64], 'kv_cache_backend': 'paged',
@@ -457,6 +464,8 @@ class EngineHeadsTests(unittest.TestCase):
                               {'acceptance_stats': 'true'},
                               {'cold_heads': 3}, {'warm_heads': 3}, {'warm_heads': True},
                               {'cold_heads': 0}, {'warm_heads': '1'},
+                              {'finish_cold_heads': 3}, {'chunk_warm_heads': True},
+                              {'chunk_cold_heads': 0}, {'finish_warm_heads': None},
                               {'graph_token_sizes': [1000000]}):
                 with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                     load_worker(runner, target, {

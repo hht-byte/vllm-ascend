@@ -2767,12 +2767,13 @@
 +        return result
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_worker.py
-@@ -0,0 +1,523 @@
+@@ -0,0 +1,553 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Worker-local external draft -> MTP handoff for the v0.23 sync runner."""
 +import hashlib
 +import logging
 +from collections import Counter
++from collections.abc import Mapping
 +from pathlib import Path
 +from time import perf_counter
 +
@@ -2782,10 +2783,12 @@
 +    from .asr_mtp_fused import prepare_fused_heads
 +    from .asr_mtp_graph import MTPGraphs, graph_options, validate_graph_runner
 +    from .asr_mtp_heads import BatchedMTPHeads, CacheArena
++    from .asr_mtp_metrics import request_type
 +except ImportError:
 +    from asr_mtp_fused import prepare_fused_heads
 +    from asr_mtp_graph import MTPGraphs, graph_options, validate_graph_runner
 +    from asr_mtp_heads import BatchedMTPHeads, CacheArena
++    from asr_mtp_metrics import request_type
 +
 +logger = logging.getLogger(__name__)
 +MTP_KEY = 'ascend_mtp'
@@ -2797,6 +2800,21 @@
 +    if type(marker) is not bool:
 +        raise TypeError('ascend_mtp must be a bool')
 +    return marker
++
++
++def phase_head_config(settings, heads):
++    """Resolve startup-only phase budgets and the union of captured depths."""
++    cold, warm = settings.get('cold_heads', heads), settings.get('warm_heads', min(3, heads))
++    values = {'cold_heads': cold, 'warm_heads': warm}
++    typed = {}
++    for kind in ('chunk', 'finish'):
++        names = (f'{kind}_cold_heads', f'{kind}_warm_heads')
++        typed[kind] = tuple(settings.get(name, default) for name, default in zip(names, (cold, warm)))
++        values.update(zip(names, typed[kind]))
++    for name, value in values.items():
++        if type(value) is not int or not 0 < value <= heads:
++            raise ValueError(f'asr_mtp.{name} must be between 1 and loaded num_heads')
++    return cold, warm, typed, tuple(sorted(set(values.values())))
 +
 +
 +def query_buckets(states, limits, graphs=None):
@@ -2865,7 +2883,8 @@
 +
 +class MTPWorker:
 +    def __init__(self, runner, heads, arena, embedding, logits, eos, *, graphs=None,
-+                 profile_stages=False, acceptance_stats=False, cold_heads=None, warm_heads=None):
++                 profile_stages=False, acceptance_stats=False, cold_heads=None, warm_heads=None,
++                 request_heads=None):
 +        self.runner, self.heads, self.arena = runner, heads, arena
 +        self.embedding, self.logits, self.eos = embedding, logits, set(eos)
 +        self.states, self.disabled = {}, {}
@@ -2876,6 +2895,15 @@
 +            value = getattr(self, name)
 +            if type(value) is not int or not 0 < value <= heads.num_heads:
 +                raise ValueError(f'asr_mtp.{name} must be between 1 and loaded num_heads')
++        if request_heads is not None and (
++                not isinstance(request_heads, Mapping) or set(request_heads) - {'chunk', 'finish'}):
++            raise ValueError('asr_mtp request_heads must map chunk/finish to phase pairs')
++        self.request_heads = {}
++        for kind, pair in (request_heads or {}).items():
++            if (not isinstance(pair, (list, tuple)) or len(pair) != 2 or
++                    any(type(v) is not int or not 0 < v <= heads.num_heads for v in pair)):
++                raise ValueError(f'asr_mtp.{kind} phase heads must be valid cold/warm depths')
++            self.request_heads[kind] = tuple(pair)
 +        self.proposed = set()
 +        self.stats = Counter(target_forwards=0)
 +        self.graphs, self.profiled = graphs, False
@@ -3030,7 +3058,8 @@
 +                # through the target once. Do not skip it by immediately drafting MTP.
 +                continue
 +            remaining = params.max_tokens - len(request.output_token_ids)
-+            phase_limit = self.warm_heads if req_id in self.proposed else self.cold_heads
++            policy = self.request_heads.get(request_type(req_id), (self.cold_heads, self.warm_heads))
++            phase_limit = policy[req_id in self.proposed]
 +            limit = min(phase_limit, runner.speculative_config.num_speculative_tokens,
 +                        batch.max_model_len - confirmed, remaining)
 +            if limit <= 0:
@@ -3168,7 +3197,9 @@
 +               'verify_base_signature', 'graph_mode', 'graph_context_tokens',
 +               'graph_query_sizes', 'graph_token_sizes', 'graph_max_batch_size',
 +               'native_fusion', 'profile_stages', 'kv_cache_backend',
-+               'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend', 'acceptance_stats', 'cold_heads', 'warm_heads'}
++               'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend',
++               'acceptance_stats', 'cold_heads', 'warm_heads', 'chunk_cold_heads', 'chunk_warm_heads',
++               'finish_cold_heads', 'finish_warm_heads'}
 +    if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
 +        raise ValueError('invalid additional_config.asr_mtp settings')
 +    for name, default in (('native_fusion', True), ('profile_stages', False), ('acceptance_stats', False)):
@@ -3209,10 +3240,7 @@
 +    if type(trained) is not int or trained < 1:
 +        raise ValueError('invalid checkpoint num_heads')
 +    heads = min(settings.get('num_heads', trained), trained, runner.speculative_config.num_speculative_tokens)
-+    phase_depths = (settings.get('cold_heads', heads), settings.get('warm_heads', min(3, heads)))
-+    for name, value in zip(('cold_heads', 'warm_heads'), phase_depths):
-+        if type(value) is not int or not 0 < value <= heads:
-+            raise ValueError(f'asr_mtp.{name} must be between 1 and loaded num_heads')
++    cold_heads, warm_heads, request_heads, phase_depths = phase_head_config(settings, heads)
 +    selected = {name: value for name, value in weights.items()
 +                if any(name.startswith(f'blocks.{i}.') for i in range(heads))}
 +    with torch.device('meta'):
@@ -3274,11 +3302,12 @@
 +    worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits,
 +                       eos, graphs=graphs, profile_stages=settings.get('profile_stages', False),
 +                       acceptance_stats=settings.get('acceptance_stats', False),
-+                       cold_heads=phase_depths[0], warm_heads=phase_depths[1])
++                       cold_heads=cold_heads, warm_heads=warm_heads, request_heads=request_heads)
 +    logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
 +                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s '
 +                'native_fusion=%s profile_stages=%s kv_cache_backend=%s kv_write_backend=%s '
-+                'qkv_rope_backend=%s row_write_backend=%s acceptance_stats=%s cold_heads=%d warm_heads=%d',
++                'qkv_rope_backend=%s row_write_backend=%s acceptance_stats=%s cold_heads=%d warm_heads=%d '
++                'chunk_heads=%s finish_heads=%s',
 +                heads, cap, slots, getattr(arena, 'cache_bytes',
 +                    arena.storage.numel() * arena.storage.element_size()) / 1024 ** 2,
 +                settings['checkpoint'], settings.get('verify_base_signature', False),
@@ -3289,7 +3318,8 @@
 +                native_fusion, settings.get('profile_stages', False), kv_backend,
 +                getattr(arena, 'write_backend', 'separate_scatter_nd'),
 +                model.qkv_rope.backend if native_fusion else 'legacy',
-+                settings.get('row_write_backend', 'auto'), settings.get('acceptance_stats', False), *phase_depths)
++                settings.get('row_write_backend', 'auto'), settings.get('acceptance_stats', False),
++                cold_heads, warm_heads, request_heads['chunk'], request_heads['finish'])
 +    return worker
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_metrics.py
