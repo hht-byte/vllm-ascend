@@ -74,9 +74,12 @@ factory or this call. If using the optional `--mtp-graph-mode full/off` parser
 flag, map its value to `base_config["additional_config"]["asr_mtp"]["graph_mode"]`
 at the entry point first. Setting only the parser flag does not enable graphs.
 
-Graphs are prepared during memory profiling before eager fallback profiling and
-KV sizing. A startup-only memory hook conservatively subtracts the retained
-graph-pool/static-buffer reserved-memory delta from the automatic KV budget.
+Graphs are captured before the original worker memory-profiling context starts.
+Its allocated-byte baseline includes resident graph tensors; the profile measures
+target and eager fallback activations with graphs present. The startup hook then
+subtracts the complete retained graph-pool/static-buffer reservation once.
+Capturing inside that context and subtracting the full pool double-counted the
+live graph tensors in the activation peak.
 Explicit `kv_cache_memory_bytes` is left unchanged; reserve auxiliary graph
 space yourself in that manual budget. Graph memory is additional to `cache_mib`.
 Capture errors fail startup; disable the auxiliary graph option to recover.
@@ -589,3 +592,28 @@ PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
 PYTHONPATH="$PWD/vllm_ascend/spec_decode${PYTHONPATH:+:$PYTHONPATH}" \
   python -m unittest discover -s examples/910b/tests -p test_asr_mtp_token_graph.py -v
 ```
+
+## 图内存预算不足
+
+从已安装 cold/warm 版本更新显存计量，使用引擎交付目录的
+`asr_mtp_graph_memory_v023.patch`，包含两个图模块、worker 和启动 memory hook。
+其他累计安装路径也已包含修正；选择与实际安装版本匹配的一条，不叠加。
+
+```bash
+rg -n 'ASR_MTP_GRAPH_READY|ASR_MTP_GRAPH_MEMORY|Available KV cache memory' "$LOG"
+```
+
+`reserved_mib` 是图的实际 retained pool 预留，`allocated_mib` 是捕获新增的 live tensor
+分配。`base_available_mib` 是图已常驻后的原始 profiling 结果；自动预算使用
+`adjusted_available_mib = base_available_mib - reserved_mib`。结果仍不足则继续拒绝启动。
+这次修正不减少实际图内存，也不保证所有配置都能启动。
+
+例如用户日志 31 个 token 桶 × 两个深度 = 62 张图，占 15658 MiB（约 15.29 GiB）。
+若修正后实际容量仍不足，可先保留最大桶 1024、缩减中间档位试验：
+
+```python
+mtp_settings["graph_token_sizes"] = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
+```
+
+此时共 18 张图；实际显存变化不是按图数严格线性缩放，较粗桶会增加 padding，
+须比较同负载下的显存、接受长度和 commit 时延。

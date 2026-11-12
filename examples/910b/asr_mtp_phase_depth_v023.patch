@@ -99,7 +99,23 @@
              starts = metadata[:, 1 + depth]
              active = limits >= depth
              anchors = starts[:, None] + self.query_index[None, :]
-@@ -464,32 +488,38 @@
+@@ -438,6 +462,7 @@
+         self.ready = False
+         self.capture_backend = None
+         self.reserved_bytes = 0
++        self.allocated_bytes = 0
+
+     @torch.inference_mode()
+     def prepare(self, capture=None):
+@@ -455,6 +480,7 @@
+             torch.npu.synchronize()
+             torch.npu.empty_cache()
+         reserved_before = torch.npu.memory_reserved() if is_npu else 0
++        allocated_before = torch.npu.memory_allocated() if is_npu else 0
+         before = self.heads.processed_positions, self.heads.reused_positions
+         start_time = perf_counter()
+         self.arena.storage.zero_()
+@@ -464,32 +490,38 @@
                  states.append(self.arena.acquire())
              # Largest first to reuse temporary pool allocations. Live graph
              # inputs/outputs are deliberately outside that shared pool.
@@ -164,24 +180,30 @@
          finally:
              for state in states:
                  self.arena.release(state)
-@@ -503,7 +533,7 @@
+@@ -501,16 +533,21 @@
+             # and graph buffers. Reserve their full delta conservatively.
+             torch.npu.empty_cache()
              self.reserved_bytes = max(0, torch.npu.memory_reserved() - reserved_before)
++            self.allocated_bytes = max(
++                0, torch.npu.memory_allocated() - allocated_before
++            )
          logger.info(
              "ASR_MTP_GRAPH_READY graphs=%d max_batch=%d query_sizes=%s context=%d "
 -            "capture_ms=%.2f reserved_mib=%.2f row_write_backend=%s",
-+            "capture_ms=%.2f reserved_mib=%.2f row_write_backend=%s head_counts=%s",
++            "capture_ms=%.2f reserved_mib=%.2f allocated_mib=%.2f row_write_backend=%s head_counts=%s",
              len(self.entries),
              self.options.max_batch,
              self.options.queries,
-@@ -511,6 +541,7 @@
+             self.options.context,
              (perf_counter() - start_time) * 1000,
              self.reserved_bytes / 1024**2,
++            self.allocated_bytes / 1024**2,
              next(iter(self.entries.values()))[0].row_write_backend,
 +            getattr(self.options, "head_counts", ()) or (self.heads.num_heads,),
          )
 
      @torch.inference_mode()
-@@ -520,7 +551,8 @@
+@@ -520,7 +557,8 @@
          if not states or len(states) > self.options.max_batch:
              self.stats["miss_batch"] += 1
              return None
@@ -191,7 +213,7 @@
              self.stats["miss_budget"] += 1
              return None
          max_context = max(state.length for state in states)
-@@ -554,10 +586,13 @@
+@@ -554,10 +592,13 @@
          if queries is None:
              self.stats["miss_query"] += 1
              return None
@@ -206,7 +228,7 @@
          self.stats["replays"] += 1
          self.stats["requests"] += len(states)
          if self.stats["replays"] == 1:
-@@ -566,6 +601,6 @@
+@@ -566,6 +607,6 @@
                  len(states),
                  queries,
                  self.options.context,
@@ -297,7 +319,22 @@
              depth = d + 1
              segment, relative = self._segments(self.token_index, self.q_ends[d])
              request = self.order[d].index_select(0, segment)
-@@ -481,35 +494,44 @@
+@@ -458,6 +471,7 @@
+         self.ready = False
+         self.capture_backend = None
+         self.reserved_bytes = 0
++        self.allocated_bytes = 0
+
+     @torch.inference_mode()
+     def prepare(self, capture=None):
+@@ -475,41 +489,51 @@
+             torch.npu.synchronize()
+             torch.npu.empty_cache()
+         reserved = torch.npu.memory_reserved() if is_npu else 0
++        allocated = torch.npu.memory_allocated() if is_npu else 0
+         before = self.heads.processed_positions, self.heads.reused_positions
+         started = perf_counter()
+         self.arena.storage.zero_()
          states = []
          try:
              states = [self.arena.acquire() for _ in range(self.options.max_batch)]
@@ -371,24 +408,31 @@
          finally:
              for state in states:
                  self.arena.release(state)
-@@ -522,7 +544,7 @@
+@@ -519,10 +543,11 @@
+             torch.npu.synchronize()
+             torch.npu.empty_cache()
+             self.reserved_bytes = max(0, torch.npu.memory_reserved() - reserved)
++            self.allocated_bytes = max(0, torch.npu.memory_allocated() - allocated)
          logger.info(
              "ASR_MTP_GRAPH_READY layout=tokens graphs=%d max_batch=%d token_sizes=%s "
              "query_capacities=%s context=%d capture_ms=%.2f reserved_mib=%.2f "
 -            "row_write_backend=%s row_width=%d",
-+            "row_write_backend=%s row_width=%d head_counts=%s",
++            "allocated_mib=%.2f row_write_backend=%s row_width=%d head_counts=%s",
              len(self.entries),
              self.options.max_batch,
              self.options.tokens,
-@@ -532,6 +554,7 @@
+@@ -530,8 +555,10 @@
+             self.options.context,
+             (perf_counter() - started) * 1000,
              self.reserved_bytes / 1024**2,
++            self.allocated_bytes / 1024**2,
              next(iter(self.entries.values()))[0].row_write_backend,
              next(iter(self.entries.values()))[0].row_width,
 +            getattr(self.options, "head_counts", ()) or (self.heads.num_heads,),
          )
 
      @torch.inference_mode()
-@@ -543,7 +566,8 @@
+@@ -543,7 +570,8 @@
              return None
          if len(states) != len(inputs) or len(states) != len(limits):
              raise ValueError("aligned MTP graph requests required")
@@ -398,7 +442,7 @@
              self.stats["miss_budget"] += 1
              return None
          history = max(state.length for state in states)
-@@ -571,7 +595,7 @@
+@@ -571,7 +599,7 @@
          if bucket is None:
              self.stats["miss_tokens"] += 1
              return None
@@ -407,7 +451,7 @@
          profiled = getattr(self.options, "profile_stages", False)
          stage_started = perf_counter() if profiled else None
          program.stage(states, inputs, limits)
-@@ -601,6 +625,7 @@
+@@ -601,6 +629,7 @@
                  timings.get("task_updates", 0),
                  timings.get("task_update_reuses", 0),
              )
@@ -415,7 +459,7 @@
          self.stats["replays"] += 1
          self.stats["requests"] += len(states)
          if self.stats["replays"] == 1:
-@@ -613,6 +638,6 @@
+@@ -613,6 +642,6 @@
                  program.query_capacity,
                  program.kv_capacity,
                  self.options.context,
@@ -492,6 +536,19 @@
 
      def _fallback(self, req_id, reason):
          state = self.states.pop(req_id, None)
+@@ -138,9 +163,9 @@
+             raise RuntimeError('MTP memory profiling must precede live requests')
+         if self.profiled:
+             return
+-        # Graph buffers must already be resident when the eager fallback's
+-        # activation peak is measured. Private pool reservation is accounted
+-        # separately by the startup-only worker memory hook.
++        # The startup memory hook prepares these graphs before the outer target
++        # profiling interval. Keep direct profile() calls idempotent as well.
++        # Private pool reservation is accounted separately by that worker hook.
+         if self.graphs is not None:
+             self.graphs.prepare()
+         before = self.heads.processed_positions, self.heads.reused_positions
 @@ -235,7 +260,8 @@
                  # through the target once. Do not skip it by immediately drafting MTP.
                  continue
@@ -594,3 +651,55 @@
 -                settings.get('row_write_backend', 'auto'), settings.get('acceptance_stats', False))
 +                settings.get('row_write_backend', 'auto'), settings.get('acceptance_stats', False), *phase_depths)
      return worker
+--- a/vllm_ascend/patch/worker/patch_external_draft_mtp.py
++++ b/vllm_ascend/patch/worker/patch_external_draft_mtp.py
+@@ -136,22 +136,42 @@
+     if tuple(inspect.signature(original).parameters) != ('self',):
+         raise RuntimeError('ASR MTP graph memory hook requires the v0.23 worker API')
+
++    def worker_graphs(worker):
++        drafter = getattr(worker.model_runner, 'drafter', None)
++        online = drafter.online if isinstance(drafter, AscendExternalDraftMTPProposer) else None
++        return getattr(online, 'graphs', None)
++
+     def determine(self):
++        graphs = worker_graphs(self)
++        if graphs is not None and not graphs.ready:
++            # Capture before the original profiler resets its allocated-byte
++            # peak. Its baseline then includes graph tensors, so the peak delta
++            # measures activations coexisting with those resident graphs.
++            graphs.prepare()
+         available = original(self)
+-        drafter = getattr(self.model_runner, 'drafter', None)
+-        online = drafter.online if isinstance(drafter, AscendExternalDraftMTPProposer) else None
+-        graphs = getattr(online, 'graphs', None)
++        graphs = worker_graphs(self)
+         if graphs is None or not graphs.ready:
+             return available
++        # Resident graph memory predates the profiling interval, so reserve it
++        # once, in full. Merely subtracting a live-allocation delta from this
++        # reserve would miss coexistence with a target peak before graph capture.
+         reserve = graphs.reserved_bytes
++        allocated = getattr(graphs, 'allocated_bytes', 0)
+         manual = bool(self.cache_config.kv_cache_memory_bytes)
+-        logger.info('ASR_MTP_GRAPH_MEMORY reserved_mib=%.2f manual_kv=%s',
+-                    reserve / 1024 ** 2, manual)
++        adjusted = available if manual else available - reserve
++        logger.info('ASR_MTP_GRAPH_MEMORY reserved_mib=%.2f allocated_mib=%.2f '
++                    'capture_before_profile=True base_available_mib=%.2f '
++                    'adjusted_available_mib=%.2f manual_kv=%s',
++                    reserve / 1024 ** 2, allocated / 1024 ** 2,
++                    available / 1024 ** 2, adjusted / 1024 ** 2, manual)
+         if manual:
+             return available  # Explicit user KV bytes remain authoritative.
+         if available <= reserve:
+-            raise ValueError('insufficient automatic KV budget after reserving ASR MTP graphs')
+-        self.available_kv_cache_memory_bytes = available - reserve
++            raise ValueError('insufficient automatic KV budget after reserving ASR MTP graphs: '
++                             f'available={available / 1024 ** 2:.2f} MiB, '
++                             f'graph_reserve={reserve / 1024 ** 2:.2f} MiB, '
++                             f'graph_allocated={allocated / 1024 ** 2:.2f} MiB')
++        self.available_kv_cache_memory_bytes = adjusted
+         return self.available_kv_cache_memory_bytes
+
+     cls.determine_available_memory = determine

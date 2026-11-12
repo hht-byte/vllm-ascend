@@ -406,6 +406,8 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
         )
         graphs = TokenMTPGraphs(options, fixed, new, embed, logits)
         graphs.prepare()  # Real NPUGraph and FIA task-update path.
+        self.assertGreater(graphs.reserved_bytes, 0)
+        self.assertGreater(graphs.allocated_bytes, 0)
         a, b = [old.acquire(), old.acquire()], [new.acquire(), new.acquire()]
         ids = [list(range(3, 14)), list(range(20, 27))]
         with torch.inference_mode():
