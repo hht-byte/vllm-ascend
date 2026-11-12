@@ -49,7 +49,7 @@ class PhaseTests(unittest.TestCase):
             scratch_elements=33 * 12,
         )
 
-    def worker(self, *, graph=True, acceptance=False):
+    def worker(self, *, graph=True, acceptance=False, request_heads=None):
         arena = self.arena()
         options = SimpleNamespace(max_batch=3, queries=(), tokens=(8, 32), context=17, head_counts=(3, 5))
         graphs = TokenMTPGraphs(options, self.heads, arena, self.embed, self.logits) if graph else None
@@ -91,6 +91,7 @@ class PhaseTests(unittest.TestCase):
             set(),
             graphs=graphs,
             acceptance_stats=acceptance,
+            **({"request_heads": request_heads} if request_heads is not None else {}),
         )
         scheduler = SimpleNamespace(num_scheduled_tokens=dict(zip(batch.req_ids, map(len, ids))))
         return worker, graphs, scheduler, torch.randn(sum(map(len, ids)), 12)
@@ -136,6 +137,92 @@ class PhaseTests(unittest.TestCase):
             self.assertEqual([h.valid for h in state.heads[:3]], [state.length] * 3)
             self.assertLess(state.heads[3].valid, state.length)
             self.assertLess(state.heads[4].valid, state.length)
+
+    def test_chunk_three_finish_five_and_shadow_fallback_share_depth_graphs(self):
+        for graph in (True, False):
+            with self.subTest(graph=graph):
+                worker, graphs, scheduler, hidden = self.worker(
+                    graph=graph, request_heads={"chunk": (3, 3), "finish": (5, 3)}
+                )
+                worker.cold_heads = 3  # global fallback for shadow/other
+                batch = worker.runner.input_batch
+                batch.req_ids = ["stream_a-engine", "finish_b-engine", "prespec-c"]
+                worker.runner.requests = dict(zip(batch.req_ids, worker.runner.requests.values()))
+                scheduler.num_scheduled_tokens = dict(zip(batch.req_ids, scheduler.num_scheduled_tokens.values()))
+                converted = []
+                original = torch.Tensor.tolist
+                with patch.object(
+                    torch.Tensor,
+                    "tolist",
+                    lambda t, converted=converted, original=original: (
+                        converted.append(t.shape),
+                        original(t),
+                    )[1],
+                ):
+                    result = worker.propose([[4]] * 3, scheduler, hidden)
+                self.assertEqual(list(map(len, result)), [3, 5, 3])
+                self.assertEqual(len(converted), 1)
+                reference_arena = self.arena()
+                states = [reference_arena.acquire() for _ in batch.req_ids]
+                rows, offset = [], 0
+                for i, state in enumerate(states):
+                    state.length = int(batch.num_tokens_no_spec[i]) - 1
+                    state.target[: state.length] = hidden[offset : offset + state.length]
+                    offset += state.length
+                    rows.append(batch.token_ids_cpu[i, : state.length + 1].tolist())
+                expected = self.heads.propose(states, rows, self.embed, self.logits, [3, 5, 3]).tolist()
+                self.assertEqual(result, [row[:n] for row, n in zip(expected, [3, 5, 3])])
+                for state in states:
+                    reference_arena.release(state)
+                self.assertTrue(all(h.valid == 0 for h in worker.states[batch.req_ids[0]].heads[3:]))
+                if graphs:
+                    self.assertEqual(graphs.stats["replays_h3"], 1)
+                    self.assertEqual(graphs.stats["replays_h5"], 1)
+                hidden = self.advance(worker, scheduler)
+                self.assertEqual(
+                    list(map(len, worker.propose([[7]] * 3, scheduler, hidden))),
+                    [3] * 3,
+                )
+                if graph:
+                    self.assertEqual(worker.stats["eager_head_batches"], 0)
+
+    def test_type_policy_inherits_global_depths_and_deduplicates_capture(self):
+        import asr_mtp_worker as module
+
+        resolve = getattr(module, "phase_head_config", None)
+        self.assertIsNotNone(resolve, "request-type depth configuration is missing")
+        settings = {"cold_heads": 3, "warm_heads": 3, "finish_cold_heads": 5}
+        cold, warm, typed, depths = resolve(settings, 5)
+        self.assertEqual((cold, warm), (3, 3))
+        self.assertEqual(typed, {"chunk": (3, 3), "finish": (5, 3)})
+        self.assertEqual(depths, (3, 5))
+        self.assertEqual(resolve({"cold_heads": 5, "warm_heads": 5}, 5)[3], (5,))
+        self.assertEqual(resolve({"cold_heads": 3, "warm_heads": 3}, 5)[3], (3,))
+        for name in (
+            "chunk_cold_heads",
+            "chunk_warm_heads",
+            "finish_cold_heads",
+            "finish_warm_heads",
+        ):
+            for value in (None, True, "3", 0, 6):
+                with (
+                    self.subTest(name=name, value=value),
+                    self.assertRaisesRegex(ValueError, name),
+                ):
+                    resolve({name: value}, 5)
+
+    def test_invalid_request_head_pairs_fail_before_live_requests(self):
+        worker, _, _, _ = self.worker(graph=False)
+        args = (worker.runner, self.heads, worker.arena, self.embed, self.logits, set())
+        for policy in (
+            "3",
+            {"shadow": (3, 3)},
+            {"chunk": (3,)},
+            {"finish": (True, 3)},
+            {"chunk": (3, 6)},
+        ):
+            with self.subTest(policy=policy), self.assertRaises(ValueError):
+                MTPWorker(*args, request_heads=policy)
 
     def test_eager_uses_same_phase_limits_without_metrics(self):
         worker, _, scheduler, hidden = self.worker(graph=False)

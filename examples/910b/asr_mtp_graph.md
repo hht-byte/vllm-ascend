@@ -617,3 +617,43 @@ mtp_settings["graph_token_sizes"] = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
 
 此时共 18 张图；实际显存变化不是按图数严格线性缩放，较粗桶会增加 padding，
 须比较同负载下的显存、接受长度和 commit 时延。
+
+## 按 chunk / finish 分别选择深度
+
+可选设置 `chunk_cold_heads`、`chunk_warm_heads`、`finish_cold_heads`、
+`finish_warm_heads` 分别覆盖该类请求的深度；未设置的值继承全局 `cold_heads` / `warm_heads`。
+默认配置行为不变。shadow 和未识别类型始终使用全局值。
+
+在已有 `additional_config.asr_mtp` 内合并下面配置，保留 checkpoint 等原有参数：
+
+```python
+mtp_settings.update({
+    "num_heads": 5,
+    "cold_heads": 3,
+    "warm_heads": 3,
+    "finish_cold_heads": 5,
+})
+```
+
+结果为 chunk 3/3、finish 5/3、shadow/other 3/3。
+`num_heads` 必须仍加载五头，不能设为 3 后再请求 finish 五头；所有覆盖项都会按实际
+加载深度校验，不接受 bool、字符串、None 或越界数值。设置其他组合时可显式指定四项覆盖值。
+
+请求类型识别与接受率统计一致：`stream_` 是 chunk，`finish_` 是 finish，`prespec-`
+是 shadow，允许后续引擎 request ID 后缀。cold/warm 生命周期、EOS 截断、实际剩余预算
+和缓存有效边界保持原规则，策略也不依赖是否开启接受率统计。
+
+启动日志显示全局 `cold_heads=3 warm_heads=3`，以及解析后的
+`chunk_heads=(3, 3) finish_heads=(5, 3)`。STEP 中的全局 depth 字段仍是回退值；
+实际图执行深度查看 `replays_h3` / `replays_h5`。接受率汇总的 `num_heads=5` 仍指最大加载深度。
+
+图捕获使用全局与请求覆盖项所需深度的去重集合。本例仍只捕获 3、5 两套，
+不会按 chunk/finish 再翻倍；31 个 token 桶对应 62 张图，九个桶对应 18 张图。
+混合请求复用原有按深度分组和单次整批 D2H。此前的图显存计量修正仍保留。
+
+已安装显存计量修正版可使用 `asr_mtp_request_depth_v023.patch` 聚焦更新；
+累计安装路径也已包含新设置。服务侧 `mtp_engine_config()` 会透传这些引擎配置，
+无需增加服务命令行参数。若其他服务封装自行过滤字段，需同步透传以上四项。
+
+这是一项消融策略能力，不能根据接受率报告宣称已改善时延；需按同负载分别比较
+chunk、finish 的耗时、目标验证轮次、commit 时延与显存占用。
