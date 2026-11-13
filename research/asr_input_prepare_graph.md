@@ -64,7 +64,8 @@ reported through the runner's existing graph-memory return value. This is not
 a second deduction from the automatic KV budget.
 
 CPU scheduler work, the earlier MTP handoff gap, input IDs/embedding, spec-decode
-sampler metadata, FIA's later padding update and audio encoder stay outside this
+sampler metadata (now packed separately), FIA's later padding update and audio
+encoder stay outside this
 graph. It therefore does not promise to eliminate every gap or every H2D in the
 reported 6.4 ms interval.
 
@@ -76,8 +77,10 @@ python tests/ut/worker/test_asr_input_prepare_graph_standalone.py
 ```
 
 `READY` reports captured buckets and additional reserved bytes. Runtime records
-appear on the first successful replay and each 1000 subsequent replays, including
-cumulative replay/miss counts and the current actual/bucket token count. A READY
+appear on first traffic and then at most once per five seconds while traffic
+continues, including cumulative replay/miss counts, the current actual/bucket
+token count and `spec_metadata_uploads`. Older versions log only replay 1 and
+multiples of 1000; one log line does not mean only one replay occurred. A READY
 line alone proves capture, not that requests reached this path. Miss counts cover
 oversize/invalid token counts after capture; startup profiling is not counted.
 
@@ -129,3 +132,53 @@ git apply examples/910b/asr_input_prepare_graph_startup_fix_v023.patch
 For a checkout still at `2b3cb3c97`, the updated full preparation patch includes
 this fix. Use either the full patch or the incremental fix for its matching
 base. Updating to a branch commit that includes the fix needs no extra patch.
+
+## Synchronous verifier metadata upload
+
+The original verifier metadata builder uploads five separately pinned tensors,
+then gathers input IDs twice on device (with an index addition). This happens
+outside the preparation graph. The synchronous ASR fast path builds the same
+indices and draft IDs from the already prepared CPU input IDs, then uploads one
+persistent packed buffer. It adds no graph, device index kernels or D2H readback.
+
+This path is enabled with the existing preparation graph setting. To isolate
+this change while keeping the same preparation graphs, compare:
+
+```python
+additional["asr_input_prepare_graph"] = {
+    "enabled": True,
+    "token_sizes": [16, 64, 256, 1024],
+    "pack_spec_metadata": True,  # Set False for the original verifier builder.
+}
+```
+
+`spec_metadata_uploads` counts packed verifier calls, not graph replays. Batches
+without drafts do not increment it. If previous input IDs are repaired on GPU,
+the original builder is retained. CPU packing does not require a graph bucket
+hit, so a preparation bucket miss can still use the packed verifier metadata.
+The buffer is reused only in synchronous execution; a copy event protects pinned
+host reuse and the runner stream orders device consumers before the next upload.
+
+In a comparable speculative batch, expect five small metadata H2Ds to become
+one and the builder's two Index/IndexCheck pairs and Add to disappear. Aggregate
+MEMCPY counts include device-to-device copies inside the preparation graph, so
+they are not a host-launch count. Other indices may have unrelated call sites.
+Compare the same MTP-to-decoder wall interval with identical concurrency and
+batch/token distributions. Embedding and the scheduler handoff remain outside
+this optimization. CPU equivalence tests do not establish NPU latency gains.
+
+```bash
+python tests/ut/worker/test_asr_spec_decode_metadata_standalone.py
+rg -n 'ASR_INPUT_PREPARE_GRAPH_READY|ASR_INPUT_PREPARE_GRAPH replays=' "$LOG"
+```
+
+The cumulative preparation patch includes this change. For a checkout already
+at `fd89726b5`, use the focused incremental patch instead:
+
+```bash
+git apply --check examples/910b/asr_spec_decode_metadata_v023.patch
+git apply examples/910b/asr_spec_decode_metadata_v023.patch
+```
+
+The incremental patch adds `asr_spec_decode_metadata.py` as well as updating the
+runner and preparation helper. Copy all three files if deploying manually.
