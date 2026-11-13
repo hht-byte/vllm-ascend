@@ -106,7 +106,7 @@ def runner():
         num_computed_tokens=torch.zeros(4, dtype=torch.int32),
         seq_lens=torch.zeros(4, dtype=torch.int32),
         query_start_loc=NS(gpu=torch.zeros(6, dtype=torch.int32)),
-        num_accepted_tokens=NS(gpu=torch.zeros(4, dtype=torch.int32)),
+        num_accepted_tokens=NS(gpu=torch.zeros(4, dtype=torch.int32), np=np.ones(4, dtype=np.int32)),
         discard_request_indices=NS(gpu=torch.zeros(4, dtype=torch.int64)),
         discard_request_mask=NS(gpu=torch.zeros(4, dtype=torch.bool)),
         input_batch=NS(block_table=Tables()),
@@ -207,6 +207,35 @@ class PrepareGraphTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "block table"):
             graph.capture()
 
+    def test_sync_speculation_event_does_not_imply_async_or_hybrid(self):
+        r = self.r
+        r._prepare_inputs = MethodType(prepare_inputs, r)
+        # vLLM v0.23 allocates this whenever num_spec_tokens > 0, independently
+        # of async scheduling and model type (gpu_model_runner.py:870-874).
+        r.num_accepted_tokens_event = Event()
+        self.assertEqual(self.mod.settings(r, prepare_inputs=prepare_inputs), (8, 16, 32))
+
+    def test_guard_reports_each_actual_unsupported_value(self):
+        r = self.r
+        r._prepare_inputs = MethodType(prepare_inputs, r)
+        r.use_async_scheduling = True
+        r.compilation_config.cudagraph_mode.name = "FULL_DECODE_ONLY"
+        with self.assertRaises(ValueError) as caught:
+            self.mod.settings(r, prepare_inputs=prepare_inputs)
+        self.assertIn("use_async_scheduling=True", str(caught.exception))
+        self.assertIn("cudagraph_mode='FULL_DECODE_ONLY'", str(caught.exception))
+
+    def test_graph_preserves_cpu_accepted_counts_with_allocated_event(self):
+        graph = self.graph()
+        graph.capture()
+        self.r.num_accepted_tokens_event = Event()
+        for accepted in ([3, 2], [1]):
+            n = len(accepted)
+            self.r.num_accepted_tokens.np.fill(99)
+            self.r.num_accepted_tokens.np[:n] = accepted
+            graph.replay(8, [0] * n, [1] * n, [0] * n, np.arange(n + 1), [False] * n, [])
+            self.assertEqual(self.r.num_accepted_tokens.gpu.tolist(), list(accepted) + [1] * (4 - n))
+
     def test_bad_buckets_and_override_fail(self):
         r = self.r
         r._prepare_inputs = MethodType(prepare_inputs, r)
@@ -297,6 +326,43 @@ class WiringTests(unittest.TestCase):
             self.assertEqual(len(copies), 0 if active else 3)
             self.assertEqual(r.num_discarded_requests, 1)
             self.assertEqual(r.num_accepted_tokens.gpu[0].item(), 42 if active else 1)
+
+    def test_actual_event_branch_preserves_sync_and_defers_only_gpu_copy(self):
+        src = SOURCE.with_name("model_runner_v1.py").read_text(encoding="utf-8")
+        a = src.index("        # Sync num_accepted_tokens from CPU", src.index("    def _prepare_inputs("))
+        b = src.index("        # Update num_computed_tokens on GPU.", a)
+        code = compile(textwrap.dedent(src[a:b]), "<real accepted count branch>", "exec")
+        tree = ast.parse(src)
+        cls = next(x for x in tree.body if isinstance(x, ast.ClassDef) and x.name == "NPUModelRunner")
+        sync = next(x for x in cls.body if isinstance(x, ast.FunctionDef) and x.name == "_sync_num_accepted_tokens")
+        env = {}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[sync], type_ignores=[])), "<real accepted sync>", "exec"
+            ),
+            env,
+        )
+        for active in (False, True):
+            r = runner()
+            r._sync_num_accepted_tokens = MethodType(env["_sync_num_accepted_tokens"], r)
+            r.input_batch.num_accepted_tokens_cpu = np.array([3, 2, 9, 9], dtype=np.int32)
+            r.num_accepted_tokens_event = Event()
+            copies = []
+
+            def copy_counts(r=r, copies=copies):
+                copies.append(1)
+                r.num_accepted_tokens.gpu.copy_(torch.from_numpy(r.num_accepted_tokens.np))
+
+            r.num_accepted_tokens.copy_to_gpu = copy_counts
+            exec(code, dict(self=r, num_reqs=2, prev_req_id_to_index={}, input_prepare_bucket=8 if active else None))
+            self.assertEqual(r.num_accepted_tokens_event.waits, 1)
+            self.assertEqual(r.num_accepted_tokens.np.tolist(), [3, 2, 1, 1])
+            self.assertEqual(len(copies), 0 if active else 1)
+            if active:
+                graph = load().InputPrepareGraph(r, (8,), backend=CPUCapture())
+                graph.capture()
+                graph.replay(8, [0, 0], [1, 1], [0, 0], [0, 1, 2], [False, False], [])
+            self.assertEqual(r.num_accepted_tokens.gpu.tolist(), [3, 2, 1, 1])
 
     def test_capture_hook_after_decoder_and_no_runtime_capture(self):
         tree = ast.parse(SOURCE.with_name("model_runner_v1.py").read_text(encoding="utf-8"))

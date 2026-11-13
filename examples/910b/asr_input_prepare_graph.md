@@ -43,8 +43,9 @@ packing, enable `asr_sync_input_packing` only in the graph-disabled run.
 
 The CPU scheduler already computes authoritative positions and sequence lengths.
 One pinned upload carries them along with computed counts, query starts and
-discard indices/mask. One graph replay writes the fixed runner buffers, fills
-accepted counts and padding, and invokes the existing slot mapping kernel.
+discard indices/mask and synchronized accepted-token counts. One graph replay
+writes the fixed runner buffers, fills padding, and invokes the existing slot
+mapping kernel.
 Device index/cast/add operations for recomputing positions are unnecessary.
 
 The private query starts used for slot mapping repeat the actual token count
@@ -104,3 +105,27 @@ git apply examples/910b/asr_input_prepare_graph_v023.patch
 ```
 
 Do not apply the focused patch again if the branch already contains this change.
+
+## Startup compatibility fix
+
+vLLM 0.23 creates `num_accepted_tokens_event` whenever speculative tokens are
+configured, including synchronous dense ASR. Its presence is not an unsupported
+mode. The initial implementation incorrectly rejected this valid allocation.
+The fix removes that check; real asynchronous, hybrid and unsupported graph
+modes remain rejected, with each actual conflicting setting in the error.
+
+The existing event wait and CPU accepted-count synchronization remain intact.
+Only the accepted-count GPU transfer moves into the packed preparation replay;
+actual synchronized counts are copied, with inactive slots padded to one.
+Graph misses and graph-disabled runs retain the original transfer path.
+
+For a checkout already containing `0343e34b8`, use the incremental startup fix:
+
+```bash
+git apply --check examples/910b/asr_input_prepare_graph_startup_fix_v023.patch
+git apply examples/910b/asr_input_prepare_graph_startup_fix_v023.patch
+```
+
+For a checkout still at `2b3cb3c97`, the updated full preparation patch includes
+this fix. Use either the full patch or the incremental fix for its matching
+base. Updating to a branch commit that includes the fix needs no extra patch.

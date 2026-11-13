@@ -24,22 +24,39 @@ def settings(runner, *, prepare_inputs):
         raise ValueError("disable asr_sync_input_packing before enabling asr_input_prepare_graph")
     if not isinstance(config.get("asr_mtp"), Mapping):
         raise ValueError("asr_input_prepare_graph requires additional_config.asr_mtp")
-    if (
-        runner.use_async_scheduling
-        or runner.use_async_spec_decode
-        or runner.pcp_size != 1
-        or runner.dcp_size != 1
-        or getattr(runner.model_config, "is_hybrid", False)
-        or getattr(runner.model_config, "enforce_eager", False)
-        or getattr(runner, "num_accepted_tokens_event", None) is not None
-        or any(getattr(runner, name, False) for name in ("_has_gdn", "use_sparse", "use_compress", "is_hybrid"))
-        or any(
-            getattr(runner.parallel_config, name) != 1
-            for name in ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size")
+    # vLLM allocates num_accepted_tokens_event for every speculative runner,
+    # including synchronous dense models. Allocation is not an async/hybrid flag.
+    unsupported = [
+        f"{name}={value!r}"
+        for name, value in {
+            "use_async_scheduling": runner.use_async_scheduling,
+            "use_async_spec_decode": runner.use_async_spec_decode,
+            "model_config.is_hybrid": getattr(runner.model_config, "is_hybrid", False),
+            "enforce_eager": getattr(runner.model_config, "enforce_eager", False),
+            **{name: getattr(runner, name, False) for name in ("_has_gdn", "use_sparse", "use_compress", "is_hybrid")},
+        }.items()
+        if value
+    ]
+    unsupported.extend(
+        f"{name}={value!r}"
+        for name, value in {
+            "pcp_size": runner.pcp_size,
+            "dcp_size": runner.dcp_size,
+            **{
+                name: getattr(runner.parallel_config, name)
+                for name in ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size")
+            },
+        }.items()
+        if value != 1
+    )
+    mode = runner.compilation_config.cudagraph_mode.name
+    if mode != "FULL":
+        unsupported.append(f"cudagraph_mode={mode!r}")
+    if unsupported:
+        raise ValueError(
+            "asr_input_prepare_graph requires synchronous single-device dense ASR with FULL graphs; "
+            "unsupported settings: " + ", ".join(unsupported)
         )
-        or runner.compilation_config.cudagraph_mode.name != "FULL"
-    ):
-        raise ValueError("asr_input_prepare_graph requires synchronous single-device dense ASR with FULL graphs")
     if runner._prepare_inputs.__func__ is not prepare_inputs:
         raise ValueError("asr_input_prepare_graph does not support overridden _prepare_inputs")
     capacity = min(runner.max_num_tokens, runner.positions.numel())
@@ -98,6 +115,7 @@ class InputPrepareGraph:
         self.max_requests = runner.seq_lens.numel()
         self.outputs = {
             "counts": runner.num_computed_tokens,
+            "accepted": runner.num_accepted_tokens.gpu,
             "seq": runner.seq_lens,
             "qsl": runner.query_start_loc.gpu,
             "discard_indices": runner.discard_request_indices.gpu,
@@ -106,6 +124,7 @@ class InputPrepareGraph:
         }
         expected = {
             "counts": torch.int32,
+            "accepted": torch.int32,
             "seq": torch.int32,
             "qsl": torch.int32,
             "discard_indices": torch.int64,
@@ -121,11 +140,10 @@ class InputPrepareGraph:
                 or (name != "positions" and out.numel() not in sizes)
             ):
                 raise ValueError(f"unsupported input preparation layout: {name}")
-        self.accepted = runner.num_accepted_tokens.gpu
         # Every field is independently aligned. Positions last: only the selected
         # bucket prefix is transferred. Separate private qsl avoids FIA rewrites.
         layout, offset = {}, 0
-        for name in ("counts", "seq", "qsl", "discard_indices", "discard_mask", "slot_qsl", "positions"):
+        for name in ("counts", "accepted", "seq", "qsl", "discard_indices", "discard_mask", "slot_qsl", "positions"):
             out = self.outputs["qsl" if name == "slot_qsl" else name]
             offset = (offset + 7) // 8 * 8
             size = out.numel() * out.element_size()
@@ -156,7 +174,6 @@ class InputPrepareGraph:
                 out[:tokens].copy_(self.inputs[name][:tokens])
             else:
                 out.copy_(self.inputs[name])
-        self.accepted.fill_(1)
         for table in self.tables.block_tables:
             # The slot kernel clears tokens:capacity itself. It does not clear
             # actual_tokens:tokens for a fixed bucket: explicitly clear that too.
@@ -213,6 +230,11 @@ class InputPrepareGraph:
         ):
             self.cpu[name].fill(0)
             self.cpu[name][: len(values)] = values
+        # The runner retains its original event wait / CPU synchronization.
+        # Only the device transfer moves into this graph; do not replace accepted
+        # counts with ones just because the supported model is dense.
+        self.cpu["accepted"].fill(1)
+        self.cpu["accepted"][:n] = self.runner.num_accepted_tokens.np[:n]
         self.cpu["qsl"].fill(-1)
         self.cpu["qsl"][: n + 1] = qsl
         self.cpu["slot_qsl"].fill(t)

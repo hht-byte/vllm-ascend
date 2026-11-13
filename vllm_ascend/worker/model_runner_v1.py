@@ -1172,7 +1172,8 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs, has_prev_mapping=bool(prev_req_id_to_index)
             )
             self.num_accepted_tokens.np[num_reqs:].fill(1)
-            self.num_accepted_tokens.copy_to_gpu()
+            if input_prepare_bucket is None:
+                self.num_accepted_tokens.copy_to_gpu()
         else:
             self.num_accepted_tokens.np.fill(1)
             if input_prepare_bucket is None:
