@@ -81,3 +81,38 @@ whitespace normally, and validate patch whitespace with blank-at-eol disabled
 alongside forward/reverse application checks. No source changes made at delivery.
 
 Engine delivery commit: `0343e34b8`, pushed to `310P-graph`.
+
+## Startup regression fix
+
+User reported startup failure at the preparation graph guard after delivery.
+Root cause: upstream vLLM v0.23 GPUModelRunner allocates
+`num_accepted_tokens_event` whenever `num_spec_tokens > 0` (reference lines
+870-874), independently of async scheduling and hybrid model type. Our guard
+wrongly rejected all such speculative runners. The original CPU fixture used
+None and therefore missed this production allocation.
+
+Four regression tests initially fail: allocated-event startup, exact guard
+messages, preservation of accepted counts and actual event-branch GPU transfer
+suppression. Remove only the invalid gate; retain real mode restrictions and
+list every conflicting value. Preserve the runner's event wait / CPU sync;
+pack the resulting accepted counts instead of filling graph output with ones.
+No extra H2D and no new runtime graph capture. Fallback remains unchanged.
+
+Deliver both an updated cumulative patch from `2b3cb3c97` and a focused startup
+fix from `0343e34b8`. Both apply, match source and reverse-check. This follow-up
+is not pushed yet; hardware validation remains unavailable locally.
+
+Follow-up validation: 80 related CPU tests pass, 2 device tests skip. Fresh
+architectural review found no critical/important issue; original event wait,
+CPU ownership and oversize fallback remain intact. Ruff, Markdown, spelling,
+source whitespace and both patch application checks pass. No server restart,
+NPU capture validation or push performed for this fix.
+
+## Startup fix delivery
+
+The user subsequently requested push. Engine fix commit: `fd89726b5` on
+`310P-graph`; matching cumulative/incremental patches and documentation are
+included on `codex/streaming-prespec-monitor`. No service restart performed.
+Source whitespace, both patch reverse checks and delivery mirror equality were
+verified again before committing. Test evidence remains the preceding 80 CPU
+passes and 2 device skips on these unchanged source files.
