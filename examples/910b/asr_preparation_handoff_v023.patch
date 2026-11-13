@@ -1,0 +1,494 @@
+diff --git a/vllm_ascend/worker/asr_input_prepare_graph.py b/vllm_ascend/worker/asr_input_prepare_graph.py
+index 0ad8f1581..650ee8dc2 100644
+--- a/vllm_ascend/worker/asr_input_prepare_graph.py
++++ b/vllm_ascend/worker/asr_input_prepare_graph.py
+@@ -14,15 +14,16 @@ def settings(runner, *, prepare_inputs):
+     opts = config.get("asr_input_prepare_graph", {})
+     if not isinstance(opts, Mapping):
+         raise TypeError("asr_input_prepare_graph must be a mapping")
+-    if set(opts) - {"enabled", "token_sizes", "pack_spec_metadata"}:
++    if set(opts) - {"enabled", "token_sizes", "pack_spec_metadata", "fuse_handoff", "capture_decode_embedding"}:
+         raise ValueError("unknown asr_input_prepare_graph setting")
+     on = opts.get("enabled", False)
+     if type(on) is not bool:
+         raise TypeError("asr_input_prepare_graph.enabled must be a bool")
+     if not on:
+         return None
+-    if type(opts.get("pack_spec_metadata", True)) is not bool:
+-        raise TypeError("asr_input_prepare_graph.pack_spec_metadata must be a bool")
++    for name in ("pack_spec_metadata", "fuse_handoff", "capture_decode_embedding"):
++        if type(opts.get(name, True)) is not bool:
++            raise TypeError(f"asr_input_prepare_graph.{name} must be a bool")
+     if config.get("asr_sync_input_packing", False):
+         raise ValueError("disable asr_sync_input_packing before enabling asr_input_prepare_graph")
+     if not isinstance(config.get("asr_mtp"), Mapping):
+@@ -110,7 +111,26 @@ class InputPrepareGraph:
+     def __init__(self, runner, token_sizes, *, backend=None):
+         self.runner, self.token_sizes = runner, token_sizes
+         self.backend = backend if backend is not None else NPUCapture()
+-        self.entries = {}
++        opts = (runner.vllm_config.additional_config or {}).get("asr_input_prepare_graph", {})
++        self.fuse_handoff = opts.get("fuse_handoff", True)
++        self.capture_decode_embedding = opts.get("capture_decode_embedding", True)
++        self.want_embedding = (
++            self.fuse_handoff
++            and self.capture_decode_embedding
++            and getattr(self.runner, "supports_mm_inputs", False)
++            and not getattr(self.runner, "enable_prompt_embeds", False)
++            and not getattr(self.runner, "lora_config", None)
++            and not getattr(self.runner.model_config, "quantization", None)
++            and not getattr(self.runner.model_config, "is_encoder_decoder", False)
++            and not getattr(self.runner, "uses_mrope", False)
++            and not getattr(self.runner, "uses_xdrope_dim", 0)
++        )
++        self.entries, self.embedding_entries = {}, {}
++        self.embedding_output = None
++        self.embedding_replays = self.upload_records = 0
++        self.upload_active = False
++        self.staged = self.completed = self.embedding_schedule = None
++        self.last_bucket = None
+         self.tables = None
+         self.ready = False
+         self.replays = self.misses = self.reserved_bytes = 0
+@@ -125,6 +145,7 @@ class InputPrepareGraph:
+             "discard_indices": runner.discard_request_indices.gpu,
+             "discard_mask": runner.discard_request_mask.gpu,
+             "positions": runner.positions,
++            "logits": torch.zeros(self.max_requests, dtype=torch.int64, device=runner.device),
+         }
+         expected = {
+             "counts": torch.int32,
+@@ -134,6 +155,7 @@ class InputPrepareGraph:
+             "discard_indices": torch.int64,
+             "discard_mask": torch.bool,
+             "positions": torch.int64,
++            "logits": torch.int64,
+         }
+         for name, out in self.outputs.items():
+             sizes = (self.max_requests + 1, self.max_requests + 2) if name == "qsl" else (self.max_requests,)
+@@ -147,8 +169,25 @@ class InputPrepareGraph:
+         # Every field is independently aligned. Positions last: only the selected
+         # bucket prefix is transferred. Separate private qsl avoids FIA rewrites.
+         layout, offset = {}, 0
+-        for name in ("counts", "accepted", "seq", "qsl", "discard_indices", "discard_mask", "slot_qsl", "positions"):
+-            out = self.outputs["qsl" if name == "slot_qsl" else name]
++        for name in (
++            "counts",
++            "accepted",
++            "seq",
++            "qsl",
++            "discard_indices",
++            "discard_mask",
++            "slot_qsl",
++            "logits",
++            "block_padding",
++            "embed_ids",
++            "positions",
++        ):
++            if name == "block_padding":
++                out = torch.empty(self.max_requests, dtype=torch.bool)
++            elif name == "embed_ids":
++                out = torch.empty(runner.positions.numel() if self.want_embedding else 0, dtype=torch.int32)
++            else:
++                out = self.outputs["qsl" if name == "slot_qsl" else name]
+             offset = (offset + 7) // 8 * 8
+             size = out.numel() * out.element_size()
+             layout[name] = (offset, size, out.dtype)
+@@ -162,6 +201,10 @@ class InputPrepareGraph:
+         self.position_offset = layout["positions"][0]
+ 
+     def select(self, total_tokens):
++        if self.staged is not None:
++            raise RuntimeError("previous input preparation was not finalized")
++        self.completed = self.embedding_schedule = None
++        self.last_bucket = None
+         if not self.ready:
+             return None
+         if self.runner.input_batch.block_table is not self.tables:
+@@ -181,8 +224,10 @@ class InputPrepareGraph:
+         self.last_stats_time = now
+         return True
+ 
+-    def _run(self, tokens):
++    def _run(self, tokens, embed=False):
+         for name, out in self.outputs.items():
++            if name == "logits" and not self.fuse_handoff:
++                continue
+             if name == "positions":
+                 out[:tokens].copy_(self.inputs[name][:tokens])
+             else:
+@@ -192,6 +237,11 @@ class InputPrepareGraph:
+             # actual_tokens:tokens for a fixed bucket: explicitly clear that too.
+             table.slot_mapping.gpu[:tokens].fill_(-1)
+         self.tables.compute_slot_mapping(self.max_requests, self.inputs["slot_qsl"], self.outputs["positions"][:tokens])
++        if self.fuse_handoff:
++            for table in self.tables.block_tables:
++                table.block_table.gpu[: self.max_requests].masked_fill_(self.inputs["block_padding"][:, None], 0)
++        if embed:
++            self.embedding_output[:tokens].copy_(self.runner.model.embed_input_ids(self.inputs["embed_ids"][:tokens]))
+ 
+     @torch.inference_mode()
+     def capture(self):
+@@ -210,14 +260,23 @@ class InputPrepareGraph:
+         # Zero private qsl makes every request inactive during capture. Runtime
+         # lengths are device inputs to the fixed-grid existing slot kernel.
+         self.device.zero_()
++        can_capture_embedding = self.want_embedding
++        if can_capture_embedding:
++            self.embedding_output = self.runner.inputs_embeds.gpu
++            if self.embedding_output.shape[0] < self.token_sizes[-1]:
++                raise ValueError("input embedding buffer is smaller than preparation graph capacity")
+         for tokens in self.token_sizes:
+             self.entries[tokens] = self.backend.capture(lambda tokens=tokens: self._run(tokens))
++            if can_capture_embedding:
++                self.embedding_entries[tokens] = self.backend.capture(
++                    lambda tokens=tokens: self._run(tokens, embed=True)
++                )
+         self.reserved_bytes = max(0, self.backend.reserved() - before)
+         self.ready = True
+         return self.reserved_bytes
+ 
+     @torch.inference_mode()
+-    def replay(self, bucket, counts, seq_lens, positions, qsl, discard_mask, discard_indices):
++    def stage(self, bucket, counts, seq_lens, positions, qsl, discard_mask, discard_indices):
+         n, t = len(counts), len(positions)
+         if (
+             not self.ready
+@@ -232,9 +291,7 @@ class InputPrepareGraph:
+             or len(discard_indices) > n
+         ):
+             raise ValueError("input preparation metadata exceeds captured capacity or has inconsistent lengths")
+-        event = self.backend.event
+-        if self.pending_copy and not event.query():
+-            event.synchronize()  # Protect pinned host reuse, only the preceding copy.
++        self.before_upload()
+         for name, values in (
+             ("counts", counts),
+             ("seq", seq_lens),
+@@ -254,12 +311,111 @@ class InputPrepareGraph:
+         self.cpu["slot_qsl"][: n + 1] = qsl
+         self.cpu["positions"][:t] = positions
+         self.cpu["positions"][t:bucket] = 0
++        self.cpu["logits"][:n] = self.cpu["qsl"][1 : n + 1] - 1
++        self.cpu["block_padding"].fill(False)
++        self.staged = (n, t, bucket)
++        self.completed = self.embedding_schedule = None
++
++    def before_upload(self):
++        if self.upload_active:
++            return
++        event = self.backend.event
++        if self.pending_copy and not event.query():
++            event.synchronize()
++        self.pending_copy = False
++        self.upload_active = True
++
++    def record_upload(self):
++        if self.upload_active:
++            self.backend.event.record()
++            self.upload_records += 1
++            self.pending_copy = True
++            self.upload_active = False
++
++    def _can_embed(self, scheduler_output, n, t, bucket, padded):
++        r = self.runner
++        return (
++            scheduler_output is not None
++            and bucket in self.embedding_entries
++            and padded <= bucket
++            and not scheduler_output.scheduled_encoder_inputs
++            and not r.enable_prompt_embeds
++            and not r.uses_mrope
++            and not r.uses_xdrope_dim
++            and not r.lora_config
++            and r.input_batch.prev_sampled_token_ids is None
++            and (r.input_batch.num_computed_tokens_cpu[:n] >= r.input_batch.num_prompt_tokens[:n]).all()
++            and (r.input_ids.np[:t] >= 0).all()
++            and (r.input_ids.np[:t] < r.input_batch.vocab_size).all()
++        )
++
++    @torch.inference_mode()
++    def finish(self, num_tokens_padded, num_reqs_padded, *, scheduler_output=None, allow_embedding=False):
++        if self.staged is None:
++            return False
++        n, t, bucket = self.staged
++        if not t <= num_tokens_padded <= self.runner.positions.numel() or not n <= num_reqs_padded <= n + 1:
++            raise ValueError("invalid final preparation padding")
++        index = bisect_left(self.token_sizes, num_tokens_padded)
++        if index < len(self.token_sizes):
++            bucket = self.token_sizes[index]
++        if num_reqs_padded > n:
++            self.cpu["qsl"][n + 1] = num_tokens_padded
++        elif num_tokens_padded != t:
++            raise ValueError("padded tokens require the FULL dummy request")
++        self.cpu["block_padding"][n : min(num_reqs_padded, self.max_requests)] = True
++        self.cpu["positions"][t:bucket] = 0
++        embed = allow_embedding and self._can_embed(scheduler_output, n, t, bucket, num_tokens_padded)
++        if embed:
++            if self.runner.inputs_embeds.gpu is not self.embedding_output:
++                raise RuntimeError("input embedding storage changed after capture")
++            self.cpu["embed_ids"][:t] = self.runner.input_ids.np[:t]
++            self.cpu["embed_ids"][t:bucket] = 0
+         size = self.position_offset + bucket * 8
+         self.device[:size].copy_(self.host[:size], non_blocking=True)
+-        event.record()
+-        self.pending_copy = True
+-        self.entries[bucket].replay()
++        self.record_upload()  # Covers this copy and any earlier verifier upload.
++        (self.embedding_entries if embed else self.entries)[bucket].replay()
+         self.replays += 1
++        self.embedding_replays += int(embed)
++        self.embedding_schedule = scheduler_output if embed else None
++        self.completed = (t, num_tokens_padded, n, num_reqs_padded)
++        self.last_bucket = bucket
++        self.staged = None
++        return True
++
++    def covers_padding(self, num_tokens, num_tokens_padded, num_reqs, num_reqs_padded):
++        return (
++            self.fuse_handoff
++            and self.completed == (num_tokens, num_tokens_padded, num_reqs, num_reqs_padded)
++            and all(
++                num_tokens_padded <= table.max_num_batched_tokens and num_reqs_padded <= table.block_table.gpu.shape[0]
++                for table in self.tables.block_tables
++            )
++        )
++
++    def preprocess_result(self, scheduler_output, num_input_tokens):
++        if (
++            self.embedding_schedule is None
++            or self.embedding_schedule is not scheduler_output
++            or self.completed is None
++            or num_input_tokens != self.completed[1]
++        ):
++            return None
++        r = self.runner
++        input_ids, embeds = r._prepare_mm_inputs(num_input_tokens)
++        return (
++            input_ids,
++            embeds,
++            r.positions[:num_input_tokens],
++            None,
++            {**r._init_model_kwargs(), **r._extract_mm_kwargs(scheduler_output)},
++            None,
++        )
++
++    @torch.inference_mode()
++    def replay(self, bucket, counts, seq_lens, positions, qsl, discard_mask, discard_indices):
++        self.stage(bucket, counts, seq_lens, positions, qsl, discard_mask, discard_indices)
++        self.finish(len(positions), len(counts))
+ 
+ 
+ def install(runner, *, prepare_inputs):
+diff --git a/vllm_ascend/worker/asr_spec_decode_metadata.py b/vllm_ascend/worker/asr_spec_decode_metadata.py
+index 19e7310a2..9011816b6 100644
+--- a/vllm_ascend/worker/asr_spec_decode_metadata.py
++++ b/vllm_ascend/worker/asr_spec_decode_metadata.py
+@@ -14,11 +14,12 @@ class SyncSpecDecodeMetadata:
+     ordered by the runner stream. Never use this for GPU-repaired input IDs.
+     """
+ 
+-    def __init__(self, runner, *, event=None):
++    def __init__(self, runner, *, event=None, upload_owner=None):
+         self.max_requests = runner.seq_lens.numel()
+         self.max_tokens = runner.max_num_tokens
+         self.max_drafts = runner.num_spec_tokens
+-        self.event = event if event is not None else torch.npu.Event()
++        self.upload_owner = upload_owner
++        self.event = None if upload_owner is not None else (event if event is not None else torch.npu.Event())
+         self.pending = False
+         self.uploads = 0
+         self.arange = np.arange(self.max_tokens + self.max_requests, dtype=np.int64)
+@@ -61,7 +62,9 @@ class SyncSpecDecodeMetadata:
+             or scheduled_ends[-1] > min(self.max_tokens, len(input_ids))
+         ):
+             raise ValueError("speculative metadata exceeds capacity or has inconsistent lengths")
+-        if self.pending and not self.event.query():
++        if self.upload_owner is not None:
++            self.upload_owner.before_upload()
++        elif self.pending and not self.event.query():
+             self.event.synchronize()
+         cu_draft = self.cpu["cu_num_draft_tokens"][:n]
+         cu_sample = self.cpu["cu_num_sampled_tokens"][:n]
+@@ -81,8 +84,9 @@ class SyncSpecDecodeMetadata:
+         self.cpu["draft_token_ids"][:d] = input_ids[logits[target + 1]]
+         size = self.draft_offset + d * 4
+         self.device[:size].copy_(self.host[:size], non_blocking=True)
+-        self.event.record()
+-        self.pending = True
++        if self.upload_owner is None:
++            self.event.record()
++            self.pending = True
+         self.uploads += 1
+         sizes = {
+             "cu_num_draft_tokens": n,
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 2212ca995..f42fd7100 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -611,7 +611,9 @@ class NPUModelRunner(GPUModelRunner):
+         # Install before model loading/capture so recorded tensor addresses stay fixed.
+         self._input_prepare_graph = install_input_prepare_graph(self, prepare_inputs=NPUModelRunner._prepare_inputs)
+         self._spec_decode_metadata_packer = (
+-            SyncSpecDecodeMetadata(self)
++            SyncSpecDecodeMetadata(
++                self, upload_owner=(self._input_prepare_graph if self._input_prepare_graph.fuse_handoff else None)
++            )
+             if self._input_prepare_graph is not None
+             and (self.vllm_config.additional_config or {}).get("asr_input_prepare_graph", {}).get(
+                 "pack_spec_metadata", True
+@@ -836,6 +838,8 @@ class NPUModelRunner(GPUModelRunner):
+         num_reqs: int,
+         cudagraph_runtime_mode: CUDAGraphMode | None = None,
+         batch_desc_num_reqs: int | None = None,
++        *,
++        defer_upload: bool = False,
+     ) -> int:
+         """
+         This function is only designed to satisfied the constraint that when the layout is TND,
+@@ -873,7 +877,8 @@ class NPUModelRunner(GPUModelRunner):
+                 query_start_loc.np[num_reqs_padded + 1] = num_tokens_padded
+                 num_reqs_padded = num_reqs_padded + 1
+ 
+-        copy_snapshot_to_gpu(query_start_loc)
++        if not defer_upload:
++            copy_snapshot_to_gpu(query_start_loc)
+ 
+         return num_reqs_padded
+ 
+@@ -1194,7 +1199,12 @@ class NPUModelRunner(GPUModelRunner):
+         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
+         valid_sampled_token_count_gpu = self.valid_sampled_token_count_gpu
+         if input_prepare_bucket is not None:
+-            self._input_prepare_graph.replay(
++            prepare = (
++                self._input_prepare_graph.stage
++                if self._input_prepare_graph.fuse_handoff and not lmhead_tp_enable()
++                else self._input_prepare_graph.replay
++            )
++            prepare(
+                 input_prepare_bucket,
+                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].numpy(),
+                 self.optimistic_seq_lens_cpu[:num_reqs].numpy(),
+@@ -1354,6 +1364,8 @@ class NPUModelRunner(GPUModelRunner):
+             if self.use_cp:
+                 logits_indices = self.pcp_manager.get_logits_indices(cu_num_tokens, num_reqs, tokens_original)
+                 logits_indices = logits_indices.pin_memory().to(self.device, non_blocking=True)
++            elif input_prepare_bucket is not None and self._input_prepare_graph.staged is not None:
++                logits_indices = self._input_prepare_graph.outputs["logits"][:num_reqs]
+             else:
+                 logits_indices = self.query_start_loc.gpu[1 : num_reqs + 1] - 1
+         else:
+@@ -1391,13 +1403,9 @@ class NPUModelRunner(GPUModelRunner):
+             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
+             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
+             self.num_decode_draft_tokens.copy_to_gpu()
+-        if self._input_prepare_graph is not None and self._input_prepare_graph.should_log():
+-            logger.info(
+-                "ASR_INPUT_PREPARE_GRAPH replays=%d misses=%d tokens=%d bucket=%s spec_metadata_uploads=%d",
+-                self._input_prepare_graph.replays, self._input_prepare_graph.misses,
+-                total_num_scheduled_tokens, input_prepare_bucket,
+-                self._spec_decode_metadata_packer.uploads if self._spec_decode_metadata_packer is not None else 0,
+-            )
++        if self._input_prepare_graph is not None and self._input_prepare_graph.staged is None:
++            self._input_prepare_graph.record_upload()
++            self._log_asr_input_preparation(total_num_scheduled_tokens)
+         # save logits_indices for pcp spec decode usage
+         self.logits_indices = logits_indices
+ 
+@@ -1428,6 +1436,21 @@ class NPUModelRunner(GPUModelRunner):
+             total_num_scheduled_tokens,
+         )
+ 
++    def _log_asr_input_preparation(self, tokens):
++        graph = self._input_prepare_graph
++        if graph is not None and graph.should_log():
++            logger.info(
++                "ASR_INPUT_PREPARE_GRAPH replays=%d misses=%d tokens=%d bucket=%s "
++                "spec_metadata_uploads=%d embedding_replays=%d upload_records=%d",
++                graph.replays,
++                graph.misses,
++                tokens,
++                graph.last_bucket,
++                self._spec_decode_metadata_packer.uploads if self._spec_decode_metadata_packer is not None else 0,
++                graph.embedding_replays,
++                graph.upload_records,
++            )
++
+     def _preprocess(
+         self,
+         scheduler_output: "SchedulerOutput",
+@@ -1441,6 +1464,10 @@ class NPUModelRunner(GPUModelRunner):
+         dict[str, Any],
+         ECConnectorOutput | None,
+     ]:
++        if self._input_prepare_graph is not None:
++            prepared = self._input_prepare_graph.preprocess_result(scheduler_output, num_input_tokens)
++            if prepared is not None:
++                return prepared
+         restore_state = None
+ 
+         # For PCP, local worker token count can differ from scheduler global count.
+@@ -2289,9 +2316,26 @@ class NPUModelRunner(GPUModelRunner):
+                         num_reqs,
+                         cudagraph_mode,
+                         batch_desc.num_reqs,
++                        defer_upload=(
++                            self._input_prepare_graph is not None and self._input_prepare_graph.staged is not None
++                        ),
++                    )
++
++                input_layout_prepared = False
++                if self._input_prepare_graph is not None:
++                    self._input_prepare_graph.finish(
++                        num_tokens_padded,
++                        num_reqs_padded,
++                        scheduler_output=scheduler_output,
++                        allow_embedding=not has_ec_transfer(),
++                    )
++                    input_layout_prepared = self._input_prepare_graph.covers_padding(
++                        num_tokens_unpadded, num_tokens_padded, num_reqs, num_reqs_padded
+                     )
++                    self._log_asr_input_preparation(num_tokens_unpadded)
+ 
+                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
++                    input_layout_prepared=input_layout_prepared,
+                     num_tokens=num_tokens_unpadded
+                     if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
+                     else total_num_scheduled_tokens,
+@@ -3110,6 +3154,7 @@ class NPUModelRunner(GPUModelRunner):
+         num_scheduled_tokens: dict[str, int] | None = None,
+         num_scheduled_tokens_np: np.ndarray | None = None,
+         cascade_attn_prefix_lens: list[list[int]] | None = None,
++        input_layout_prepared: bool = False,
+     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
+         """
+         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
+@@ -3186,7 +3231,7 @@ class NPUModelRunner(GPUModelRunner):
+                 blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]
+                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
+                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
+-                if self.pcp_size == 1:
++                if self.pcp_size == 1 and not input_layout_prepared:
+                     slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
+                     blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
+             if self.pcp_size > 1:
+@@ -5171,9 +5216,15 @@ class NPUModelRunner(GPUModelRunner):
+         # independent preparation graph once, never on the request hot path.
+         if self._input_prepare_graph is not None:
+             cuda_graph_size += self._input_prepare_graph.capture()
+-            logger.info("ASR_INPUT_PREPARE_GRAPH_READY graphs=%d token_sizes=%s reserved_bytes=%d",
+-                        len(self._input_prepare_graph.entries), self._input_prepare_graph.token_sizes,
+-                        self._input_prepare_graph.reserved_bytes)
++            logger.info(
++                "ASR_INPUT_PREPARE_GRAPH_READY graphs=%d token_sizes=%s reserved_bytes=%d "
++                "embedding_graphs=%d fuse_handoff=%s",
++                len(self._input_prepare_graph.entries),
++                self._input_prepare_graph.token_sizes,
++                self._input_prepare_graph.reserved_bytes,
++                len(self._input_prepare_graph.embedding_entries),
++                self._input_prepare_graph.fuse_handoff,
++            )
+ 
+         mgr = self.encoder_cudagraph_manager
+         if mgr is not None and hasattr(self, "update_stream"):

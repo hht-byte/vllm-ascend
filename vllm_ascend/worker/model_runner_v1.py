@@ -611,7 +611,9 @@ class NPUModelRunner(GPUModelRunner):
         # Install before model loading/capture so recorded tensor addresses stay fixed.
         self._input_prepare_graph = install_input_prepare_graph(self, prepare_inputs=NPUModelRunner._prepare_inputs)
         self._spec_decode_metadata_packer = (
-            SyncSpecDecodeMetadata(self)
+            SyncSpecDecodeMetadata(
+                self, upload_owner=(self._input_prepare_graph if self._input_prepare_graph.fuse_handoff else None)
+            )
             if self._input_prepare_graph is not None
             and (self.vllm_config.additional_config or {}).get("asr_input_prepare_graph", {}).get(
                 "pack_spec_metadata", True
@@ -836,6 +838,8 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs: int,
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
         batch_desc_num_reqs: int | None = None,
+        *,
+        defer_upload: bool = False,
     ) -> int:
         """
         This function is only designed to satisfied the constraint that when the layout is TND,
@@ -873,7 +877,8 @@ class NPUModelRunner(GPUModelRunner):
                 query_start_loc.np[num_reqs_padded + 1] = num_tokens_padded
                 num_reqs_padded = num_reqs_padded + 1
 
-        copy_snapshot_to_gpu(query_start_loc)
+        if not defer_upload:
+            copy_snapshot_to_gpu(query_start_loc)
 
         return num_reqs_padded
 
@@ -1194,7 +1199,12 @@ class NPUModelRunner(GPUModelRunner):
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
         valid_sampled_token_count_gpu = self.valid_sampled_token_count_gpu
         if input_prepare_bucket is not None:
-            self._input_prepare_graph.replay(
+            prepare = (
+                self._input_prepare_graph.stage
+                if self._input_prepare_graph.fuse_handoff and not lmhead_tp_enable()
+                else self._input_prepare_graph.replay
+            )
+            prepare(
                 input_prepare_bucket,
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].numpy(),
                 self.optimistic_seq_lens_cpu[:num_reqs].numpy(),
@@ -1354,6 +1364,8 @@ class NPUModelRunner(GPUModelRunner):
             if self.use_cp:
                 logits_indices = self.pcp_manager.get_logits_indices(cu_num_tokens, num_reqs, tokens_original)
                 logits_indices = logits_indices.pin_memory().to(self.device, non_blocking=True)
+            elif input_prepare_bucket is not None and self._input_prepare_graph.staged is not None:
+                logits_indices = self._input_prepare_graph.outputs["logits"][:num_reqs]
             else:
                 logits_indices = self.query_start_loc.gpu[1 : num_reqs + 1] - 1
         else:
@@ -1391,13 +1403,9 @@ class NPUModelRunner(GPUModelRunner):
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
-        if self._input_prepare_graph is not None and self._input_prepare_graph.should_log():
-            logger.info(
-                "ASR_INPUT_PREPARE_GRAPH replays=%d misses=%d tokens=%d bucket=%s spec_metadata_uploads=%d",
-                self._input_prepare_graph.replays, self._input_prepare_graph.misses,
-                total_num_scheduled_tokens, input_prepare_bucket,
-                self._spec_decode_metadata_packer.uploads if self._spec_decode_metadata_packer is not None else 0,
-            )
+        if self._input_prepare_graph is not None and self._input_prepare_graph.staged is None:
+            self._input_prepare_graph.record_upload()
+            self._log_asr_input_preparation(total_num_scheduled_tokens)
         # save logits_indices for pcp spec decode usage
         self.logits_indices = logits_indices
 
@@ -1428,6 +1436,21 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens,
         )
 
+    def _log_asr_input_preparation(self, tokens):
+        graph = self._input_prepare_graph
+        if graph is not None and graph.should_log():
+            logger.info(
+                "ASR_INPUT_PREPARE_GRAPH replays=%d misses=%d tokens=%d bucket=%s "
+                "spec_metadata_uploads=%d embedding_replays=%d upload_records=%d",
+                graph.replays,
+                graph.misses,
+                tokens,
+                graph.last_bucket,
+                self._spec_decode_metadata_packer.uploads if self._spec_decode_metadata_packer is not None else 0,
+                graph.embedding_replays,
+                graph.upload_records,
+            )
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1441,6 +1464,10 @@ class NPUModelRunner(GPUModelRunner):
         dict[str, Any],
         ECConnectorOutput | None,
     ]:
+        if self._input_prepare_graph is not None:
+            prepared = self._input_prepare_graph.preprocess_result(scheduler_output, num_input_tokens)
+            if prepared is not None:
+                return prepared
         restore_state = None
 
         # For PCP, local worker token count can differ from scheduler global count.
@@ -2289,9 +2316,26 @@ class NPUModelRunner(GPUModelRunner):
                         num_reqs,
                         cudagraph_mode,
                         batch_desc.num_reqs,
+                        defer_upload=(
+                            self._input_prepare_graph is not None and self._input_prepare_graph.staged is not None
+                        ),
                     )
 
+                input_layout_prepared = False
+                if self._input_prepare_graph is not None:
+                    self._input_prepare_graph.finish(
+                        num_tokens_padded,
+                        num_reqs_padded,
+                        scheduler_output=scheduler_output,
+                        allow_embedding=not has_ec_transfer(),
+                    )
+                    input_layout_prepared = self._input_prepare_graph.covers_padding(
+                        num_tokens_unpadded, num_tokens_padded, num_reqs, num_reqs_padded
+                    )
+                    self._log_asr_input_preparation(num_tokens_unpadded)
+
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
+                    input_layout_prepared=input_layout_prepared,
                     num_tokens=num_tokens_unpadded
                     if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
                     else total_num_scheduled_tokens,
@@ -3110,6 +3154,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens: dict[str, int] | None = None,
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
+        input_layout_prepared: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -3186,7 +3231,7 @@ class NPUModelRunner(GPUModelRunner):
                 blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
-                if self.pcp_size == 1:
+                if self.pcp_size == 1 and not input_layout_prepared:
                     slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
                     blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
             if self.pcp_size > 1:
@@ -5171,9 +5216,15 @@ class NPUModelRunner(GPUModelRunner):
         # independent preparation graph once, never on the request hot path.
         if self._input_prepare_graph is not None:
             cuda_graph_size += self._input_prepare_graph.capture()
-            logger.info("ASR_INPUT_PREPARE_GRAPH_READY graphs=%d token_sizes=%s reserved_bytes=%d",
-                        len(self._input_prepare_graph.entries), self._input_prepare_graph.token_sizes,
-                        self._input_prepare_graph.reserved_bytes)
+            logger.info(
+                "ASR_INPUT_PREPARE_GRAPH_READY graphs=%d token_sizes=%s reserved_bytes=%d "
+                "embedding_graphs=%d fuse_handoff=%s",
+                len(self._input_prepare_graph.entries),
+                self._input_prepare_graph.token_sizes,
+                self._input_prepare_graph.reserved_bytes,
+                len(self._input_prepare_graph.embedding_entries),
+                self._input_prepare_graph.fuse_handoff,
+            )
 
         mgr = self.encoder_cudagraph_manager
         if mgr is not None and hasattr(self, "update_stream"):

@@ -306,6 +306,7 @@ class WiringTests(unittest.TestCase):
                 num_reqs=2,
                 total_num_scheduled_tokens=7,
                 input_prepare_bucket=8 if use_graph else None,
+                lmhead_tp_enable=lambda: False,
                 num_scheduled_tokens=np.array([3, 4], dtype=np.int32),
                 positions_np=np.array([9, 10, 11, 0, 1, 2, 3]),
                 req_indices=np.array([0, 0, 0, 1, 1, 1, 1]),
@@ -316,6 +317,9 @@ class WiringTests(unittest.TestCase):
                 logger=NS(info=lambda *a: None),
             )
             exec(code, ns)
+            if use_graph and r._input_prepare_graph.staged is not None:
+                self.assertEqual(r._input_prepare_graph.replays, 0)
+                r._input_prepare_graph.finish(7, 2)
             self.assertEqual(r.positions[:7].tolist(), [9, 10, 11, 0, 1, 2, 3])
             self.assertEqual(r.seq_lens.tolist(), [12, 4, 0, 0])
             self.assertEqual(r._input_prepare_graph.replays, int(use_graph))
@@ -417,7 +421,14 @@ class WiringTests(unittest.TestCase):
         )
         exec(compile(ast.fix_missing_locations(ast.Module(body=[capture], type_ignores=[])), "<capture>", "exec"), env)
         r = NS(
-            _input_prepare_graph=NS(capture=lambda: 1024, token_sizes=(8,), entries={8: None}, reserved_bytes=1024),
+            _input_prepare_graph=NS(
+                capture=lambda: 1024,
+                token_sizes=(8,),
+                entries={8: None},
+                reserved_bytes=1024,
+                embedding_entries={},
+                fuse_handoff=True,
+            ),
             encoder_cudagraph_manager=None,
         )
         self.assertEqual(env["capture_model"](r), 5120)

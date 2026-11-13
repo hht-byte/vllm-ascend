@@ -16,6 +16,9 @@ additional["asr_sync_input_packing"] = False
 additional["asr_input_prepare_graph"] = {
     "enabled": True,
     "token_sizes": [16, 64, 256, 1024],
+    "pack_spec_metadata": True,
+    "fuse_handoff": True,
+    "capture_decode_embedding": True,
 }
 base_config["additional_config"] = additional
 # Continue using the existing mtp_engine_config(...) and engine construction.
@@ -51,7 +54,8 @@ Device index/cast/add operations for recomputing positions are unnecessary.
 The private query starts used for slot mapping repeat the actual token count
 for inactive request slots. Attention query starts retain their original -1
 padding and separate storage, including the FULL-mode extra dummy-request entry.
-This preserves FIA's later query-start rewrite. Slots between the actual token
+The final FIA padding is staged before replay on the fused path; the original
+later upload remains on the legacy path. Slots between the actual token
 count and the preparation bucket are explicitly invalidated on every replay.
 Reordering, rejection, mixed prefill/decode and shrinking batches do not retain
 old slot addresses. Block table contents can change without changing pointers.
@@ -63,11 +67,11 @@ the previous metadata copy when necessary. Extra reserved capture bytes are
 reported through the runner's existing graph-memory return value. This is not
 a second deduction from the automatic KV budget.
 
-CPU scheduler work, the earlier MTP handoff gap, input IDs/embedding, spec-decode
-sampler metadata (now packed separately), FIA's later padding update and audio
-encoder stay outside this
-graph. It therefore does not promise to eliminate every gap or every H2D in the
-reported 6.4 ms interval.
+CPU scheduler work, the earlier MTP handoff gap, the normal input-ID upload,
+verifier metadata (packed separately) and the audio encoder stay outside this
+graph. Eligible pure-decode embedding and final FIA padding are now included.
+This does not promise to eliminate every gap or every H2D in the reported
+6.4 ms interval.
 
 ## Verify on the server
 
@@ -76,10 +80,14 @@ rg -n 'ASR_INPUT_PREPARE_GRAPH_READY|ASR_INPUT_PREPARE_GRAPH replays=' "$LOG"
 python tests/ut/worker/test_asr_input_prepare_graph_standalone.py
 ```
 
-`READY` reports captured buckets and additional reserved bytes. Runtime records
+`READY` reports captured metadata buckets, `embedding_graphs`, `fuse_handoff`
+and additional reserved bytes. Metadata-only and embedding variants share one
+pool; only one variant replays per batch. Runtime records
 appear on first traffic and then at most once per five seconds while traffic
 continues, including cumulative replay/miss counts, the current actual/bucket
-token count and `spec_metadata_uploads`. Older versions log only replay 1 and
+token count, `spec_metadata_uploads`, `embedding_replays` and `upload_records`.
+`embedding_replays` is a subset of `replays`; `upload_records` counts the
+preparation owner's fence records, not every event in the worker. Older versions log only replay 1 and
 multiples of 1000; one log line does not mean only one replay occurred. A READY
 line alone proves capture, not that requests reached this path. Miss counts cover
 oversize/invalid token counts after capture; startup profiling is not counted.
@@ -164,8 +172,9 @@ one and the builder's two Index/IndexCheck pairs and Add to disappear. Aggregate
 MEMCPY counts include device-to-device copies inside the preparation graph, so
 they are not a host-launch count. Other indices may have unrelated call sites.
 Compare the same MTP-to-decoder wall interval with identical concurrency and
-batch/token distributions. Embedding and the scheduler handoff remain outside
-this optimization. CPU equivalence tests do not establish NPU latency gains.
+batch/token distributions. This metadata packing alone does not cover embedding
+or the scheduler handoff. The additional fused path below covers eligible
+embedding. CPU equivalence tests do not establish NPU latency gains.
 
 ```bash
 python tests/ut/worker/test_asr_spec_decode_metadata_standalone.py
@@ -182,3 +191,61 @@ git apply examples/910b/asr_spec_decode_metadata_v023.patch
 
 The incremental patch adds `asr_spec_decode_metadata.py` as well as updating the
 runner and preparation helper. Copy all three files if deploying manually.
+
+## Fused preparation handoff
+
+With `fuse_handoff=True` (the default inside the opt-in preparation graph),
+`_prepare_inputs` stages CPU metadata without replaying immediately. After the
+runner selects final decoder padding, one preparation replay installs final FIA
+query starts, slots and the dummy block-table row. Attention metadata no longer
+uploads those query starts or launches the two redundant padding fills.
+The existing LM-head parallel padding path consumes logits indices early and
+retains immediate preparation and the original later padding.
+
+The verifier packer and preparation helper share one host-buffer copy fence.
+Normal eligible batches record it once after both uploads; reuse queries it once
+and waits only when incomplete. The accepted-token event and other worker events
+are unchanged. Event query/record/synchronize are host control operations; their
+presence in a CPU trace does not mean device kernels failed to enter a graph.
+
+With `capture_decode_embedding=True` (also default), capture creates an embedding
+variant for each metadata bucket. Eligible pure-decode batches select this
+variant instead of the metadata-only graph. The same replay computes embeddings
+and copies them into the runner's stable embedding buffer, avoiding a second
+embedding call in preprocessing. It does not introduce another replay between
+preparation and the decoder. This variant applies to the multimodal ASR runner
+with standard positions, no quantization/LoRA/prompt embeddings, CPU-authoritative
+IDs, no scheduled encoder work and no encoder connector. All requests must have
+finished their prompts. Mixed prefill/audio and unsupported inputs keep original
+preprocessing. A decoder padding size above the largest preparation bucket also
+keeps the original embedding path. No runtime graph capture is performed.
+
+For incremental A/B comparisons, keep metadata packing and token sizes fixed:
+
+| fuse_handoff | capture_decode_embedding | Behavior |
+| --- | --- | --- |
+| False | False | Previous early replay, separate upload fences and later padding |
+| True | False | Shared fence and final-padding replay, original embedding |
+| True | True | Same fused replay, with eligible pure-decode embedding |
+
+These are startup switches; disabling the parent graph disables all three
+optimizations. A trace still includes the original input-ID copy, block-table
+uploads, unrelated sampler work and required synchronization. Compare the same
+MTP-to-decoder wall interval and CPU self time, not an inclusive sum of nested
+CPU events or aggregate copy counts.
+
+For a checkout at `7e1be27cb`, use the new incremental patch:
+
+```bash
+git apply --check examples/910b/asr_preparation_handoff_v023.patch
+git apply examples/910b/asr_preparation_handoff_v023.patch
+python tests/ut/worker/test_asr_preparation_handoff_standalone.py
+```
+
+The cumulative patch against `2b3cb3c97` also includes this change. The older
+startup and verifier-metadata incremental patches retain their original bases;
+apply the patch matching your checkout, or update the branch. Deploy all three
+source files together: `asr_input_prepare_graph.py`, `asr_spec_decode_metadata.py`
+and `model_runner_v1.py`. The optional NPU test alternates metadata/embedding
+variants and token buckets to check shared-pool reuse. Local CPU tests cannot
+validate device graph correctness or end-to-end speedup.

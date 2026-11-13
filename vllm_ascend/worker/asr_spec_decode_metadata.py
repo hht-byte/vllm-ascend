@@ -14,11 +14,12 @@ class SyncSpecDecodeMetadata:
     ordered by the runner stream. Never use this for GPU-repaired input IDs.
     """
 
-    def __init__(self, runner, *, event=None):
+    def __init__(self, runner, *, event=None, upload_owner=None):
         self.max_requests = runner.seq_lens.numel()
         self.max_tokens = runner.max_num_tokens
         self.max_drafts = runner.num_spec_tokens
-        self.event = event if event is not None else torch.npu.Event()
+        self.upload_owner = upload_owner
+        self.event = None if upload_owner is not None else (event if event is not None else torch.npu.Event())
         self.pending = False
         self.uploads = 0
         self.arange = np.arange(self.max_tokens + self.max_requests, dtype=np.int64)
@@ -61,7 +62,9 @@ class SyncSpecDecodeMetadata:
             or scheduled_ends[-1] > min(self.max_tokens, len(input_ids))
         ):
             raise ValueError("speculative metadata exceeds capacity or has inconsistent lengths")
-        if self.pending and not self.event.query():
+        if self.upload_owner is not None:
+            self.upload_owner.before_upload()
+        elif self.pending and not self.event.query():
             self.event.synchronize()
         cu_draft = self.cpu["cu_num_draft_tokens"][:n]
         cu_sample = self.cpu["cu_num_sampled_tokens"][:n]
@@ -81,8 +84,9 @@ class SyncSpecDecodeMetadata:
         self.cpu["draft_token_ids"][:d] = input_ids[logits[target + 1]]
         size = self.draft_offset + d * 4
         self.device[:size].copy_(self.host[:size], non_blocking=True)
-        self.event.record()
-        self.pending = True
+        if self.upload_owner is None:
+            self.event.record()
+            self.pending = True
         self.uploads += 1
         sizes = {
             "cu_num_draft_tokens": n,
