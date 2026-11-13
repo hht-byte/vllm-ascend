@@ -1,0 +1,362 @@
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index a07bd7c90..27d63fb4c 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -168,6 +168,7 @@ from vllm_ascend.utils import (
+     sparse_kv_cache_has_indexer,
+     vllm_version_is,
+ )
++from vllm_ascend.worker.asr_input_prepare_graph import install as install_input_prepare_graph
+ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+ from vllm_ascend.worker.pcp_utils import PCPAsyncSpecDecodeRebuildResult, PCPManager
+ from vllm_ascend.worker.sync_input_metadata import install as install_sync_input_metadata
+@@ -607,6 +608,7 @@ class NPUModelRunner(GPUModelRunner):
+                 parallel_config=self.parallel_config, dtype=self.dtype)
+ 
+         # Install before model loading/capture so recorded tensor addresses stay fixed.
++        self._input_prepare_graph = install_input_prepare_graph(self, prepare_inputs=NPUModelRunner._prepare_inputs)
+         self._sync_input_metadata = install_sync_input_metadata(self, prepare_inputs=NPUModelRunner._prepare_inputs)
+         if self._sync_input_metadata is not None:
+             logger.info("ASR_SYNC_INPUT_PACKING enabled=True capacity_bytes=%d",
+@@ -887,6 +889,11 @@ class NPUModelRunner(GPUModelRunner):
+         num_reqs = self.input_batch.num_reqs
+         assert num_reqs > 0
+ 
++        input_prepare_bucket = (
++            self._input_prepare_graph.select(total_num_scheduled_tokens)
++            if self._input_prepare_graph is not None else None
++        )
++
+         # OPTIMIZATION: Start copying the block table first.
+         # This way, we can overlap the copy with the following CPU operations.
+         self.input_batch.block_table.commit_block_table(num_reqs)
+@@ -1072,7 +1079,8 @@ class NPUModelRunner(GPUModelRunner):
+ 
+         self.query_start_loc.np[0] = 0
+         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
+-        copy_snapshot_to_gpu(self.query_start_loc)
++        if input_prepare_bucket is None:
++            copy_snapshot_to_gpu(self.query_start_loc)
+ 
+         # Now, query_start_loc is padded.
+         # But gdn needs an unpadded one.
+@@ -1096,8 +1104,9 @@ class NPUModelRunner(GPUModelRunner):
+         )
+         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+ 
+-        # Fill unused with -1. Needed for reshape_and_cache in attention_cp
+-        self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
++        # Fill unused with -1. The preparation graph does this on its replay.
++        if input_prepare_bucket is None:
++            self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
+ 
+         # Copy the tensors to the NPU.
+         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
+@@ -1148,10 +1157,12 @@ class NPUModelRunner(GPUModelRunner):
+         discard_request_indices = np.nonzero(discard_requests_mask)[0]
+         self.num_discarded_requests = len(discard_request_indices)
+         self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
+-        self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
++        if input_prepare_bucket is None:
++            self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
+         
+         self.discard_request_mask.np[:num_reqs] = discard_requests_mask
+-        self.discard_request_mask.copy_to_gpu(num_reqs)
++        if input_prepare_bucket is None:
++            self.discard_request_mask.copy_to_gpu(num_reqs)
+ 
+         # Sync num_accepted_tokens from CPU (set by
+         # _update_states_after_model_execute for hybrid models).
+@@ -1164,14 +1175,29 @@ class NPUModelRunner(GPUModelRunner):
+             self.num_accepted_tokens.copy_to_gpu()
+         else:
+             self.num_accepted_tokens.np.fill(1)
+-            self.num_accepted_tokens.gpu.fill_(1)
++            if input_prepare_bucket is None:
++                self.num_accepted_tokens.gpu.fill_(1)
+ 
+         # Update num_computed_tokens on GPU. In async spec decode,
+         # CPU values are optimistic (all drafts accepted). The kernel
+         # corrects on GPU using the previous step's
+         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
+         valid_sampled_token_count_gpu = self.valid_sampled_token_count_gpu
+-        if self._sync_input_metadata is not None:
++        if input_prepare_bucket is not None:
++            self._input_prepare_graph.replay(
++                input_prepare_bucket,
++                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].numpy(),
++                self.optimistic_seq_lens_cpu[:num_reqs].numpy(),
++                positions_np[:total_num_scheduled_tokens],
++                self.query_start_loc.np[:num_reqs + 1],
++                discard_requests_mask,
++                discard_request_indices,
++            )
++            if self._input_prepare_graph.replays == 1 or self._input_prepare_graph.replays % 1000 == 0:
++                logger.info("ASR_INPUT_PREPARE_GRAPH replays=%d misses=%d tokens=%d bucket=%d",
++                            self._input_prepare_graph.replays, self._input_prepare_graph.misses,
++                            total_num_scheduled_tokens, input_prepare_bucket)
++        elif self._sync_input_metadata is not None:
+             # CPU positions/lengths above are authoritative in synchronous ASR.
+             # One copy replaces four H2Ds and device index/cast/add/fill launches.
+             self._sync_input_metadata.prepare(
+@@ -1295,7 +1321,7 @@ class NPUModelRunner(GPUModelRunner):
+ 
+         # For non-PCP, compute slot_mapping on GPU. PCP slot_mapping was
+         # already computed on GPU before PCP split the positions.
+-        if self.pcp_size <= 1:
++        if self.pcp_size <= 1 and input_prepare_bucket is None:
+             self.input_batch.block_table.compute_slot_mapping(
+                 num_reqs,
+                 self.query_start_loc.gpu[: num_reqs + 1],
+@@ -5118,6 +5144,14 @@ class NPUModelRunner(GPUModelRunner):
+         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+             cuda_graph_size = GPUModelRunner.capture_model(self)
+ 
++        # KV tables and decoder output addresses are final now. Capture the
++        # independent preparation graph once, never on the request hot path.
++        if self._input_prepare_graph is not None:
++            cuda_graph_size += self._input_prepare_graph.capture()
++            logger.info("ASR_INPUT_PREPARE_GRAPH_READY graphs=%d token_sizes=%s reserved_bytes=%d",
++                        len(self._input_prepare_graph.entries), self._input_prepare_graph.token_sizes,
++                        self._input_prepare_graph.reserved_bytes)
++
+         mgr = self.encoder_cudagraph_manager
+         if mgr is not None and hasattr(self, "update_stream"):
+             mgr.update_stream = self.update_stream
+diff --git a/vllm_ascend/worker/asr_input_prepare_graph.py b/vllm_ascend/worker/asr_input_prepare_graph.py
+new file mode 100644
+--- /dev/null
++++ b/vllm_ascend/worker/asr_input_prepare_graph.py
+@@ -0,0 +1,232 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Opt-in NPU graph for synchronous ASR input preparation, separate from forward."""
++
++from bisect import bisect_left
++from collections.abc import Mapping
++
++import torch
++
++
++def settings(runner, *, prepare_inputs):
++    config = runner.vllm_config.additional_config or {}
++    opts = config.get("asr_input_prepare_graph", {})
++    if not isinstance(opts, Mapping):
++        raise TypeError("asr_input_prepare_graph must be a mapping")
++    if set(opts) - {"enabled", "token_sizes"}:
++        raise ValueError("unknown asr_input_prepare_graph setting")
++    on = opts.get("enabled", False)
++    if type(on) is not bool:
++        raise TypeError("asr_input_prepare_graph.enabled must be a bool")
++    if not on:
++        return None
++    if config.get("asr_sync_input_packing", False):
++        raise ValueError("disable asr_sync_input_packing before enabling asr_input_prepare_graph")
++    if not isinstance(config.get("asr_mtp"), Mapping):
++        raise ValueError("asr_input_prepare_graph requires additional_config.asr_mtp")
++    if (
++        runner.use_async_scheduling
++        or runner.use_async_spec_decode
++        or runner.pcp_size != 1
++        or runner.dcp_size != 1
++        or getattr(runner.model_config, "is_hybrid", False)
++        or getattr(runner.model_config, "enforce_eager", False)
++        or getattr(runner, "num_accepted_tokens_event", None) is not None
++        or any(getattr(runner, name, False) for name in ("_has_gdn", "use_sparse", "use_compress", "is_hybrid"))
++        or any(
++            getattr(runner.parallel_config, name) != 1
++            for name in ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size")
++        )
++        or runner.compilation_config.cudagraph_mode.name != "FULL"
++    ):
++        raise ValueError("asr_input_prepare_graph requires synchronous single-device dense ASR with FULL graphs")
++    if runner._prepare_inputs.__func__ is not prepare_inputs:
++        raise ValueError("asr_input_prepare_graph does not support overridden _prepare_inputs")
++    capacity = min(runner.max_num_tokens, runner.positions.numel())
++    default = sorted({min(n, capacity) for n in (16, 64, 256, 1024)})
++    sizes = opts.get("token_sizes", default)
++    if (
++        not isinstance(sizes, (list, tuple))
++        or not sizes
++        or any(type(n) is not int or not 0 < n <= capacity for n in sizes)
++        or len(set(sizes)) != len(sizes)
++    ):
++        raise ValueError("token_sizes must be unique positive integers within the runner token capacity")
++    return tuple(sorted(sizes))
++
++
++class NPUCapture:
++    def __init__(self):
++        self.pool = torch.npu.graph_pool_handle()
++        self.event = torch.npu.Event()
++
++    def reserved(self):
++        return torch.npu.memory_reserved()
++
++    def capture(self, fn):
++        stream = torch.npu.Stream()
++        stream.wait_stream(torch.npu.current_stream())
++        with torch.npu.stream(stream):
++            for _ in range(2):
++                fn()
++        torch.npu.current_stream().wait_stream(stream)
++        torch.npu.synchronize()
++        graph = torch.npu.NPUGraph()
++        with torch.npu.graph(graph, pool=self.pool):
++            fn()
++        torch.npu.synchronize()
++        return graph
++
++
++class InputPrepareGraph:
++    """Fixed metadata addresses and fixed request grid; token buckets only.
++
++    CPU lengths and positions are already authoritative in the synchronous
++    runner. Upload them once, then replay all device copies/fills/slot mapping.
++    Graphs share one pool and output storage and must execute serially on the
++    runner stream. No runtime capture, host length readback or device-wide sync.
++    """
++
++    def __init__(self, runner, token_sizes, *, backend=None):
++        self.runner, self.token_sizes = runner, token_sizes
++        self.backend = backend if backend is not None else NPUCapture()
++        self.entries = {}
++        self.tables = None
++        self.ready = False
++        self.replays = self.misses = self.reserved_bytes = 0
++        self.pending_copy = False
++        self.max_requests = runner.seq_lens.numel()
++        self.outputs = {
++            "counts": runner.num_computed_tokens,
++            "seq": runner.seq_lens,
++            "qsl": runner.query_start_loc.gpu,
++            "discard_indices": runner.discard_request_indices.gpu,
++            "discard_mask": runner.discard_request_mask.gpu,
++            "positions": runner.positions,
++        }
++        expected = {
++            "counts": torch.int32,
++            "seq": torch.int32,
++            "qsl": torch.int32,
++            "discard_indices": torch.int64,
++            "discard_mask": torch.bool,
++            "positions": torch.int64,
++        }
++        for name, out in self.outputs.items():
++            sizes = (self.max_requests + 1, self.max_requests + 2) if name == "qsl" else (self.max_requests,)
++            if (
++                out.ndim != 1
++                or not out.is_contiguous()
++                or out.dtype != expected[name]
++                or (name != "positions" and out.numel() not in sizes)
++            ):
++                raise ValueError(f"unsupported input preparation layout: {name}")
++        self.accepted = runner.num_accepted_tokens.gpu
++        # Every field is independently aligned. Positions last: only the selected
++        # bucket prefix is transferred. Separate private qsl avoids FIA rewrites.
++        layout, offset = {}, 0
++        for name in ("counts", "seq", "qsl", "discard_indices", "discard_mask", "slot_qsl", "positions"):
++            out = self.outputs["qsl" if name == "slot_qsl" else name]
++            offset = (offset + 7) // 8 * 8
++            size = out.numel() * out.element_size()
++            layout[name] = (offset, size, out.dtype)
++            offset += size
++        self.host = torch.zeros(offset, dtype=torch.uint8, pin_memory=runner.pin_memory)
++        self.device = torch.zeros(offset, dtype=torch.uint8, device=runner.device)
++        self.inputs, self.cpu = {}, {}
++        for name, (start, size, dtype) in layout.items():
++            self.inputs[name] = self.device[start : start + size].view(dtype)
++            self.cpu[name] = self.host[start : start + size].view(dtype).numpy()
++        self.position_offset = layout["positions"][0]
++
++    def select(self, total_tokens):
++        if not self.ready:
++            return None
++        if self.runner.input_batch.block_table is not self.tables:
++            raise RuntimeError("input preparation graph block table was replaced after capture")
++        index = bisect_left(self.token_sizes, total_tokens)
++        if total_tokens <= 0 or index == len(self.token_sizes):
++            self.misses += 1
++            return None
++        return self.token_sizes[index]
++
++    def _run(self, tokens):
++        for name, out in self.outputs.items():
++            if name == "positions":
++                out[:tokens].copy_(self.inputs[name][:tokens])
++            else:
++                out.copy_(self.inputs[name])
++        self.accepted.fill_(1)
++        for table in self.tables.block_tables:
++            # The slot kernel clears tokens:capacity itself. It does not clear
++            # actual_tokens:tokens for a fixed bucket: explicitly clear that too.
++            table.slot_mapping.gpu[:tokens].fill_(-1)
++        self.tables.compute_slot_mapping(self.max_requests, self.inputs["slot_qsl"], self.outputs["positions"][:tokens])
++
++    @torch.inference_mode()
++    def capture(self):
++        if self.ready:
++            return 0
++        self.tables = self.runner.input_batch.block_table
++        if not self.tables.block_tables or any(
++            table.is_mamba_group
++            or table.block_table.gpu.shape[0] < self.max_requests
++            or table.slot_mapping.gpu.numel() < self.token_sizes[-1]
++            or table.max_num_batched_tokens < self.token_sizes[-1]
++            for table in self.tables.block_tables
++        ):
++            raise ValueError("unsupported input preparation block table layout")
++        before = self.backend.reserved()
++        # Zero private qsl makes every request inactive during capture. Runtime
++        # lengths are device inputs to the fixed-grid existing slot kernel.
++        self.device.zero_()
++        for tokens in self.token_sizes:
++            self.entries[tokens] = self.backend.capture(lambda tokens=tokens: self._run(tokens))
++        self.reserved_bytes = max(0, self.backend.reserved() - before)
++        self.ready = True
++        return self.reserved_bytes
++
++    @torch.inference_mode()
++    def replay(self, bucket, counts, seq_lens, positions, qsl, discard_mask, discard_indices):
++        n, t = len(counts), len(positions)
++        if (
++            not self.ready
++            or bucket not in self.entries
++            or not 0 < n <= self.max_requests
++            or not 0 < t <= bucket
++            or len(seq_lens) != n
++            or len(qsl) != n + 1
++            or qsl[0] != 0
++            or qsl[-1] != t
++            or len(discard_mask) != n
++            or len(discard_indices) > n
++        ):
++            raise ValueError("input preparation metadata exceeds captured capacity or has inconsistent lengths")
++        event = self.backend.event
++        if self.pending_copy and not event.query():
++            event.synchronize()  # Protect pinned host reuse, only the preceding copy.
++        for name, values in (
++            ("counts", counts),
++            ("seq", seq_lens),
++            ("discard_indices", discard_indices),
++            ("discard_mask", discard_mask),
++        ):
++            self.cpu[name].fill(0)
++            self.cpu[name][: len(values)] = values
++        self.cpu["qsl"].fill(-1)
++        self.cpu["qsl"][: n + 1] = qsl
++        self.cpu["slot_qsl"].fill(t)
++        self.cpu["slot_qsl"][: n + 1] = qsl
++        self.cpu["positions"][:t] = positions
++        self.cpu["positions"][t:bucket] = 0
++        size = self.position_offset + bucket * 8
++        self.device[:size].copy_(self.host[:size], non_blocking=True)
++        event.record()
++        self.pending_copy = True
++        self.entries[bucket].replay()
++        self.replays += 1
++
++
++def install(runner, *, prepare_inputs):
++    sizes = settings(runner, prepare_inputs=prepare_inputs)
++    return None if sizes is None else InputPrepareGraph(runner, sizes)

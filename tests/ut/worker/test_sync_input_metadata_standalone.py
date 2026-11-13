@@ -186,6 +186,7 @@ class RunnerWiringTests(unittest.TestCase):
                 r.query_pos.np[: len(pos)] = offsets
                 ns = dict(
                     self=r,
+                    input_prepare_bucket=None,
                     num_reqs=n,
                     total_num_scheduled_tokens=len(pos),
                     req_indices=ids,
