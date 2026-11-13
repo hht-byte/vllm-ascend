@@ -1,0 +1,224 @@
+diff --git a/vllm_ascend/worker/asr_input_prepare_graph.py b/vllm_ascend/worker/asr_input_prepare_graph.py
+index 16430ba41..0ad8f1581 100644
+--- a/vllm_ascend/worker/asr_input_prepare_graph.py
++++ b/vllm_ascend/worker/asr_input_prepare_graph.py
+@@ -4,6 +4,7 @@
+ 
+ from bisect import bisect_left
+ from collections.abc import Mapping
++from time import monotonic
+ 
+ import torch
+ 
+@@ -13,13 +14,15 @@ def settings(runner, *, prepare_inputs):
+     opts = config.get("asr_input_prepare_graph", {})
+     if not isinstance(opts, Mapping):
+         raise TypeError("asr_input_prepare_graph must be a mapping")
+-    if set(opts) - {"enabled", "token_sizes"}:
++    if set(opts) - {"enabled", "token_sizes", "pack_spec_metadata"}:
+         raise ValueError("unknown asr_input_prepare_graph setting")
+     on = opts.get("enabled", False)
+     if type(on) is not bool:
+         raise TypeError("asr_input_prepare_graph.enabled must be a bool")
+     if not on:
+         return None
++    if type(opts.get("pack_spec_metadata", True)) is not bool:
++        raise TypeError("asr_input_prepare_graph.pack_spec_metadata must be a bool")
+     if config.get("asr_sync_input_packing", False):
+         raise ValueError("disable asr_sync_input_packing before enabling asr_input_prepare_graph")
+     if not isinstance(config.get("asr_mtp"), Mapping):
+@@ -112,6 +115,7 @@ class InputPrepareGraph:
+         self.ready = False
+         self.replays = self.misses = self.reserved_bytes = 0
+         self.pending_copy = False
++        self.last_stats_time = None
+         self.max_requests = runner.seq_lens.numel()
+         self.outputs = {
+             "counts": runner.num_computed_tokens,
+@@ -168,6 +172,15 @@ class InputPrepareGraph:
+             return None
+         return self.token_sizes[index]
+ 
++    def should_log(self, *, now=None):
++        if not self.ready or self.replays + self.misses == 0:
++            return False
++        now = monotonic() if now is None else now
++        if self.last_stats_time is not None and now - self.last_stats_time < 5.0:
++            return False
++        self.last_stats_time = now
++        return True
++
+     def _run(self, tokens):
+         for name, out in self.outputs.items():
+             if name == "positions":
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index f86683356..2212ca995 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -169,6 +169,7 @@ from vllm_ascend.utils import (
+     vllm_version_is,
+ )
+ from vllm_ascend.worker.asr_input_prepare_graph import install as install_input_prepare_graph
++from vllm_ascend.worker.asr_spec_decode_metadata import SyncSpecDecodeMetadata
+ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+ from vllm_ascend.worker.pcp_utils import PCPAsyncSpecDecodeRebuildResult, PCPManager
+ from vllm_ascend.worker.sync_input_metadata import install as install_sync_input_metadata
+@@ -609,6 +610,14 @@ class NPUModelRunner(GPUModelRunner):
+ 
+         # Install before model loading/capture so recorded tensor addresses stay fixed.
+         self._input_prepare_graph = install_input_prepare_graph(self, prepare_inputs=NPUModelRunner._prepare_inputs)
++        self._spec_decode_metadata_packer = (
++            SyncSpecDecodeMetadata(self)
++            if self._input_prepare_graph is not None
++            and (self.vllm_config.additional_config or {}).get("asr_input_prepare_graph", {}).get(
++                "pack_spec_metadata", True
++            )
++            else None
++        )
+         self._sync_input_metadata = install_sync_input_metadata(self, prepare_inputs=NPUModelRunner._prepare_inputs)
+         if self._sync_input_metadata is not None:
+             logger.info("ASR_SYNC_INPUT_PACKING enabled=True capacity_bytes=%d",
+@@ -1194,10 +1203,6 @@ class NPUModelRunner(GPUModelRunner):
+                 discard_requests_mask,
+                 discard_request_indices,
+             )
+-            if self._input_prepare_graph.replays == 1 or self._input_prepare_graph.replays % 1000 == 0:
+-                logger.info("ASR_INPUT_PREPARE_GRAPH replays=%d misses=%d tokens=%d bucket=%d",
+-                            self._input_prepare_graph.replays, self._input_prepare_graph.misses,
+-                            total_num_scheduled_tokens, input_prepare_bucket)
+         elif self._sync_input_metadata is not None:
+             # CPU positions/lengths above are authoritative in synchronous ASR.
+             # One copy replaces four H2Ds and device index/cast/add/fill launches.
+@@ -1386,6 +1391,13 @@ class NPUModelRunner(GPUModelRunner):
+             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
+             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
+             self.num_decode_draft_tokens.copy_to_gpu()
++        if self._input_prepare_graph is not None and self._input_prepare_graph.should_log():
++            logger.info(
++                "ASR_INPUT_PREPARE_GRAPH replays=%d misses=%d tokens=%d bucket=%s spec_metadata_uploads=%d",
++                self._input_prepare_graph.replays, self._input_prepare_graph.misses,
++                total_num_scheduled_tokens, input_prepare_bucket,
++                self._spec_decode_metadata_packer.uploads if self._spec_decode_metadata_packer is not None else 0,
++            )
+         # save logits_indices for pcp spec decode usage
+         self.logits_indices = logits_indices
+ 
+@@ -1571,6 +1583,16 @@ class NPUModelRunner(GPUModelRunner):
+         cu_num_scheduled_tokens: np.ndarray,
+         num_pcp_pads: np.ndarray | None,
+     ) -> SpecDecodeMetadata:
++        if (
++            self._spec_decode_metadata_packer is not None
++            and not self.use_async_scheduling
++            and not self.use_async_spec_decode
++            and self.pcp_size == 1
++            and self.input_batch.prev_sampled_token_ids is None
++        ):
++            return self._spec_decode_metadata_packer.prepare(
++                num_draft_tokens, cu_num_scheduled_tokens, self.input_ids.np, SpecDecodeMetadata
++            )
+         # Inputs:
+         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
+         # num_draft_tokens:         [  3,   0,   2,   0,   1]
+diff --git a/vllm_ascend/worker/asr_spec_decode_metadata.py b/vllm_ascend/worker/asr_spec_decode_metadata.py
+new file mode 100644
+--- /dev/null
++++ b/vllm_ascend/worker/asr_spec_decode_metadata.py
+@@ -0,0 +1,97 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""One upload for CPU-authoritative synchronous speculative verifier metadata."""
++
++import numpy as np
++import torch
++
++
++class SyncSpecDecodeMetadata:
++    """Reuse fixed host/device storage on the synchronous runner stream.
++
++    All consumers must finish using these views before the next engine step.
++    The copy event protects pinned host reuse, not device consumers: those are
++    ordered by the runner stream. Never use this for GPU-repaired input IDs.
++    """
++
++    def __init__(self, runner, *, event=None):
++        self.max_requests = runner.seq_lens.numel()
++        self.max_tokens = runner.max_num_tokens
++        self.max_drafts = runner.num_spec_tokens
++        self.event = event if event is not None else torch.npu.Event()
++        self.pending = False
++        self.uploads = 0
++        self.arange = np.arange(self.max_tokens + self.max_requests, dtype=np.int64)
++        sample_capacity = min(self.max_tokens, self.max_requests * (self.max_drafts + 1))
++        draft_capacity = min(self.max_tokens, self.max_requests * self.max_drafts)
++        fields = (
++            ("cu_num_draft_tokens", self.max_requests, torch.int32),
++            ("cu_num_sampled_tokens", self.max_requests, torch.int32),
++            ("bonus_logits_indices", self.max_requests, torch.int32),
++            ("logits_indices", sample_capacity, torch.int64),
++            ("target_logits_indices", draft_capacity, torch.int64),
++            ("draft_token_ids", draft_capacity, torch.int32),
++        )
++        layout, offset = {}, 0
++        for name, capacity, dtype in fields:
++            offset = (offset + 7) // 8 * 8
++            size = capacity * torch.empty((), dtype=dtype).element_size()
++            layout[name] = offset, size, dtype
++            offset += size
++        self.host = torch.zeros(offset, dtype=torch.uint8, pin_memory=runner.pin_memory)
++        self.device = torch.zeros(offset, dtype=torch.uint8, device=runner.device)
++        self.cpu, self.gpu = {}, {}
++        for name, (start, size, dtype) in layout.items():
++            self.cpu[name] = self.host[start : start + size].view(dtype).numpy()
++            self.gpu[name] = self.device[start : start + size].view(dtype)
++        self.draft_offset = layout["draft_token_ids"][0]
++
++    @torch.inference_mode()
++    def prepare(self, drafts, scheduled_ends, input_ids, metadata_type):
++        n = len(drafts)
++        lengths = np.diff(scheduled_ends, prepend=0)
++        if (
++            not 0 < n <= self.max_requests
++            or len(scheduled_ends) != n
++            or drafts.ndim != 1
++            or scheduled_ends.ndim != 1
++            or np.any(drafts < 0)
++            or np.any(drafts > self.max_drafts)
++            or np.any(lengths < drafts + 1)
++            or scheduled_ends[-1] > min(self.max_tokens, len(input_ids))
++        ):
++            raise ValueError("speculative metadata exceeds capacity or has inconsistent lengths")
++        if self.pending and not self.event.query():
++            self.event.synchronize()
++        cu_draft = self.cpu["cu_num_draft_tokens"][:n]
++        cu_sample = self.cpu["cu_num_sampled_tokens"][:n]
++        np.cumsum(drafts, dtype=np.int32, out=cu_draft)
++        np.add(cu_draft, self.arange[1 : n + 1], out=cu_sample, casting="unsafe")
++        d, s = int(cu_draft[-1]), int(cu_sample[-1])
++        sampled = drafts + 1
++        logits = self.cpu["logits_indices"][:s]
++        logits[:] = (
++            np.repeat(scheduled_ends - sampled, sampled) + self.arange[:s] - np.repeat(cu_sample - sampled, sampled)
++        )
++        target = self.cpu["target_logits_indices"][:d]
++        target[:] = np.repeat(cu_sample - sampled, drafts) + self.arange[:d] - np.repeat(cu_draft - drafts, drafts)
++        np.subtract(cu_sample, 1, out=self.cpu["bonus_logits_indices"][:n])
++        # The synchronous runner already prepared these exact CPU input IDs.
++        # NumPy indexing replaces two NPU Index/IndexCheck launches and Add.
++        self.cpu["draft_token_ids"][:d] = input_ids[logits[target + 1]]
++        size = self.draft_offset + d * 4
++        self.device[:size].copy_(self.host[:size], non_blocking=True)
++        self.event.record()
++        self.pending = True
++        self.uploads += 1
++        sizes = {
++            "cu_num_draft_tokens": n,
++            "cu_num_sampled_tokens": n,
++            "bonus_logits_indices": n,
++            "logits_indices": s,
++            "target_logits_indices": d,
++            "draft_token_ids": d,
++        }
++        return metadata_type(
++            num_draft_tokens=drafts.tolist(), **{key: self.gpu[key][:length] for key, length in sizes.items()}
++        )

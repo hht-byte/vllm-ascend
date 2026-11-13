@@ -4,6 +4,7 @@
 
 from bisect import bisect_left
 from collections.abc import Mapping
+from time import monotonic
 
 import torch
 
@@ -13,13 +14,15 @@ def settings(runner, *, prepare_inputs):
     opts = config.get("asr_input_prepare_graph", {})
     if not isinstance(opts, Mapping):
         raise TypeError("asr_input_prepare_graph must be a mapping")
-    if set(opts) - {"enabled", "token_sizes"}:
+    if set(opts) - {"enabled", "token_sizes", "pack_spec_metadata"}:
         raise ValueError("unknown asr_input_prepare_graph setting")
     on = opts.get("enabled", False)
     if type(on) is not bool:
         raise TypeError("asr_input_prepare_graph.enabled must be a bool")
     if not on:
         return None
+    if type(opts.get("pack_spec_metadata", True)) is not bool:
+        raise TypeError("asr_input_prepare_graph.pack_spec_metadata must be a bool")
     if config.get("asr_sync_input_packing", False):
         raise ValueError("disable asr_sync_input_packing before enabling asr_input_prepare_graph")
     if not isinstance(config.get("asr_mtp"), Mapping):
@@ -112,6 +115,7 @@ class InputPrepareGraph:
         self.ready = False
         self.replays = self.misses = self.reserved_bytes = 0
         self.pending_copy = False
+        self.last_stats_time = None
         self.max_requests = runner.seq_lens.numel()
         self.outputs = {
             "counts": runner.num_computed_tokens,
@@ -167,6 +171,15 @@ class InputPrepareGraph:
             self.misses += 1
             return None
         return self.token_sizes[index]
+
+    def should_log(self, *, now=None):
+        if not self.ready or self.replays + self.misses == 0:
+            return False
+        now = monotonic() if now is None else now
+        if self.last_stats_time is not None and now - self.last_stats_time < 5.0:
+            return False
+        self.last_stats_time = now
+        return True
 
     def _run(self, tokens):
         for name, out in self.outputs.items():

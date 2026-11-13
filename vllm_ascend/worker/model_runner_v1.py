@@ -169,6 +169,7 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.asr_input_prepare_graph import install as install_input_prepare_graph
+from vllm_ascend.worker.asr_spec_decode_metadata import SyncSpecDecodeMetadata
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPAsyncSpecDecodeRebuildResult, PCPManager
 from vllm_ascend.worker.sync_input_metadata import install as install_sync_input_metadata
@@ -609,6 +610,14 @@ class NPUModelRunner(GPUModelRunner):
 
         # Install before model loading/capture so recorded tensor addresses stay fixed.
         self._input_prepare_graph = install_input_prepare_graph(self, prepare_inputs=NPUModelRunner._prepare_inputs)
+        self._spec_decode_metadata_packer = (
+            SyncSpecDecodeMetadata(self)
+            if self._input_prepare_graph is not None
+            and (self.vllm_config.additional_config or {}).get("asr_input_prepare_graph", {}).get(
+                "pack_spec_metadata", True
+            )
+            else None
+        )
         self._sync_input_metadata = install_sync_input_metadata(self, prepare_inputs=NPUModelRunner._prepare_inputs)
         if self._sync_input_metadata is not None:
             logger.info("ASR_SYNC_INPUT_PACKING enabled=True capacity_bytes=%d",
@@ -1194,10 +1203,6 @@ class NPUModelRunner(GPUModelRunner):
                 discard_requests_mask,
                 discard_request_indices,
             )
-            if self._input_prepare_graph.replays == 1 or self._input_prepare_graph.replays % 1000 == 0:
-                logger.info("ASR_INPUT_PREPARE_GRAPH replays=%d misses=%d tokens=%d bucket=%d",
-                            self._input_prepare_graph.replays, self._input_prepare_graph.misses,
-                            total_num_scheduled_tokens, input_prepare_bucket)
         elif self._sync_input_metadata is not None:
             # CPU positions/lengths above are authoritative in synchronous ASR.
             # One copy replaces four H2Ds and device index/cast/add/fill launches.
@@ -1386,6 +1391,13 @@ class NPUModelRunner(GPUModelRunner):
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
+        if self._input_prepare_graph is not None and self._input_prepare_graph.should_log():
+            logger.info(
+                "ASR_INPUT_PREPARE_GRAPH replays=%d misses=%d tokens=%d bucket=%s spec_metadata_uploads=%d",
+                self._input_prepare_graph.replays, self._input_prepare_graph.misses,
+                total_num_scheduled_tokens, input_prepare_bucket,
+                self._spec_decode_metadata_packer.uploads if self._spec_decode_metadata_packer is not None else 0,
+            )
         # save logits_indices for pcp spec decode usage
         self.logits_indices = logits_indices
 
@@ -1571,6 +1583,16 @@ class NPUModelRunner(GPUModelRunner):
         cu_num_scheduled_tokens: np.ndarray,
         num_pcp_pads: np.ndarray | None,
     ) -> SpecDecodeMetadata:
+        if (
+            self._spec_decode_metadata_packer is not None
+            and not self.use_async_scheduling
+            and not self.use_async_spec_decode
+            and self.pcp_size == 1
+            and self.input_batch.prev_sampled_token_ids is None
+        ):
+            return self._spec_decode_metadata_packer.prepare(
+                num_draft_tokens, cu_num_scheduled_tokens, self.input_ids.np, SpecDecodeMetadata
+            )
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
         # num_draft_tokens:         [  3,   0,   2,   0,   1]

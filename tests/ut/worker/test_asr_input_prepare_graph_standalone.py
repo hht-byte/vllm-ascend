@@ -122,6 +122,29 @@ class PrepareGraphTests(unittest.TestCase):
     def graph(self):
         return self.mod.InputPrepareGraph(self.r, (8, 16, 32), backend=self.backend)
 
+    def test_stats_report_traffic_without_waiting_for_1000_replays(self):
+        graph = self.graph()
+        self.assertTrue(hasattr(graph, "should_log"), "time-based graph stats missing")
+        self.assertFalse(graph.should_log(now=0))
+        graph.capture()
+        graph.replays = 1
+        self.assertTrue(graph.should_log(now=0))
+        graph.replays = 12
+        self.assertFalse(graph.should_log(now=4.9))
+        self.assertTrue(graph.should_log(now=5.0))
+        graph.select(33)  # Oversize-only traffic must also produce stats.
+        self.assertTrue(graph.should_log(now=10.0))
+
+    def test_spec_metadata_switch_validation(self):
+        r = self.r
+        r._prepare_inputs = MethodType(prepare_inputs, r)
+        opts = r.vllm_config.additional_config["asr_input_prepare_graph"]
+        opts["pack_spec_metadata"] = False
+        self.assertEqual(self.mod.settings(r, prepare_inputs=prepare_inputs), (8, 16, 32))
+        opts["pack_spec_metadata"] = "false"
+        with self.assertRaisesRegex(TypeError, "pack_spec_metadata"):
+            self.mod.settings(r, prepare_inputs=prepare_inputs)
+
     def test_replay_dynamic_reorder_shrink_and_padding(self):
         graph = self.graph()
         self.assertIsNone(graph.select(7))
