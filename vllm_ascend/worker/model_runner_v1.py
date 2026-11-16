@@ -169,6 +169,7 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.asr_input_prepare_graph import install as install_input_prepare_graph
+from vllm_ascend.worker.asr_rejection_output import install as install_rejection_output
 from vllm_ascend.worker.asr_spec_decode_metadata import SyncSpecDecodeMetadata
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPAsyncSpecDecodeRebuildResult, PCPManager
@@ -610,6 +611,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # Install before model loading/capture so recorded tensor addresses stay fixed.
         self._input_prepare_graph = install_input_prepare_graph(self, prepare_inputs=NPUModelRunner._prepare_inputs)
+        self._rejection_output_buffer = install_rejection_output(self)
         self._spec_decode_metadata_packer = (
             SyncSpecDecodeMetadata(
                 self, upload_owner=(self._input_prepare_graph if self._input_prepare_graph.fuse_handoff else None)
@@ -1441,7 +1443,8 @@ class NPUModelRunner(GPUModelRunner):
         if graph is not None and graph.should_log():
             logger.info(
                 "ASR_INPUT_PREPARE_GRAPH replays=%d misses=%d tokens=%d bucket=%s "
-                "spec_metadata_uploads=%d embedding_replays=%d upload_records=%d",
+                "spec_metadata_uploads=%d embedding_replays=%d upload_records=%d "
+                "rejection_copies=%d rejection_fallbacks=%d",
                 graph.replays,
                 graph.misses,
                 tokens,
@@ -1449,6 +1452,8 @@ class NPUModelRunner(GPUModelRunner):
                 self._spec_decode_metadata_packer.uploads if self._spec_decode_metadata_packer is not None else 0,
                 graph.embedding_replays,
                 graph.upload_records,
+                self._rejection_output_buffer.copies if self._rejection_output_buffer is not None else 0,
+                self._rejection_output_buffer.fallbacks if self._rejection_output_buffer is not None else 0,
             )
 
     def _preprocess(
@@ -2814,12 +2819,21 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 # Includes spec decode tokens.
                 # parse_output returns (list[list[int]], LogprobsLists | None)
-                valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
-                    sampled_token_ids,
-                    self.input_batch.vocab_size,
-                    discard_sampled_tokens_req_indices,
-                    logprobs_tensors=logprobs_tensors,
-                )
+                if self._rejection_output_buffer is not None:
+                    valid_sampled_token_ids, logprobs_lists = self._rejection_output_buffer.parse(
+                        sampled_token_ids,
+                        self.input_batch.vocab_size,
+                        discard_sampled_tokens_req_indices,
+                        parser=RejectionSampler.parse_output,
+                        logprobs_tensors=logprobs_tensors,
+                    )
+                else:
+                    valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
+                        sampled_token_ids,
+                        self.input_batch.vocab_size,
+                        discard_sampled_tokens_req_indices,
+                        logprobs_tensors=logprobs_tensors,
+                    )
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()

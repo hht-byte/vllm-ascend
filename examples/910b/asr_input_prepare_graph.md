@@ -19,6 +19,7 @@ additional["asr_input_prepare_graph"] = {
     "pack_spec_metadata": True,
     "fuse_handoff": True,
     "capture_decode_embedding": True,
+    "reuse_rejection_buffer": True,
 }
 base_config["additional_config"] = additional
 # Continue using the existing mtp_engine_config(...) and engine construction.
@@ -244,8 +245,18 @@ python tests/ut/worker/test_asr_preparation_handoff_standalone.py
 
 The cumulative patch against `2b3cb3c97` also includes this change. The older
 startup and verifier-metadata incremental patches retain their original bases;
-apply the patch matching your checkout, or update the branch. Deploy all three
-source files together: `asr_input_prepare_graph.py`, `asr_spec_decode_metadata.py`
-and `model_runner_v1.py`. The optional NPU test alternates metadata/embedding
+apply the patch matching your checkout, or update the branch. Deploy all four
+source files together: `asr_input_prepare_graph.py`, `asr_spec_decode_metadata.py`,
+`asr_rejection_output.py` and `model_runner_v1.py`. The optional NPU test alternates metadata/embedding
 variants and token buckets to check shared-pool reuse. Local CPU tests cannot
 validate device graph correctness or end-to-end speedup.
+
+## Rejection readback reuse
+
+`reuse_rejection_buffer=True` reuses a bounded pinned buffer for synchronous
+int32 speculative results without logprobs, then delegates to the original
+vLLM parser after an event wait. Set it to `False` for an independent ablation.
+`rejection_copies` and `rejection_fallbacks` join the existing periodic log.
+This reduces allocation/copy setup before MTP; it does not remove the required
+accepted-token readback or move host control operations into a graph.
+See [buffer reuse deployment and validation](asr_rejection_mtp_buffers.md).

@@ -14,14 +14,14 @@ def settings(runner, *, prepare_inputs):
     opts = config.get("asr_input_prepare_graph", {})
     if not isinstance(opts, Mapping):
         raise TypeError("asr_input_prepare_graph must be a mapping")
-    if set(opts) - {"enabled", "token_sizes", "pack_spec_metadata", "fuse_handoff", "capture_decode_embedding"}:
+    if set(opts) - {"enabled", "token_sizes", "pack_spec_metadata", "fuse_handoff", "capture_decode_embedding", "reuse_rejection_buffer"}:
         raise ValueError("unknown asr_input_prepare_graph setting")
     on = opts.get("enabled", False)
     if type(on) is not bool:
         raise TypeError("asr_input_prepare_graph.enabled must be a bool")
     if not on:
         return None
-    for name in ("pack_spec_metadata", "fuse_handoff", "capture_decode_embedding"):
+    for name in ("pack_spec_metadata", "fuse_handoff", "capture_decode_embedding", "reuse_rejection_buffer"):
         if type(opts.get(name, True)) is not bool:
             raise TypeError(f"asr_input_prepare_graph.{name} must be a bool")
     if config.get("asr_sync_input_packing", False):

@@ -1,6 +1,3 @@
-diff --git a/vllm_ascend/worker/asr_input_prepare_graph.py b/vllm_ascend/worker/asr_input_prepare_graph.py
-new file mode 100644
-index 000000000..650ee8dc2
 --- /dev/null
 +++ b/vllm_ascend/worker/asr_input_prepare_graph.py
 @@ -0,0 +1,423 @@
@@ -20,14 +17,14 @@ index 000000000..650ee8dc2
 +    opts = config.get("asr_input_prepare_graph", {})
 +    if not isinstance(opts, Mapping):
 +        raise TypeError("asr_input_prepare_graph must be a mapping")
-+    if set(opts) - {"enabled", "token_sizes", "pack_spec_metadata", "fuse_handoff", "capture_decode_embedding"}:
++    if set(opts) - {"enabled", "token_sizes", "pack_spec_metadata", "fuse_handoff", "capture_decode_embedding", "reuse_rejection_buffer"}:
 +        raise ValueError("unknown asr_input_prepare_graph setting")
 +    on = opts.get("enabled", False)
 +    if type(on) is not bool:
 +        raise TypeError("asr_input_prepare_graph.enabled must be a bool")
 +    if not on:
 +        return None
-+    for name in ("pack_spec_metadata", "fuse_handoff", "capture_decode_embedding"):
++    for name in ("pack_spec_metadata", "fuse_handoff", "capture_decode_embedding", "reuse_rejection_buffer"):
 +        if type(opts.get(name, True)) is not bool:
 +            raise TypeError(f"asr_input_prepare_graph.{name} must be a bool")
 +    if config.get("asr_sync_input_packing", False):
@@ -427,9 +424,6 @@ index 000000000..650ee8dc2
 +def install(runner, *, prepare_inputs):
 +    sizes = settings(runner, prepare_inputs=prepare_inputs)
 +    return None if sizes is None else InputPrepareGraph(runner, sizes)
-diff --git a/vllm_ascend/worker/asr_spec_decode_metadata.py b/vllm_ascend/worker/asr_spec_decode_metadata.py
-new file mode 100644
-index 000000000..9011816b6
 --- /dev/null
 +++ b/vllm_ascend/worker/asr_spec_decode_metadata.py
 @@ -0,0 +1,101 @@
@@ -534,24 +528,24 @@ index 000000000..9011816b6
 +        return metadata_type(
 +            num_draft_tokens=drafts.tolist(), **{key: self.gpu[key][:length] for key, length in sizes.items()}
 +        )
-diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
-index a07bd7c90..f42fd7100 100644
 --- a/vllm_ascend/worker/model_runner_v1.py
 +++ b/vllm_ascend/worker/model_runner_v1.py
-@@ -168,6 +168,8 @@ from vllm_ascend.utils import (
+@@ -168,6 +168,9 @@
      sparse_kv_cache_has_indexer,
      vllm_version_is,
  )
 +from vllm_ascend.worker.asr_input_prepare_graph import install as install_input_prepare_graph
++from vllm_ascend.worker.asr_rejection_output import install as install_rejection_output
 +from vllm_ascend.worker.asr_spec_decode_metadata import SyncSpecDecodeMetadata
  from vllm_ascend.worker.npu_input_batch import NPUInputBatch
  from vllm_ascend.worker.pcp_utils import PCPAsyncSpecDecodeRebuildResult, PCPManager
  from vllm_ascend.worker.sync_input_metadata import install as install_sync_input_metadata
-@@ -607,6 +609,17 @@ class NPUModelRunner(GPUModelRunner):
+@@ -607,6 +610,18 @@
                  parallel_config=self.parallel_config, dtype=self.dtype)
- 
+
          # Install before model loading/capture so recorded tensor addresses stay fixed.
 +        self._input_prepare_graph = install_input_prepare_graph(self, prepare_inputs=NPUModelRunner._prepare_inputs)
++        self._rejection_output_buffer = install_rejection_output(self)
 +        self._spec_decode_metadata_packer = (
 +            SyncSpecDecodeMetadata(
 +                self, upload_owner=(self._input_prepare_graph if self._input_prepare_graph.fuse_handoff else None)
@@ -565,7 +559,7 @@ index a07bd7c90..f42fd7100 100644
          self._sync_input_metadata = install_sync_input_metadata(self, prepare_inputs=NPUModelRunner._prepare_inputs)
          if self._sync_input_metadata is not None:
              logger.info("ASR_SYNC_INPUT_PACKING enabled=True capacity_bytes=%d",
-@@ -825,6 +838,8 @@ class NPUModelRunner(GPUModelRunner):
+@@ -825,6 +840,8 @@
          num_reqs: int,
          cudagraph_runtime_mode: CUDAGraphMode | None = None,
          batch_desc_num_reqs: int | None = None,
@@ -574,20 +568,20 @@ index a07bd7c90..f42fd7100 100644
      ) -> int:
          """
          This function is only designed to satisfied the constraint that when the layout is TND,
-@@ -862,7 +877,8 @@ class NPUModelRunner(GPUModelRunner):
+@@ -862,7 +879,8 @@
                  query_start_loc.np[num_reqs_padded + 1] = num_tokens_padded
                  num_reqs_padded = num_reqs_padded + 1
- 
+
 -        copy_snapshot_to_gpu(query_start_loc)
 +        if not defer_upload:
 +            copy_snapshot_to_gpu(query_start_loc)
- 
+
          return num_reqs_padded
- 
-@@ -887,6 +903,11 @@ class NPUModelRunner(GPUModelRunner):
+
+@@ -887,6 +905,11 @@
          num_reqs = self.input_batch.num_reqs
          assert num_reqs > 0
- 
+
 +        input_prepare_bucket = (
 +            self._input_prepare_graph.select(total_num_scheduled_tokens)
 +            if self._input_prepare_graph is not None else None
@@ -596,29 +590,29 @@ index a07bd7c90..f42fd7100 100644
          # OPTIMIZATION: Start copying the block table first.
          # This way, we can overlap the copy with the following CPU operations.
          self.input_batch.block_table.commit_block_table(num_reqs)
-@@ -1072,7 +1093,8 @@ class NPUModelRunner(GPUModelRunner):
- 
+@@ -1072,7 +1095,8 @@
+
          self.query_start_loc.np[0] = 0
          self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
 -        copy_snapshot_to_gpu(self.query_start_loc)
 +        if input_prepare_bucket is None:
 +            copy_snapshot_to_gpu(self.query_start_loc)
- 
+
          # Now, query_start_loc is padded.
          # But gdn needs an unpadded one.
-@@ -1096,8 +1118,9 @@ class NPUModelRunner(GPUModelRunner):
+@@ -1096,8 +1120,9 @@
          )
          self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
- 
+
 -        # Fill unused with -1. Needed for reshape_and_cache in attention_cp
 -        self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
 +        # Fill unused with -1. The preparation graph does this on its replay.
 +        if input_prepare_bucket is None:
 +            self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
- 
+
          # Copy the tensors to the NPU.
          self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
-@@ -1148,10 +1171,12 @@ class NPUModelRunner(GPUModelRunner):
+@@ -1148,10 +1173,12 @@
          discard_request_indices = np.nonzero(discard_requests_mask)[0]
          self.num_discarded_requests = len(discard_request_indices)
          self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
@@ -630,10 +624,10 @@ index a07bd7c90..f42fd7100 100644
 -        self.discard_request_mask.copy_to_gpu(num_reqs)
 +        if input_prepare_bucket is None:
 +            self.discard_request_mask.copy_to_gpu(num_reqs)
- 
+
          # Sync num_accepted_tokens from CPU (set by
          # _update_states_after_model_execute for hybrid models).
-@@ -1161,17 +1186,34 @@ class NPUModelRunner(GPUModelRunner):
+@@ -1161,17 +1188,34 @@
                  num_reqs, has_prev_mapping=bool(prev_req_id_to_index)
              )
              self.num_accepted_tokens.np[num_reqs:].fill(1)
@@ -645,7 +639,7 @@ index a07bd7c90..f42fd7100 100644
 -            self.num_accepted_tokens.gpu.fill_(1)
 +            if input_prepare_bucket is None:
 +                self.num_accepted_tokens.gpu.fill_(1)
- 
+
          # Update num_computed_tokens on GPU. In async spec decode,
          # CPU values are optimistic (all drafts accepted). The kernel
          # corrects on GPU using the previous step's
@@ -671,8 +665,8 @@ index a07bd7c90..f42fd7100 100644
              # CPU positions/lengths above are authoritative in synchronous ASR.
              # One copy replaces four H2Ds and device index/cast/add/fill launches.
              self._sync_input_metadata.prepare(
-@@ -1295,7 +1337,7 @@ class NPUModelRunner(GPUModelRunner):
- 
+@@ -1295,7 +1339,7 @@
+
          # For non-PCP, compute slot_mapping on GPU. PCP slot_mapping was
          # already computed on GPU before PCP split the positions.
 -        if self.pcp_size <= 1:
@@ -680,7 +674,7 @@ index a07bd7c90..f42fd7100 100644
              self.input_batch.block_table.compute_slot_mapping(
                  num_reqs,
                  self.query_start_loc.gpu[: num_reqs + 1],
-@@ -1322,6 +1364,8 @@ class NPUModelRunner(GPUModelRunner):
+@@ -1322,6 +1366,8 @@
              if self.use_cp:
                  logits_indices = self.pcp_manager.get_logits_indices(cu_num_tokens, num_reqs, tokens_original)
                  logits_indices = logits_indices.pin_memory().to(self.device, non_blocking=True)
@@ -689,7 +683,7 @@ index a07bd7c90..f42fd7100 100644
              else:
                  logits_indices = self.query_start_loc.gpu[1 : num_reqs + 1] - 1
          else:
-@@ -1359,6 +1403,9 @@ class NPUModelRunner(GPUModelRunner):
+@@ -1359,6 +1405,9 @@
              self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
              self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
              self.num_decode_draft_tokens.copy_to_gpu()
@@ -698,17 +692,19 @@ index a07bd7c90..f42fd7100 100644
 +            self._log_asr_input_preparation(total_num_scheduled_tokens)
          # save logits_indices for pcp spec decode usage
          self.logits_indices = logits_indices
- 
-@@ -1389,6 +1436,21 @@ class NPUModelRunner(GPUModelRunner):
+
+@@ -1388,6 +1437,24 @@
+             spec_decode_metadata,
              total_num_scheduled_tokens,
          )
- 
++
 +    def _log_asr_input_preparation(self, tokens):
 +        graph = self._input_prepare_graph
 +        if graph is not None and graph.should_log():
 +            logger.info(
 +                "ASR_INPUT_PREPARE_GRAPH replays=%d misses=%d tokens=%d bucket=%s "
-+                "spec_metadata_uploads=%d embedding_replays=%d upload_records=%d",
++                "spec_metadata_uploads=%d embedding_replays=%d upload_records=%d "
++                "rejection_copies=%d rejection_fallbacks=%d",
 +                graph.replays,
 +                graph.misses,
 +                tokens,
@@ -716,12 +712,13 @@ index a07bd7c90..f42fd7100 100644
 +                self._spec_decode_metadata_packer.uploads if self._spec_decode_metadata_packer is not None else 0,
 +                graph.embedding_replays,
 +                graph.upload_records,
++                self._rejection_output_buffer.copies if self._rejection_output_buffer is not None else 0,
++                self._rejection_output_buffer.fallbacks if self._rejection_output_buffer is not None else 0,
 +            )
-+
+
      def _preprocess(
          self,
-         scheduler_output: "SchedulerOutput",
-@@ -1402,6 +1464,10 @@ class NPUModelRunner(GPUModelRunner):
+@@ -1402,6 +1469,10 @@
          dict[str, Any],
          ECConnectorOutput | None,
      ]:
@@ -730,9 +727,9 @@ index a07bd7c90..f42fd7100 100644
 +            if prepared is not None:
 +                return prepared
          restore_state = None
- 
+
          # For PCP, local worker token count can differ from scheduler global count.
-@@ -1544,6 +1610,16 @@ class NPUModelRunner(GPUModelRunner):
+@@ -1544,6 +1615,16 @@
          cu_num_scheduled_tokens: np.ndarray,
          num_pcp_pads: np.ndarray | None,
      ) -> SpecDecodeMetadata:
@@ -749,7 +746,7 @@ index a07bd7c90..f42fd7100 100644
          # Inputs:
          # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
          # num_draft_tokens:         [  3,   0,   2,   0,   1]
-@@ -2240,9 +2316,26 @@ class NPUModelRunner(GPUModelRunner):
+@@ -2240,9 +2321,26 @@
                          num_reqs,
                          cudagraph_mode,
                          batch_desc.num_reqs,
@@ -757,7 +754,7 @@ index a07bd7c90..f42fd7100 100644
 +                            self._input_prepare_graph is not None and self._input_prepare_graph.staged is not None
 +                        ),
                      )
- 
+
 +                input_layout_prepared = False
 +                if self._input_prepare_graph is not None:
 +                    self._input_prepare_graph.finish(
@@ -776,7 +773,35 @@ index a07bd7c90..f42fd7100 100644
                      num_tokens=num_tokens_unpadded
                      if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
                      else total_num_scheduled_tokens,
-@@ -3061,6 +3154,7 @@ class NPUModelRunner(GPUModelRunner):
+@@ -2721,12 +2819,21 @@
+             else:
+                 # Includes spec decode tokens.
+                 # parse_output returns (list[list[int]], LogprobsLists | None)
+-                valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
+-                    sampled_token_ids,
+-                    self.input_batch.vocab_size,
+-                    discard_sampled_tokens_req_indices,
+-                    logprobs_tensors=logprobs_tensors,
+-                )
++                if self._rejection_output_buffer is not None:
++                    valid_sampled_token_ids, logprobs_lists = self._rejection_output_buffer.parse(
++                        sampled_token_ids,
++                        self.input_batch.vocab_size,
++                        discard_sampled_tokens_req_indices,
++                        parser=RejectionSampler.parse_output,
++                        logprobs_tensors=logprobs_tensors,
++                    )
++                else:
++                    valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
++                        sampled_token_ids,
++                        self.input_batch.vocab_size,
++                        discard_sampled_tokens_req_indices,
++                        logprobs_tensors=logprobs_tensors,
++                    )
+         else:
+             valid_sampled_token_ids = []
+             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
+@@ -3061,6 +3168,7 @@
          num_scheduled_tokens: dict[str, int] | None = None,
          num_scheduled_tokens_np: np.ndarray | None = None,
          cascade_attn_prefix_lens: list[list[int]] | None = None,
@@ -784,7 +809,7 @@ index a07bd7c90..f42fd7100 100644
      ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
          """
          :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
-@@ -3137,7 +3231,7 @@ class NPUModelRunner(GPUModelRunner):
+@@ -3137,7 +3245,7 @@
                  blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]
                  # Fill unused with -1. Needed for reshape_and_cache in full cuda
                  # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
@@ -793,10 +818,10 @@ index a07bd7c90..f42fd7100 100644
                      slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
                      blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
              if self.pcp_size > 1:
-@@ -5118,6 +5212,20 @@ class NPUModelRunner(GPUModelRunner):
+@@ -5118,6 +5226,20 @@
          with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
              cuda_graph_size = GPUModelRunner.capture_model(self)
- 
+
 +        # KV tables and decoder output addresses are final now. Capture the
 +        # independent preparation graph once, never on the request hot path.
 +        if self._input_prepare_graph is not None:
@@ -814,3 +839,61 @@ index a07bd7c90..f42fd7100 100644
          mgr = self.encoder_cudagraph_manager
          if mgr is not None and hasattr(self, "update_stream"):
              mgr.update_stream = self.update_stream
+--- /dev/null
++++ b/vllm_ascend/worker/asr_rejection_output.py
+@@ -0,0 +1,55 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Bounded pinned readback for synchronous ASR rejection bookkeeping."""
++
++import torch
++
++
++def install(runner):
++    opts = (runner.vllm_config.additional_config or {}).get("asr_input_prepare_graph", {})
++    if (
++        runner._input_prepare_graph is None
++        or not opts.get("reuse_rejection_buffer", True)
++        or runner.use_async_scheduling
++        or runner.use_async_spec_decode
++        or runner.num_spec_tokens <= 0
++    ):
++        return None
++    return RejectionOutputBuffer(runner.max_num_reqs, runner.num_spec_tokens + 1, device=runner.device)
++
++
++class RejectionOutputBuffer:
++    def __init__(self, max_requests, max_tokens, *, device, event=None):
++        self.max_requests, self.max_tokens = max_requests, max_tokens
++        self.host = torch.empty(
++            max_requests * max_tokens,
++            dtype=torch.int32,
++            device="cpu",
++            pin_memory=device.type == "npu",
++        )
++        self.event = event
++        if self.event is None and device.type == "npu":
++            self.event = torch.npu.Event()
++        self.copies = self.fallbacks = 0
++
++    def parse(self, tokens, vocab_size, discard, *, parser, logprobs_tensors):
++        if (
++            logprobs_tensors is not None
++            or tokens.dtype != torch.int32
++            or tokens.ndim != 2
++            or not 0 < tokens.shape[0] <= self.max_requests
++            or not 1 < tokens.shape[1] <= self.max_tokens
++        ):
++            self.fallbacks += 1
++            return parser(tokens, vocab_size, discard, logprobs_tensors=logprobs_tensors)
++        # Flat prefix makes each changing (requests, accepted-width) contiguous.
++        # No device dtype cast, fresh host tensor, or per-request transfer.
++        host = self.host[: tokens.numel()].view(tokens.shape)
++        host.copy_(tokens, non_blocking=True)
++        if self.event is not None:
++            self.event.record()
++            self.event.synchronize()
++        self.copies += 1
++        # The upstream parser's .cpu() is now a no-op. Keep its exact filtering
++        # rules rather than duplicating placeholders, vocab or discard semantics.
++        return parser(host, vocab_size, discard, logprobs_tensors=None)

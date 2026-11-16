@@ -100,6 +100,17 @@ class TinyMTPFixture:
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "requires Torch")
 class FixedMTPTests(TinyMTPFixture, unittest.TestCase):
+    def test_stage_reuses_pinned_storage_without_tensor_construction(self):
+        from unittest.mock import patch
+
+        pointer = self.program.metadata_upload.host.data_ptr()
+        rows = [row + [5] for row in self.ids]
+        with patch("torch.tensor", side_effect=AssertionError("hot-path tensor construction")):
+            self.program.stage(self.b, rows, [3, 2])
+            self.program.stage(self.b[::-1], rows[::-1], [2, 3])
+        self.assertEqual(pointer, self.program.metadata_upload.host.data_ptr())
+        self.assertEqual(self.program.metadata[:, 0].tolist(), [s.slot for s in self.b[::-1]])
+
     def test_cache_transfers_use_compact_row_indices(self):
         from torch.utils._python_dispatch import TorchDispatchMode
 
