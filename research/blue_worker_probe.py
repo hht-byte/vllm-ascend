@@ -19,11 +19,13 @@ def batch_invariant_status():
     bridge = sys.modules.get(_BATCH_BRIDGE)
     check = getattr(bridge, 'fia_bridge_installed', None)
     torch_npu = sys.modules.get('torch_npu')
+    registered = getattr(module, '_batch_invariant_LIB', None) is not None
     return {'requested': requested is True,
-            'registered': getattr(module, '_batch_invariant_LIB', None) is not None,
+            'registered': registered,
             'has_ascendc': getattr(module, 'HAS_ASCENDC_BATCH_INVARIANT', False) is True,
             'has_triton': getattr(module, 'HAS_TRITON', False) is True,
-            'bridge_registered': bool(check(torch_npu)) if callable(check) and torch_npu is not None else False}
+            'bridge_registered': bool(check(torch_npu)) if callable(check) and torch_npu is not None else False,
+            'matmul_backend': getattr(module, 'BLUE_BATCH_INVARIANT_MATMUL_BACKEND', None) if registered else None}
 
 
 def install_batch_initializer(cls):
@@ -38,6 +40,9 @@ def install_batch_initializer(cls):
         if status['requested']:
             if not all(status[key] for key in ('registered', 'has_ascendc', 'has_triton')):
                 raise RuntimeError('full batch-invariant operator registration is unavailable')
+            expected = os.environ.get('LLM_OPT_BATCH_INVARIANT_MATMUL_BACKEND', 'ascendc')
+            if expected not in ('ascendc', 'triton') or status['matmul_backend'] != expected:
+                raise RuntimeError('batch-invariant matmul registration does not match the requested backend')
             torch = sys.modules.get('torch')
             torch_npu = sys.modules.get('torch_npu')
             ops = getattr(getattr(torch, 'ops', None), 'batch_invariant_ops', None)

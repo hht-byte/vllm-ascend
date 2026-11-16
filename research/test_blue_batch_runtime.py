@@ -46,6 +46,7 @@ class RuntimePinTests(unittest.TestCase):
             with patch.dict(os.environ, previous, clear=True), patch.object(sys, 'path', ['original']):
                 server.configure_runtime(config, assets)
                 self.assertEqual(os.environ['VLLM_BATCH_INVARIANT'], '1')
+                self.assertEqual(os.environ['LLM_OPT_BATCH_INVARIANT_MATMUL_BACKEND'], 'ascendc')
                 self.assertEqual(os.environ['ASCEND_CUSTOM_OPP_PATH'], '/vendor/a:/vendor/b:' + str(root / 'opp'))
                 self.assertEqual(os.environ['LD_LIBRARY_PATH'], str(root / 'opp/op_api/lib') + ':/vendor/lib')
                 self.assertEqual(sys.path, [str(root / 'python'), 'original'])
@@ -63,6 +64,22 @@ class RuntimePinTests(unittest.TestCase):
                 with patch.dict(os.environ, {'KEPT': 'same'}, clear=True), patch.object(sys, 'path', ['original']):
                     with self.assertRaises((ValueError, RuntimeError)):
                         server.configure_runtime(config, assets)
+                    self.assertEqual(dict(os.environ), {'KEPT': 'same'})
+                    self.assertEqual(sys.path, ['original'])
+
+    def test_explicit_triton_selector_is_fixed_and_invalid_values_never_change_process_state(self):
+        server = self.server()
+        with tempfile.TemporaryDirectory() as directory:
+            assets = Path(directory)
+            _, config = make_vendor(assets)
+            with patch.dict(os.environ, {}, clear=True), patch.object(sys, 'path', ['original']):
+                server.configure_runtime({**config, 'batch_invariant_matmul_backend': 'triton'}, assets)
+                self.assertEqual(os.environ['LLM_OPT_BATCH_INVARIANT_MATMUL_BACKEND'], 'triton')
+            for invalid in ('unknown', None, True, {}, []):
+                with self.subTest(invalid=invalid), patch.dict(os.environ, {'KEPT': 'same'}, clear=True), \
+                        patch.object(sys, 'path', ['original']):
+                    with self.assertRaises(ValueError):
+                        server.configure_runtime({**config, 'batch_invariant_matmul_backend': invalid}, assets)
                     self.assertEqual(dict(os.environ), {'KEPT': 'same'})
                     self.assertEqual(sys.path, ['original'])
 
@@ -117,7 +134,7 @@ def package_modules(*leaves):
 
 
 class WorkerRegistrationTests(unittest.TestCase):
-    def fixture(self, *, requested=True, ascendc=True, triton=True):
+    def fixture(self, *, requested=True, ascendc=True, triton=True, actual_backend='ascendc'):
         import blue_worker_probe as probe
         self.assertTrue(hasattr(probe, 'batch_invariant_status'), 'worker batch state is missing')
         events = []
@@ -125,9 +142,11 @@ class WorkerRegistrationTests(unittest.TestCase):
         batch = ModuleType('vllm_ascend.batch_invariant')
         batch.HAS_ASCENDC_BATCH_INVARIANT, batch.HAS_TRITON = ascendc, triton
         batch._batch_invariant_LIB = None
+        batch.BLUE_BATCH_INVARIANT_MATMUL_BACKEND = None
         def original():
             events.append('stock')
             batch._batch_invariant_LIB = object()
+            batch.BLUE_BATCH_INVARIANT_MATMUL_BACKEND = actual_backend
             return 'initialized'
         worker.init_batch_invariance = original
         envs = ModuleType('vllm.envs')
@@ -159,7 +178,8 @@ class WorkerRegistrationTests(unittest.TestCase):
             self.assertEqual(wrapped(), 'initialized')
             self.assertEqual(events, ['stock', 'bridge'])
             self.assertEqual(probe.batch_invariant_status(), {'requested': True, 'registered': True,
-                'has_ascendc': True, 'has_triton': True, 'bridge_registered': True})
+                'has_ascendc': True, 'has_triton': True, 'bridge_registered': True,
+                'matmul_backend': 'ascendc'})
         probe, Worker, worker, events, modules = self.fixture(requested=False)
         with patch.dict(sys.modules, modules):
             probe.install(Worker)
@@ -174,8 +194,37 @@ class WorkerRegistrationTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError): worker.init_batch_invariance()
                 self.assertEqual(events, ['stock'])
 
+    def test_post_init_reports_and_checks_actual_backend_before_fia_bridge(self):
+        probe, Worker, worker, events, modules = self.fixture(actual_backend='triton')
+        with patch.dict(sys.modules, modules), patch.dict(os.environ,
+                {'LLM_OPT_BATCH_INVARIANT_MATMUL_BACKEND': 'triton'}):
+            self.assertIsNone(probe.batch_invariant_status()['matmul_backend'])
+            probe.install(Worker)
+            worker.init_batch_invariance()
+            self.assertEqual(events, ['stock', 'bridge'])
+            self.assertEqual(probe.batch_invariant_status()['matmul_backend'], 'triton')
+        for actual in ('ascendc', None):
+            probe, Worker, worker, events, modules = self.fixture(actual_backend=actual)
+            with self.subTest(actual=actual), patch.dict(sys.modules, modules), patch.dict(os.environ,
+                    {'LLM_OPT_BATCH_INVARIANT_MATMUL_BACKEND': 'triton'}):
+                probe.install(Worker)
+                with self.assertRaises(RuntimeError): worker.init_batch_invariance()
+                self.assertEqual(events, ['stock'])
+
 
 class ObservationTests(unittest.IsolatedAsyncioTestCase):
+    def test_full_status_must_match_registered_common_backend(self):
+        import blue_mtp_server as server
+        status = {'batch_invariant': {'requested': True, 'registered': True, 'has_ascendc': True,
+                                     'has_triton': True, 'bridge_registered': True, 'matmul_backend': 'ascendc'}}
+        server.validate_batch_invariant_status({'batch_invariant': True}, status)
+        with self.assertRaises(RuntimeError):
+            server.validate_batch_invariant_status({'batch_invariant': True,
+                'batch_invariant_matmul_backend': 'triton'}, status)
+        status['batch_invariant']['matmul_backend'] = 'triton'
+        server.validate_batch_invariant_status({'batch_invariant': True,
+            'batch_invariant_matmul_backend': 'triton'}, status)
+
     async def test_actual_status_handler_refuses_partial_batch_mode(self):
         import blue_mtp_server as server
         self.assertTrue(hasattr(server, 'validate_batch_invariant_status'), 'status mode guard is missing')

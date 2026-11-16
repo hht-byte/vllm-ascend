@@ -11,6 +11,7 @@ import subprocess
 
 from blue_external_draft_port import check_input_batch, dispatch, worker_registry
 from blue_scheduler_port import base_scheduler, recompute_scheduler
+from blue_batch_invariant import make_batch_invariant_matmul_patch
 from build_asr_mtp_patch import check_runner, worker_entry, worker_memory_entry
 
 MODULES = (
@@ -87,6 +88,7 @@ def build(vllm_root, ascend_root, mtp_source, output):
     changes['vllm/v1/core/sched/scheduler.py'] = base_scheduler(read('vllm/v1/core/sched/scheduler.py'))
     changes['vllm_ascend/core/recompute_scheduler.py'] = recompute_scheduler(read('vllm_ascend/core/recompute_scheduler.py'))
     changes['vllm_ascend/spec_decode/__init__.py'] = dispatch(read('vllm_ascend/spec_decode/__init__.py'))
+    changes['vllm_ascend/batch_invariant.py'] = make_batch_invariant_matmul_patch(read('vllm_ascend/batch_invariant.py'))
     changes['vllm_ascend/patch/worker/__init__.py'] = worker_registry(read('vllm_ascend/patch/worker/__init__.py'))
     changes['vllm_ascend/worker/worker.py'] = worker_memory_entry(worker_entry(read('vllm_ascend/worker/worker.py')))+(
         '\nfrom vllm_ascend.patch.worker.blue_worker_probe import install as _install_blue_probe\n'
@@ -126,7 +128,7 @@ def build(vllm_root, ascend_root, mtp_source, output):
         raise ValueError('engine source identity changed during copy')
     manifest = {'schema_version':1, 'runtime_sources':identities,
         'shared_adjustments':['bounded_external_draft_transport','first_verify_scheduler_port',
-                              'restricted_checkpoint_loading'],
+                              'restricted_checkpoint_loading','configured_batch_invariant_matmul_backend'],
         'changed_files':sorted(changes),'files':package_hashes(output)}
     (output/'overlay.json').write_text(json.dumps(manifest, indent=2)+'\n', encoding='utf-8')
     return manifest

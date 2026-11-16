@@ -6,6 +6,13 @@ exact token and text checks at C1 and C20; a failed gate prevents benchmarking.
 requires `target_graph_mode: "piecewise"` while auxiliary MTP graphs can retain
 `graph_mode: "full"`. Default configuration remains unchanged.
 
+`batch_invariant_matmul_backend` explicitly selects `ascendc` (default) or
+`triton` before operator registration. The Triton selection uses the existing
+batch-invariant implementations for `aten.mm` and `aten.matmul`; AscendC
+attention/reduction and the other stock registrations remain in place. It
+adds no linear override. Invalid or unavailable selections fail before
+registration. A kernel failure never changes the selected backend.
+
 The [official Ascend 0.23 guide](https://docs.vllm.ai/projects/ascend/en/v0.23.0/user_guide/feature_guide/batch_invariance.html)
 describes target PIECEWISE execution. Its listed model coverage does not
 establish ASR or custom MTP graph compatibility. The common FIA adapter maps
@@ -41,6 +48,7 @@ The trusted server enables the flag before engine imports. Each worker reports
 actual operator registration, AscendC and Triton availability, and FIA bridge
 state. All must be confirmed for this opt-in mode. This check prevents a partial
 Triton-only initialization from being labelled as the full requested mode.
+The actual registered matrix backend must also match the frozen configuration.
 Model output never selects code, dependencies, loader paths or permissions.
 
 Correctness gates and benchmarks use fresh experiment IDs and their complete

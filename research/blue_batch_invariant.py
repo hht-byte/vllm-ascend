@@ -16,7 +16,14 @@ The extension decides output layout and binary/kernel compatibility. Its CANN
 package reports compiler 9.1.0; compatibility with the exact runtime, graph task
 capture/rebinding and token parity require actual isolated preflight evidence.
 This bridge does not establish support for target-model FULL graph mode.
+
+``make_batch_invariant_matmul_patch`` generates a bounded stock-source change
+for an explicit, recorded mm/matmul backend selection. It never catches a
+failed kernel or changes registration in response to a runtime failure.
 """
+
+import ast
+import hashlib
 
 
 _PREFIX = "npu_fused_infer_attention_score"
@@ -27,6 +34,69 @@ _OP_NAMES = (
     "_" + _PREFIX + "_batch_invariant_get_max_workspace",
     "_" + _PREFIX + "_batch_invariant_infer_output",
 )
+_STOCK_ENABLE_SHA256 = "6b484ec54ca07ea9557c12d19784ffac784b3fa069a523c72b8c3ee961acbc55"
+_BACKEND_VARIABLE = "LLM_OPT_BATCH_INVARIANT_MATMUL_BACKEND"
+_BACKEND_MARKER = "BLUE_BATCH_INVARIANT_MATMUL_BACKEND"
+
+
+def make_batch_invariant_matmul_patch(source):
+    """Return patched frozen Ascend 1cdb8c4 source; reject drift or reapplication.
+
+    The exact initializer body is bound by its normalized source SHA256, making
+    this independent of Python-version changes in AST serialization. Parsing
+    and unique module/function anchors are checked before and after rewriting.
+    Only the AscendC branch's two matmul registrations change. Other operator
+    registrations, including the existing Triton-only branch, remain intact.
+    """
+    source = source.replace("\r\n", "\n")
+    tree = ast.parse(source)
+    functions = [node for node in tree.body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and node.name == "enable_batch_invariant_mode"]
+    if len(functions) != 1 or not isinstance(functions[0], ast.FunctionDef):
+        raise ValueError("Unknown stock batch-invariant initializer")
+    original = ast.get_source_segment(source, functions[0])
+    if hashlib.sha256(original.encode("utf-8")).hexdigest() != _STOCK_ENABLE_SHA256:
+        raise ValueError("Stock batch-invariant initializer changed")
+    anchor = "_batch_invariant_LIB = None\n"
+    imports_os = any(isinstance(node, ast.Import)
+                     and any(alias.name == "os" and alias.asname is None
+                             for alias in node.names) for node in tree.body)
+    if (source.count(anchor) != 1 or not imports_os
+            or _BACKEND_VARIABLE in source or _BACKEND_MARKER in source):
+        raise ValueError("Unknown stock batch-invariant module contract")
+    changed = original.replace(
+        "    global _batch_invariant_LIB\n",
+        "    global _batch_invariant_LIB, BLUE_BATCH_INVARIANT_MATMUL_BACKEND\n"
+        "    blue_matmul_backend = os.environ.get(\n"
+        "        'LLM_OPT_BATCH_INVARIANT_MATMUL_BACKEND', 'ascendc')\n"
+        "    if blue_matmul_backend not in ('ascendc', 'triton'):\n"
+        "        raise ValueError('Unknown batch-invariant matmul backend')\n"
+        "    if blue_matmul_backend == 'triton' and not HAS_TRITON:\n"
+        "        raise ValueError('Requested batch-invariant Triton is unavailable')\n",
+        1,
+    )
+    for name, triton_function, ascendc_function in (
+        ("mm", "mm_batch_invariant", "npu_mm_batch_invariant"),
+        ("matmul", "matmul_batch_invariant", "npu_matmul_batch_invariant"),
+    ):
+        old = (f'        _batch_invariant_LIB.impl("aten::{name}", '
+               f'torch.ops.batch_invariant_ops.{ascendc_function}, "NPU")')
+        new = (f'        _batch_invariant_LIB.impl("aten::{name}",\n'
+               f'            {triton_function} if blue_matmul_backend == "triton"\n'
+               f'            else torch.ops.batch_invariant_ops.{ascendc_function}, "NPU")')
+        if changed.count(old) != 1:
+            raise ValueError("Unknown stock matmul registration anchor")
+        changed = changed.replace(old, new, 1)
+    changed += (
+        "\n\n    BLUE_BATCH_INVARIANT_MATMUL_BACKEND = (\n"
+        "        blue_matmul_backend if HAS_ASCENDC_BATCH_INVARIANT\n"
+        "        else 'triton' if HAS_TRITON else None)"
+    )
+    source = source.replace(original, changed, 1).replace(
+        anchor, anchor + _BACKEND_MARKER + " = None\n", 1)
+    ast.parse(source)
+    return source
 
 
 class _FiaBridge:

@@ -1,5 +1,6 @@
 """CPU contract tests for the isolated AscendC FIA compatibility bridge."""
 
+import ast
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,51 @@ import unittest
 
 
 SOURCE = Path(__file__).with_name("blue_batch_invariant.py")
+
+# Exact initializer from frozen Ascend 1cdb8c4; executed after transforming it.
+STOCK_SOURCE = '''import os
+_batch_invariant_LIB = None
+
+def enable_batch_invariant_mode():
+    global _batch_invariant_LIB
+    _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
+    logger.debug(
+        "Batch-invariant op registration: Triton=%s, AscendC=%s",
+        HAS_TRITON,
+        HAS_ASCENDC_BATCH_INVARIANT,
+    )
+
+    # Register operators only implemented in triton.
+    if HAS_TRITON:
+        _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, "NPU")
+        _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, "NPU")
+        _batch_invariant_LIB.impl("aten::softmax", softmax_batch_invariant, "NPU")
+        _batch_invariant_LIB.impl("aten::_softmax", softmax_batch_invariant, "NPU")
+
+    # Register operators implemented in Ascend batch-invariant ops in priority.
+    if HAS_ASCENDC_BATCH_INVARIANT:
+        _batch_invariant_LIB.impl("aten::mm", torch.ops.batch_invariant_ops.npu_mm_batch_invariant, "NPU")
+        _batch_invariant_LIB.impl("aten::matmul", torch.ops.batch_invariant_ops.npu_matmul_batch_invariant, "NPU")
+        _batch_invariant_LIB.impl("aten::sum", torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant, "NPU")
+        # torch_npu.npu_fused_infer_attention_score is a function of torch_npu, not a torch.ops.Operator,
+        # so we need to patch it directly.
+        torch_npu.npu_fused_infer_attention_score = (
+            torch.ops.batch_invariant_ops.npu_fused_infer_attention_score_batch_invariant
+        )
+        # patch npu_add_rms_norm to ensure batch invariant.
+        torch_npu.npu_add_rms_norm = add_rms_norm
+        # torch.sum can't be replaced by dispatch logic, so we patch it directly.
+        torch.sum = reduce_sum
+
+    # register triton implementations if ascendc is not available.
+    elif HAS_TRITON:
+        _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, "NPU")
+        _batch_invariant_LIB.impl("aten::matmul", matmul_batch_invariant, "NPU")
+
+        # linear call matmul internally, so register linear only when ascendc
+        # is not available. it will get better performance with ascendc.
+        _batch_invariant_LIB.impl("aten::linear", linear_batch_invariant, "NPU")
+'''
 
 
 class FakeOps:
@@ -223,6 +269,168 @@ class FiaBridgeTests(unittest.TestCase):
         with self.assertRaises((TypeError, ValueError)):
             self.install()
         self.assertIs(self.npu.npu_fused_infer_attention_score, first)
+
+
+class MatmulSourceTransformTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("blue_batch_invariant", SOURCE)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.assertTrue(callable(getattr(self.module, "make_batch_invariant_matmul_patch", None)),
+                        "Explicit matmul backend transform is missing")
+        self.library_calls, self.registrations = [], []
+        self.ops = SimpleNamespace(**{name: object() for name in (
+            'npu_mm_batch_invariant', 'npu_matmul_batch_invariant',
+            'npu_reduce_sum_batch_invariant',
+            'npu_fused_infer_attention_score_batch_invariant',
+        )})
+        self.old_fia, self.old_rms, self.old_sum = object(), object(), object()
+        self.npu = SimpleNamespace(npu_fused_infer_attention_score=self.old_fia,
+                                   npu_add_rms_norm=self.old_rms)
+        self.torch = SimpleNamespace(ops=SimpleNamespace(batch_invariant_ops=self.ops),
+                                     sum=self.old_sum)
+        self.functions = {name: object() for name in (
+            'addmm_batch_invariant', 'bmm_batch_invariant', 'softmax_batch_invariant',
+            'mm_batch_invariant', 'matmul_batch_invariant', 'linear_batch_invariant',
+            'add_rms_norm', 'reduce_sum',
+        )}
+
+    def prepare(self, backend=None, *, has_triton=True, has_ascendc=True, fail_op=None):
+        changed = self.module.make_batch_invariant_matmul_patch(STOCK_SOURCE)
+        tree = ast.parse(changed)
+        # The real stock initializer and its injected module-state assignments
+        # execute with fake external operator registrations; no Torch is loaded.
+        tree.body = [node for node in tree.body if not isinstance(node, ast.Import)]
+        owner = self
+        class Library:
+            def __init__(self, *args):
+                owner.library_calls.append(args)
+            def impl(self, name, function, key):
+                if name == fail_op:
+                    raise RuntimeError('registered operator failed')
+                owner.registrations.append((name, function, key))
+        self.torch.library = SimpleNamespace(Library=Library)
+        environment = {} if backend is None else {
+            'LLM_OPT_BATCH_INVARIANT_MATMUL_BACKEND': backend}
+        namespace = dict(self.functions, torch=self.torch, torch_npu=self.npu,
+            os=SimpleNamespace(environ=environment),
+            logger=SimpleNamespace(debug=lambda *args: None),
+            HAS_TRITON=has_triton, HAS_ASCENDC_BATCH_INVARIANT=has_ascendc)
+        exec(compile(tree, '<transformed frozen batch initializer>', 'exec'), namespace)
+        return namespace
+
+    def test_backend_marker_is_unconfirmed_before_registration(self):
+        namespace = self.prepare('triton')
+        self.assertIsNone(namespace['BLUE_BATCH_INVARIANT_MATMUL_BACKEND'])
+        self.assertEqual(self.library_calls, [])
+        self.assertEqual(self.registrations, [])
+
+    def test_default_selects_ascendc_mm_and_preserves_every_other_registration(self):
+        namespace = self.prepare()
+        namespace['enable_batch_invariant_mode']()
+        self.assertEqual(self.registrations, [
+            ('aten::addmm', self.functions['addmm_batch_invariant'], 'NPU'),
+            ('aten::bmm', self.functions['bmm_batch_invariant'], 'NPU'),
+            ('aten::softmax', self.functions['softmax_batch_invariant'], 'NPU'),
+            ('aten::_softmax', self.functions['softmax_batch_invariant'], 'NPU'),
+            ('aten::mm', self.ops.npu_mm_batch_invariant, 'NPU'),
+            ('aten::matmul', self.ops.npu_matmul_batch_invariant, 'NPU'),
+            ('aten::sum', self.ops.npu_reduce_sum_batch_invariant, 'NPU'),
+        ])
+        self.assertIs(self.npu.npu_fused_infer_attention_score,
+                      self.ops.npu_fused_infer_attention_score_batch_invariant)
+        self.assertIs(self.npu.npu_add_rms_norm, self.functions['add_rms_norm'])
+        self.assertIs(self.torch.sum, self.functions['reduce_sum'])
+        self.assertEqual(namespace['BLUE_BATCH_INVARIANT_MATMUL_BACKEND'], 'ascendc')
+
+    def test_explicit_triton_changes_only_mm_matmul_and_adds_no_linear_override(self):
+        namespace = self.prepare('triton')
+        namespace['enable_batch_invariant_mode']()
+        functions = {name: fn for name, fn, key in self.registrations}
+        self.assertIs(functions['aten::mm'], self.functions['mm_batch_invariant'])
+        self.assertIs(functions['aten::matmul'], self.functions['matmul_batch_invariant'])
+        self.assertIs(functions['aten::sum'], self.ops.npu_reduce_sum_batch_invariant)
+        self.assertNotIn('aten::linear', functions)
+        self.assertEqual(len(functions), 7)
+        self.assertIs(self.npu.npu_fused_infer_attention_score,
+                      self.ops.npu_fused_infer_attention_score_batch_invariant)
+        self.assertIs(self.npu.npu_add_rms_norm, self.functions['add_rms_norm'])
+        self.assertIs(self.torch.sum, self.functions['reduce_sum'])
+        self.assertEqual(namespace['BLUE_BATCH_INVARIANT_MATMUL_BACKEND'], 'triton')
+
+    def test_unknown_selector_fails_before_any_registration_or_torch_mutation(self):
+        for backend in ('', 'auto', 'TRITON', 'cpu'):
+            with self.subTest(backend=backend):
+                namespace = self.prepare(backend)
+                with self.assertRaises(ValueError):
+                    namespace['enable_batch_invariant_mode']()
+                self.assertEqual(self.library_calls, [])
+                self.assertEqual(self.registrations, [])
+                self.assertIsNone(namespace['BLUE_BATCH_INVARIANT_MATMUL_BACKEND'])
+                self.assertIs(self.npu.npu_fused_infer_attention_score, self.old_fia)
+                self.assertIs(self.torch.sum, self.old_sum)
+
+    def test_requested_triton_without_triton_fails_before_library_creation(self):
+        namespace = self.prepare('triton', has_triton=False)
+        with self.assertRaises(ValueError):
+            namespace['enable_batch_invariant_mode']()
+        self.assertEqual(self.library_calls, [])
+        self.assertEqual(self.registrations, [])
+        self.assertIsNone(namespace['_batch_invariant_LIB'])
+        self.assertIsNone(namespace['BLUE_BATCH_INVARIANT_MATMUL_BACKEND'])
+
+    def test_ascendc_does_not_require_unimported_triton_functions(self):
+        namespace = self.prepare('ascendc', has_triton=False)
+        del namespace['mm_batch_invariant'], namespace['matmul_batch_invariant']
+        namespace['enable_batch_invariant_mode']()
+        self.assertEqual(self.registrations[0],
+                         ('aten::mm', self.ops.npu_mm_batch_invariant, 'NPU'))
+        self.assertEqual(namespace['BLUE_BATCH_INVARIANT_MATMUL_BACKEND'], 'ascendc')
+
+    def test_failed_registration_never_sets_successful_backend_marker(self):
+        namespace = self.prepare('triton', fail_op='aten::sum')
+        with self.assertRaises(RuntimeError):
+            namespace['enable_batch_invariant_mode']()
+        self.assertIsNone(namespace['BLUE_BATCH_INVARIANT_MATMUL_BACKEND'])
+        self.assertIs(self.npu.npu_fused_infer_attention_score, self.old_fia)
+
+    def test_stock_triton_only_branch_reports_actual_backend(self):
+        namespace = self.prepare(has_ascendc=False)
+        namespace['enable_batch_invariant_mode']()
+        self.assertEqual(namespace['BLUE_BATCH_INVARIANT_MATMUL_BACKEND'], 'triton')
+        self.assertIs(self.registrations[-1][1], self.functions['linear_batch_invariant'])
+        self.assertIs(self.npu.npu_fused_infer_attention_score, self.old_fia)
+
+    def test_no_available_backend_is_never_reported_as_registered(self):
+        namespace = self.prepare(has_triton=False, has_ascendc=False)
+        namespace['enable_batch_invariant_mode']()
+        self.assertIsNone(namespace['BLUE_BATCH_INVARIANT_MATMUL_BACKEND'])
+        self.assertEqual(self.registrations, [])
+
+    def test_changed_stock_registration_is_rejected(self):
+        changed = STOCK_SOURCE.replace('aten::addmm', 'aten::addmm_changed')
+        with self.assertRaises(ValueError):
+            self.module.make_batch_invariant_matmul_patch(changed)
+
+    def test_duplicate_function_is_rejected(self):
+        changed = STOCK_SOURCE + STOCK_SOURCE[STOCK_SOURCE.index('def enable_'):]
+        with self.assertRaises(ValueError):
+            self.module.make_batch_invariant_matmul_patch(changed)
+
+    def test_duplicate_lib_anchor_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.module.make_batch_invariant_matmul_patch(
+                STOCK_SOURCE + '\n_batch_invariant_LIB = None\n')
+
+    def test_already_transformed_source_is_rejected(self):
+        changed = self.module.make_batch_invariant_matmul_patch(STOCK_SOURCE)
+        with self.assertRaises(ValueError):
+            self.module.make_batch_invariant_matmul_patch(changed)
+
+    def test_missing_os_import_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.module.make_batch_invariant_matmul_patch(
+                STOCK_SOURCE.replace('import os\n', ''))
 
 
 if __name__ == "__main__":

@@ -13,11 +13,19 @@ import sys
 EXTERNAL_CLASS='vllm_ascend.spec_decode.external_draft_proposer.AscendExternalDraftProposer'
 
 
+def batch_matmul_backend(config):
+    backend = config.get('batch_invariant_matmul_backend', 'ascendc')
+    if type(backend) is not str or backend not in ('ascendc', 'triton'):
+        raise ValueError('batch_invariant_matmul_backend must be ascendc or triton')
+    return backend
+
+
 def runtime_modes(config):
     mode = config.get('mode', 'mtp')
     graph = config.get('graph_mode', 'full')
     target = config.get('target_graph_mode', graph)
     invariant = config.get('batch_invariant', False)
+    batch_matmul_backend(config)
     if type(invariant) is not bool:
         raise ValueError('batch_invariant must be a bool')
     if mode not in ('ar', 'mtp') or graph not in ('off', 'full') or target not in ('off', 'full', 'piecewise'):
@@ -37,6 +45,7 @@ def configure_runtime(config, assets):
     configuration. Only python/ and a flattened opp/ vendor root are permitted.
     """
     _, _, _, requested = runtime_modes(config)
+    matmul_backend = batch_matmul_backend(config)
     if not requested:
         return None
     expected = config.get('batch_invariant_vendor_sha256')
@@ -103,6 +112,7 @@ def configure_runtime(config, assets):
         custom.append(opp)
     libraries = [part for part in os.environ.get('LD_LIBRARY_PATH', '').split(':') if part and part != library]
     os.environ['VLLM_BATCH_INVARIANT'] = '1'
+    os.environ['LLM_OPT_BATCH_INVARIANT_MATMUL_BACKEND'] = matmul_backend
     os.environ['ASCEND_CUSTOM_OPP_PATH'] = ':'.join(custom)
     os.environ['LD_LIBRARY_PATH'] = ':'.join([library, *libraries])
     sys.path[:] = [python, *[path for path in sys.path if path != python]]
@@ -115,6 +125,8 @@ def validate_batch_invariant_status(config, result):
         if not isinstance(status, dict) or any(status.get(key) is not True for key in (
                 'requested', 'registered', 'has_ascendc', 'has_triton', 'bridge_registered')):
             raise RuntimeError('full batch-invariant worker registration is unconfirmed')
+        if status.get('matmul_backend') != batch_matmul_backend(config):
+            raise RuntimeError('batch-invariant matmul registration does not match the common configuration')
 
 
 class RequestUnavailable(RuntimeError):
