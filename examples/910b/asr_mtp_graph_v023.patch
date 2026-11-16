@@ -1332,8 +1332,335 @@
 +        self.owner.dirty = True
 +        self.target.copy_(self.host, non_blocking=True)
 --- /dev/null
++++ b/vllm_ascend/spec_decode/asr_mtp_device_rejection.py
+@@ -0,0 +1,324 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Opt-in rejection/prefill handoff, without a host sample read before MTP.
++
++FIA retains CPU-known optimistic Q/KV lengths. Causal queries at the actual
++confirmed end cannot see the extra computed tail. A separate small graph writes
++device-derived lengths, drive/sequence, and last-row indices into stable buffers.
++"""
++import logging
++from collections import Counter
++from dataclasses import replace
++
++import torch
++
++try:
++    from .asr_mtp_staging import UploadBatch
++except ImportError:
++    from asr_mtp_staging import UploadBatch
++
++MAX_STOPS = 8
++logger = logging.getLogger(__name__)
++
++
++class RejectionPrelude:
++    def __init__(self, program, *, sample_width, vocab_size):
++        if not program.paged_kv:
++            raise ValueError('device rejection requires paged token graphs')
++        self.program, self.width, self.vocab = program, sample_width, vocab_size
++        self.compute_limits = program.limits.clone()
++        b, h = program.max_batch, program.heads.num_heads
++        device = program.output.device
++        self.raw = torch.full((b, sample_width), -1, device=device, dtype=torch.int32)
++        # Allocate outside the private capture pool: both graphs share these
++        # outputs; pool temporaries must not alias values crossing graph boundaries.
++        self.combined = torch.zeros((b, sample_width+h), device=device, dtype=torch.long)
++        program.output = self.combined[:, sample_width:]
++        self.host = torch.empty_like(self.combined, device='cpu', pin_memory=device.type == 'npu')
++        self.event = torch.npu.Event() if device.type == 'npu' else None
++        self.hidden = torch.zeros((program.query_capacity, program.heads.config.hidden_size),
++                                  device=device, dtype=program.arena.storage.dtype)
++        size = b*(5+MAX_STOPS)
++        self.metadata = torch.zeros(size+program.query_capacity, device=device, dtype=torch.long)
++        self.config = self.metadata[:size].view(b, 5+MAX_STOPS)
++        self.addresses = self.metadata[size:]
++        self.uploads = UploadBatch(device)
++        self.metadata_upload = self.uploads.buffer(self.metadata)
++        self.column = torch.arange(sample_width, device=device)[None, :]
++        self.position = torch.arange(program.sequence_width, device=device)[None, :]
++        self.replay = self.run
++
++    def stage(self, previous, counts, remaining, model_remaining, minimum_left, stops,
++              sampled, hidden, *, starts=None, sample_counts=None):
++        p, b = self.program, len(previous)
++        total = sum(counts)
++        if (not 0 < b <= p.max_batch or total > p.tokens or
++                sampled.ndim != 2 or sampled.shape[0] != b or sampled.shape[1] > self.width or
++                hidden.shape[0] < total or any(len(s) > MAX_STOPS for s in stops)):
++            raise ValueError('device rejection staging exceeds captured bounds')
++        payload = []
++        addresses = []
++        starts = [c-1 for c in previous] if starts is None else starts
++        sample_counts = counts if sample_counts is None else sample_counts
++        stride = p.arena.storage.shape[1] // p.row_width
++        # Slots were CPU-staged by program.stage; never fetch p.slots from device.
++        slots = p.metadata_upload.array.reshape(-1)
++        slot_offset = 5 * p.heads.num_heads * (p.max_batch+1)
++        for i, (c, count) in enumerate(zip(previous, counts)):
++            payload.extend([c, remaining[i], model_remaining[i], minimum_left[i], sample_counts[i],
++                            *sorted(stops[i]), *([-1]*(MAX_STOPS-len(stops[i])))])
++            base = int(slots[slot_offset+i]) * stride
++            addresses.extend(range(base+starts[i], base+starts[i]+count))
++        payload.extend([0]*(self.config.numel()-len(payload)))
++        sink = p.arena.scratch_offset // p.row_width
++        addresses.extend(range(sink+total, sink+p.query_capacity))
++        with self.uploads:
++            self.metadata_upload.copy(payload+addresses)
++        self.raw[:b, :sampled.shape[1]].copy_(sampled)
++        self.hidden[:total].copy_(hidden[:total])
++
++    @torch.inference_mode()
++    def run(self):
++        p, b = self.program, self.program.max_batch
++        previous, remaining, model_remaining, minimum, scheduled = self.config[:, :5].unbind(-1)
++        valid = ((self.raw >= 0) & (self.raw < self.vocab) &
++                 (self.column < scheduled[:, None]) & (previous[:, None] > 0))
++        n = valid.sum(-1)
++        # Discarded intermediate prefill has no sampled append. Its hidden
++        # prefix still advances to the CPU-known end of target execution.
++        end = torch.where(scheduled > 0, previous+n-1, p.lengths[:b])
++        live = (previous > 0) & (n > 0)
++        stop = (self.raw[:, :, None] == self.config[:, None, 5:]).any(-1)
++        terminal = (stop & valid & (self.column+1 >= minimum[:, None])).any(-1)
++        limits = torch.minimum(p.limits[:b], torch.minimum(remaining-n, model_remaining-n))
++        limits = torch.where(live & ~terminal, limits.clamp_min(0), 0)
++        delta = p.lengths[:b]-end
++        # last[] is in packed Q coordinates; tail length is the same at every head.
++        p.last[:, :b].copy_(torch.where(p.last[:, :b] >= delta[None, :],
++                                       p.last[:, :b]-delta[None, :], 0))
++        p.lengths[:b].copy_(end.clamp_min(0))
++        p.limits[:b].copy_(limits)
++        relative = self.position-previous[:, None]
++        new_ids = self.raw.gather(1, relative.clamp(0, self.width-1))
++        new_ids = torch.where((relative >= 0) & (relative < n[:, None]), new_ids, 0)
++        p.sequence[:b].copy_(torch.where(relative >= 0, new_ids, p.sequence[:b]))
++        if p.npu_row_update is not None:
++            p.npu_row_update(p.cache_rows, self.addresses[:, None], self.hidden)
++        else:
++            p.cache_rows.index_copy_(0, self.addresses, self.hidden)
++        self.combined[:, :self.width].copy_(torch.where(valid, self.raw, -1))
++
++    def capture(self, pool):
++        # Startup only. Existing FULL MTP graph and FIA tasks are unchanged.
++        stream = torch.npu.Stream()
++        stream.wait_stream(torch.npu.current_stream())
++        with torch.npu.stream(stream):
++            self.run()
++        torch.npu.current_stream().wait_stream(stream)
++        torch.npu.synchronize()
++        graph = torch.npu.NPUGraph()
++        with torch.npu.graph(graph, pool=pool):
++            self.run()
++        torch.npu.synchronize()
++        self.replay = graph.replay
++        self.graph = graph
++
++    def readback(self, count):
++        # Only wait after MTP. Scheduler still needs CPU samples, but they and
++        # drafts now cross the boundary together, not on either side of MTP.
++        self.host.copy_(self.combined, non_blocking=True)
++        if self.event is not None:
++            self.event.record(torch.npu.current_stream())
++            self.event.synchronize()
++        # This single completion fence also covers both preceding H2D uploads.
++        # Their next reuse no longer needs an Event::query / synchronize.
++        self.uploads.pending = self.program.uploads.pending = False
++        return self.host[:count]
++
++
++def optimistic_states(states, previous, counts, starts=None):
++    starts = [c-1 for c in previous] if starts is None else starts
++    return [replace(s, length=start+count,
++                    heads=[replace(h, valid=min(h.valid, max(0, c-d)))
++                           for d, h in enumerate(s.heads, 1)])
++            for s, c, count, start in zip(states, previous, counts, starts)]
++
++
++class DeviceRejectionHandoff:
++    """One pending serial batch; guards never inspect device tensor values."""
++    def __init__(self, worker):
++        self.worker, self.pending, self.stats = worker, None, Counter()
++
++    def miss(self, reason):
++        self.stats['fallback_'+reason] += 1
++
++    @torch.inference_mode()
++    def prepare(self, scheduler, sampler, hidden):
++        try:
++            from .asr_mtp_graph import captured_depth, depth_key
++            from .asr_mtp_heads import HeadHistory, RequestHistory
++            from .asr_mtp_token_graph import required_tokens
++            from .asr_mtp_worker import request_enabled, request_type, stop_ids
++        except ImportError:
++            from asr_mtp_graph import captured_depth, depth_key
++            from asr_mtp_heads import HeadHistory, RequestHistory
++            from asr_mtp_token_graph import required_tokens
++            from asr_mtp_worker import request_enabled, request_type, stop_ids
++        w, r = self.worker, self.worker.runner
++        batch, graphs = r.input_batch, w.graphs
++        if self.pending is not None:
++            raise RuntimeError('previous device rejection handoff was not consumed')
++        samples = sampler.sampled_token_ids
++        n = len(batch.req_ids)
++        if (not graphs.ready or not 0 < n <= graphs.options.max_batch or
++                samples.ndim != 2 or samples.shape[0] != n or samples.shape[1] < 1 or
++                samples.dtype not in (torch.int32, torch.int64) or sampler.logprobs_tensors is not None or
++                getattr(r, 'routed_experts_initialized', False) or r.use_async_scheduling):
++            return self.miss('batch')
++        previous, counts, states, rows, limits, remaining, capacity, minimum, stops = (
++            [] for _ in range(9))
++        starts, sample_counts, missing = [], [], []
++        discarded = set(r.discard_request_indices.np[:r.num_discarded_requests]) if (
++            getattr(r, 'num_discarded_requests', 0)) else set()
++        free_slots = list(reversed(w.arena.free))
++        cursor = 0
++        for i, req in enumerate(batch.req_ids):
++            state, request = w.states.get(req), r.requests[req]
++            params = request.sampling_params
++            if (not request_enabled(params) or
++                    req in w.disabled or params.temperature != 0 or params.n != 1 or
++                    req in batch.spec_decode_unsupported_reqs):
++                return self.miss('request')
++            c = int(batch.num_tokens_no_spec[i])
++            start = int(batch.num_computed_tokens_cpu[i])
++            count = scheduler.num_scheduled_tokens.get(req, 0)
++            draft = scheduler.scheduled_spec_decode_tokens.get(req, ())
++            end = start+count
++            partial = end < c
++            sample_count = 0 if partial else len(draft)+1
++            if (c < 1 or start < 0 or count < 1 or start >= c or
++                    (state is None and start != 0) or (state is not None and state.length != start) or
++                    (partial and (draft or i not in discarded)) or
++                    (not partial and (end != c+len(draft) or i in discarded)) or
++                    sample_count > samples.shape[1] or int(r.query_start_loc.np[i]) != cursor or
++                    (getattr(scheduler, 'num_invalid_spec_tokens', None) or {}).get(req, 0)):
++                return self.miss('geometry')
++            if end > graphs.options.context:
++                return self.miss('context')
++            if state is None:
++                if len(missing) >= len(free_slots):
++                    return self.miss('slots')
++                # Geometry/capacity preflight is CPU-only. Lease real arena
++                # views only after the complete mixed batch is known to fit.
++                state = RequestHistory(free_slots[len(missing)], None,
++                                       [HeadHistory(None, None, None) for _ in range(w.heads.num_heads)])
++                missing.append(req)
++            policy = w.request_heads.get(request_type(req), (w.cold_heads, w.warm_heads))
++            left = params.max_tokens-len(request.output_token_ids)
++            cap = batch.max_model_len-c
++            limit = max(0, min(policy[req in w.proposed],
++                               r.speculative_config.num_speculative_tokens, left-1, cap-1))
++            extra = params.extra_args or {}
++            legacy = (req not in w.legacy_submitted and extra.get('ascend_external_draft') and
++                      not extra.get('ascend_external_draft_first_verify'))
++            if partial or legacy:
++                limit = 0
++            stop = stop_ids(params, w.eos)
++            if len(stop) > MAX_STOPS:
++                return self.miss('budget')
++            previous.append(c)
++            counts.append(count)
++            starts.append(start)
++            sample_counts.append(sample_count)
++            states.append(state)
++            known = min(c, end+1)
++            rows.append(batch.token_ids_cpu[i, :known].tolist()+[0]*(end+1-known))
++            limits.append(limit)
++            remaining.append(left)
++            capacity.append(cap)
++            minimum.append(getattr(params, 'min_tokens', 0)-len(request.output_token_ids))
++            stops.append(stop)
++            cursor += count
++        if hidden.shape[0] < cursor:
++            return self.miss('hidden')
++        upper = optimistic_states(states, previous, counts, starts)
++        needed = max(cursor, required_tokens(upper, limits, w.heads.num_heads))
++        depth = captured_depth(graphs.options, w.heads.num_heads, max(1, max(limits)))
++        bucket = next((t for t in graphs.options.tokens if needed <= t), None)
++        if bucket is None or depth is None:
++            return self.miss('tokens')
++        program, replay = graphs.entries[depth_key(graphs.options, depth, bucket)]
++        if not hasattr(program, 'rejection') or samples.shape[1] > program.rejection.width:
++            return self.miss('capture')
++        leased = []
++        try:
++            for req in missing:
++                state = w.arena.acquire()
++                if state is None:
++                    raise RuntimeError('MTP arena capacity changed after preflight')
++                leased.append((req, state))
++                w.states[req] = state
++            # No valid head span for cache-only rows. These stay in original
++            # batch order for sample readback and late external-draft routing.
++            program.stage(upper, rows, limits, allow_inactive=True)
++            prelude = program.rejection
++            prelude.stage(previous, counts, remaining, capacity, minimum, stops, samples, hidden,
++                          starts=starts, sample_counts=sample_counts)
++        except BaseException:
++            for req, state in reversed(leased):
++                del w.states[req]
++                w.arena.release(state)
++            raise
++        if any(limits):
++            replay(prelude=prelude.replay)
++        else:
++            # Chunked prefill / pending rollback: cache target hidden without
++            # running any auxiliary heads or charging a fake proposal round.
++            prelude.replay()
++        combined = prelude.readback(n)
++        # These lists are CPU data; no more device reads in late propose().
++        proposal = combined[:, prelude.width:].tolist()
++        costs = [sum(s.length-h.valid for h in s.heads[:limit])
++                 for s, limit in zip(upper, limits)]
++        self.pending = (scheduler, tuple(batch.req_ids), proposal, upper, costs)
++        active = sum(limit > 0 for limit in limits)
++        if active:
++            graphs.stats['replays'] += 1
++            graphs.stats[f'replays_h{depth}'] += 1
++            graphs.stats['requests'] += active
++            w.stats['graph_head_batches'] += 1
++        # Execution happened even if CPU bookkeeping subsequently drops every
++        # proposal at EOS/length. Account it once, independently of consumption.
++        w.heads.processed_positions += sum(costs)
++        w.heads.reused_positions += sum(h.valid for s, limit in zip(upper, limits)
++                                       for h in s.heads[:limit])
++        w.stats['head_positions'] += sum(costs)
++        w.stats['head_batches'] += bool(active)
++        self.stats['batches'] += 1
++        self.stats['requests'] += n
++        self.stats['cold_requests'] += sum(bool(limit) and req not in w.proposed
++                                           for req, limit in zip(batch.req_ids, limits))
++        self.stats['warm_requests'] += sum(bool(limit) and req in w.proposed
++                                           for req, limit in zip(batch.req_ids, limits))
++        self.stats['cache_only_requests'] += n-active
++        self.stats['optimistic_positions'] += sum(costs)
++        if self.stats['batches'] == 1 or self.stats['batches'] % 100 == 0:
++            logger.info('ASR_MTP_DEVICE_REJECTION batches=%d requests=%d bucket=%d '
++                        'readbacks=%d optimistic_positions=%d cold_requests=%d '
++                        'warm_requests=%d cache_only_requests=%d fallbacks=%s',
++                        self.stats['batches'], self.stats['requests'], bucket,
++                        self.stats['batches'], self.stats['optimistic_positions'],
++                        self.stats['cold_requests'], self.stats['warm_requests'],
++                        self.stats['cache_only_requests'],
++                        {k: v for k, v in self.stats.items() if k.startswith('fallback_')})
++        # Always width >= 2: even non-spec prefill must take the original CPU
++        # rejection parser, not _to_list's unconditional device event wait.
++        return combined[:, :prelude.width]
++
++    def take(self, scheduler):
++        pending, self.pending = self.pending, None
++        if pending is None:
++            return None
++        old, ids, rows, upper, costs = pending
++        if old is not scheduler or ids != tuple(self.worker.runner.input_batch.req_ids):
++            raise RuntimeError('device rejection batch changed before bookkeeping completed')
++        return rows, upper, costs
+--- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_token_attention.py
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,367 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Packed auxiliary attention with isolated request segments and FIA task updates.
 +
@@ -1678,11 +2005,13 @@
 +
 +        if getattr(program, "profile_stages", False):
 +
-+            def replay():
++            def replay(prelude=None):
 +                started = perf_counter()
 +                updates, reuses = attention.task_updates, attention.task_update_reuses
 +                attention.update()
 +                updated = perf_counter()
++                if prelude is not None:
++                    prelude()
 +                graph.replay()
 +                replay.last_timings = {
 +                    "task_update_host_ms": (updated - started) * 1000,
@@ -1692,14 +2021,16 @@
 +                }
 +        else:
 +
-+            def replay():
++            def replay(prelude=None):
 +                attention.update()
++                if prelude is not None:
++                    prelude()
 +                graph.replay()
 +
 +        return replay
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_token_graph.py
-@@ -0,0 +1,651 @@
+@@ -0,0 +1,682 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Packed auxiliary MTP graphs keyed by execution depth and fresh-token capacity."""
 +
@@ -1892,7 +2223,7 @@
 +            **extra,
 +        )
 +
-+    def stage(self, states, inputs, limits):
++    def stage(self, states, inputs, limits, *, allow_inactive=False):
 +        n, h, r = len(states), self.heads.num_heads, self.max_batch + 1
 +        if not n or not n == len(inputs) == len(limits) or n > self.max_batch:
 +            raise ValueError("packed MTP requires aligned bounded requests")
@@ -1905,7 +2236,7 @@
 +        for state, tokens, limit in zip(states, inputs, limits):
 +            if (
 +                type(limit) is not int
-+                or not 0 < limit <= self.execution_heads
++                or not (0 if allow_inactive else 1) <= limit <= self.execution_heads
 +                or not 0 < state.length <= self.context
 +                or len(tokens) != state.length + 1
 +                or any(
@@ -1996,6 +2327,8 @@
 +                self.attention.set_tables(tables)
 +        for d, (q_ends, kv_ends) in enumerate(segments[: self.execution_heads]):
 +            self.attention.stage(d, q_ends, kv_ends)
++        if hasattr(self, 'rejection'):
++            self.rejection.compute_limits.copy_(self.limits)
 +
 +    def _segments(self, index, ends):
 +        # Bcap is small and fixed. Avoid searchsorted implementations that may
@@ -2052,7 +2385,12 @@
 +            segment, relative = self._segments(self.token_index, self.q_ends[d])
 +            request = self.order[d].index_select(0, segment)
 +            anchor = self.starts[d].index_select(0, request) + relative
-+            valid = self.limits.index_select(0, request) >= depth
++            # Optimistic FIA segments still exist when rejection discovers EOS
++            # or a lower remaining budget. Populate finite KV for their entire
++            # scheduled span; only prediction/output eligibility is shortened.
++            compute_limits = (self.rejection.compute_limits
++                              if hasattr(self, 'rejection') else self.limits)
++            valid = compute_limits.index_select(0, request) >= depth
 +            positions = anchor.clamp(0, cap - 1)
 +            base = self.slots.index_select(0, request) * stride
 +            source_offset = (
@@ -2236,6 +2574,27 @@
 +                        [[0] * (s.length + 1) for s in warm],
 +                        [depth] * count,
 +                    )
++                    rejection = getattr(self, 'device_rejection', None)
++                    if rejection is not None:
++                        try:
++                            from .asr_mtp_device_rejection import RejectionPrelude
++                        except ImportError:
++                            from asr_mtp_device_rejection import RejectionPrelude
++                        width, vocab = rejection
++                        program.rejection = RejectionPrelude(program, sample_width=width,
++                                                              vocab_size=vocab)
++                        program.rejection.stage(
++                            [s.length for s in warm], [1]*count, [width+depth]*count,
++                            [width+depth]*count, [0]*count, [set() for _ in warm],
++                            torch.zeros((count, 1), device=self.arena.storage.device,
++                                        dtype=torch.int32),
++                            torch.zeros((count, self.heads.config.hidden_size),
++                                        device=self.arena.storage.device,
++                                        dtype=self.arena.storage.dtype))
++                        if is_npu:
++                            program.rejection.capture(capture.pool)
++                        # Prelude warmup may have changed lengths or limits.
++                        program.stage(warm, [[0]*(s.length+1) for s in warm], [depth]*count)
 +                    self.entries[depth_key(self.options, depth, tokens)] = (
 +                        program,
 +                        capture.capture(program),
@@ -2253,7 +2612,8 @@
 +        logger.info(
 +            "ASR_MTP_GRAPH_READY layout=tokens graphs=%d max_batch=%d token_sizes=%s "
 +            "query_capacities=%s context=%d capture_ms=%.2f reserved_mib=%.2f "
-+            "allocated_mib=%.2f row_write_backend=%s row_width=%d head_counts=%s",
++            "allocated_mib=%.2f row_write_backend=%s row_width=%d head_counts=%s "
++            "device_rejection=%s prelude_graphs=%d",
 +            len(self.entries),
 +            self.options.max_batch,
 +            self.options.tokens,
@@ -2265,6 +2625,8 @@
 +            next(iter(self.entries.values()))[0].row_write_backend,
 +            next(iter(self.entries.values()))[0].row_width,
 +            getattr(self.options, "head_counts", ()) or (self.heads.num_heads,),
++            getattr(self, 'device_rejection', None) is not None,
++            sum(hasattr(program, 'rejection') for program, _ in self.entries.values()),
 +        )
 +
 +    @torch.inference_mode()
@@ -2710,7 +3072,7 @@
 
  logger = logging.getLogger(__name__)
  MTP_KEY = 'ascend_mtp'
-@@ -24,39 +32,130 @@
+@@ -24,39 +32,146 @@
      return marker
 
 
@@ -2804,7 +3166,7 @@
 -    def __init__(self, runner, heads, arena, embedding, logits, eos):
 +    def __init__(self, runner, heads, arena, embedding, logits, eos, *, graphs=None,
 +                 profile_stages=False, acceptance_stats=False, cold_heads=None, warm_heads=None,
-+                 request_heads=None):
++                 request_heads=None, device_rejection=False):
          self.runner, self.heads, self.arena = runner, heads, arena
          self.embedding, self.logits, self.eos = embedding, logits, set(eos)
          self.states, self.disabled = {}, {}
@@ -2827,6 +3189,20 @@
 +        self.proposed = set()
          self.stats = Counter(target_forwards=0)
 +        self.graphs, self.profiled = graphs, False
++        if type(device_rejection) is not bool:
++            raise ValueError('asr_mtp.device_rejection must be a bool')
++        self.device_handoff = None
++        if device_rejection:
++            if (graphs is None or not getattr(graphs.options, 'tokens', ()) or
++                    not getattr(arena, 'paged_kv', False)):
++                raise ValueError('device_rejection requires full paged token graphs')
++            try:
++                from .asr_mtp_device_rejection import DeviceRejectionHandoff
++            except ImportError:
++                from asr_mtp_device_rejection import DeviceRejectionHandoff
++            self.device_handoff = DeviceRejectionHandoff(self)
++            graphs.device_rejection = (runner.speculative_config.num_speculative_tokens+1,
++                                       runner.input_batch.vocab_size)
 +        self.profile_stages = profile_stages
 +        self.acceptance = None
 +        if acceptance_stats:
@@ -2837,6 +3213,8 @@
 +            self.acceptance = AcceptanceTracker(heads.num_heads)
 
      def finish(self, request_ids):
++        if self.device_handoff is not None and self.device_handoff.pending is not None:
++            raise RuntimeError('cannot change request lifetimes during device rejection handoff')
          for req_id in request_ids:
 +            if self.acceptance is not None:
 +                self.acceptance.finish(req_id)
@@ -2849,7 +3227,7 @@
 
      def _fallback(self, req_id, reason):
          state = self.states.pop(req_id, None)
-@@ -90,6 +189,13 @@
+@@ -90,6 +205,13 @@
      def profile(self):
          if self.states or self.arena.leased:
              raise RuntimeError('MTP memory profiling must precede live requests')
@@ -2863,7 +3241,7 @@
          before = self.heads.processed_positions, self.heads.reused_positions
          states = []
          try:
-@@ -108,13 +214,22 @@
+@@ -108,13 +230,23 @@
              for state in states:
                  self.arena.release(state)
              self.heads.processed_positions, self.heads.reused_positions = before
@@ -2873,6 +3251,7 @@
      def propose(self, sampled, scheduler_output, hidden):
 +        prepare_started = perf_counter() if self.profile_stages else None
          runner, batch = self.runner, self.runner.input_batch
++        pending = None if self.device_handoff is None else self.device_handoff.take(scheduler_output)
          outputs = [[] for _ in sampled]
          states, inputs, limits, indices = [], [], [], []
 +        fresh_counts = {}
@@ -2886,7 +3265,7 @@
              request = runner.requests[req_id]
              params = request.sampling_params
              if not request_enabled(params):
-@@ -130,6 +245,8 @@
+@@ -130,6 +262,8 @@
              # Scheduler will stop at EOS, so no auxiliary work can be consumed.
              if any(token in stops and previous_output + j + 1 >= minimum
                     for j, token in enumerate(tokens)):
@@ -2895,7 +3274,17 @@
                  continue
              confirmed = int(batch.num_tokens_no_spec[i])
              legacy = self._legacy_draft(req_id, params, tokens, confirmed)
-@@ -171,9 +288,13 @@
+@@ -163,7 +297,8 @@
+             if start < state.length:
+                 state.crop_heads(start)  # recomputation/preemption overwrites old rows
+             query_start = int(runner.query_start_loc.np[i])
+-            state.target[start:end].copy_(hidden[query_start:query_start + end - start])
++            if pending is None:
++                state.target[start:end].copy_(hidden[query_start:query_start + end - start])
+             state.length = end
+             state.crop_heads(end)
+             if not tokens or legacy is not None:
+@@ -171,9 +306,13 @@
                  # through the target once. Do not skip it by immediately drafting MTP.
                  continue
              remaining = params.max_tokens - len(request.output_token_ids)
@@ -2910,7 +3299,7 @@
                  continue
              row = batch.token_ids_cpu[i, :confirmed].tolist()
              if row[-len(tokens):] != tokens:
-@@ -182,16 +303,39 @@
+@@ -182,16 +321,48 @@
              inputs.append(row)
              limits.append(limit)
              indices.append(i)
@@ -2921,8 +3310,10 @@
 -            buckets = query_buckets(states, limits)
 -            drafts = torch.zeros((len(states), self.heads.num_heads),
 -                                 device=states[0].target.device, dtype=torch.long)
-+            buckets = query_buckets(states, limits, self.graphs)
-+            single_group = (len(buckets) == 1 and
++            if pending is not None:
++                before -= sum(pending[2])  # Early execution is already counted.
++            buckets = query_buckets(states, limits, self.graphs) if pending is None else {}
++            single_group = pending is not None or (len(buckets) == 1 and
 +                            next(iter(buckets.values())) == list(range(len(states))))
 +            proposal_started = perf_counter() if self.profile_stages else None
 +            drafts = (None if single_group else
@@ -2932,6 +3323,7 @@
 -                drafts[group] = self.heads.propose(
 -                    [states[i] for i in group], [inputs[i] for i in group],
 -                    self.embedding, self.logits, [limits[i] for i in group])
+-            rows = drafts.tolist()  # One device-to-host boundary for the whole batch.
 +                batch_states = [states[i] for i in group]
 +                batch_inputs = [inputs[i] for i in group]
 +                batch_limits = [limits[i] for i in group]
@@ -2950,13 +3342,20 @@
 +                    # may be overwritten by the next group using the same graph.
 +                    drafts[group] = proposal
 +            to_cpu_started = perf_counter() if self.profile_stages else None
-             rows = drafts.tolist()  # One device-to-host boundary for the whole batch.
++            if pending is None:
++                rows = drafts.tolist()  # One device-to-host boundary for the whole batch.
++            else:
++                rows = [pending[0][i] for i in indices]
++                for i, state, limit in zip(indices, states, limits):
++                    fresh_counts[i] = pending[2][i]
++                    for head in state.heads[:limit]:
++                        head.valid = state.length  # Never trust the optimistic tail.
 +            postprocess_started = perf_counter() if self.profile_stages else None
 +            cold_count = sum(batch.req_ids[i] not in self.proposed for i in indices)
              mtp_tokens = 0
              for i, row, limit in zip(indices, rows, limits):
                  row = row[:limit]
-@@ -203,13 +347,36 @@
+@@ -203,13 +374,37 @@
                          row = row[:j + 1]
                          break
                  outputs[i] = row
@@ -2967,9 +3366,12 @@
 +                    self.acceptance.offer(batch.req_ids[i], row,
 +                        int(batch.num_tokens_no_spec[i]) - 1, fresh_positions=fresh_counts[i])
              self.stats['proposal_batches'] += 1
-             self.stats['head_batches'] += len(buckets)
+-            self.stats['head_batches'] += len(buckets)
++            if pending is None:
++                self.stats['head_batches'] += len(buckets)
++                self.stats['head_positions'] += self.heads.processed_positions - before
              self.stats['draft_tokens'] += mtp_tokens
-             self.stats['head_positions'] += self.heads.processed_positions - before
+-            self.stats['head_positions'] += self.heads.processed_positions - before
 -            logger.debug('ASR_MTP_STEP requests=%d draft_tokens=%d new_head_positions=%d',
 -                         len(states), mtp_tokens, self.heads.processed_positions - before)
 +            logger.debug('ASR_MTP_STEP requests=%d draft_tokens=%d new_head_positions=%d '
@@ -2995,7 +3397,7 @@
          return outputs
 
 
-@@ -257,9 +424,33 @@
+@@ -257,9 +452,34 @@
  def load_worker(runner, target, settings):
      validate_engine(runner)
      allowed = {'checkpoint', 'num_heads', 'max_context_tokens', 'cache_mib', 'max_requests',
@@ -3005,10 +3407,11 @@
 +               'native_fusion', 'profile_stages', 'kv_cache_backend',
 +               'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend',
 +               'acceptance_stats', 'cold_heads', 'warm_heads', 'chunk_cold_heads', 'chunk_warm_heads',
-+               'finish_cold_heads', 'finish_warm_heads'}
++               'finish_cold_heads', 'finish_warm_heads', 'device_rejection'}
      if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
          raise ValueError('invalid additional_config.asr_mtp settings')
-+    for name, default in (('native_fusion', True), ('profile_stages', False), ('acceptance_stats', False)):
++    for name, default in (('native_fusion', True), ('profile_stages', False), ('acceptance_stats', False),
++                          ('device_rejection', False)):
 +        if type(settings.get(name, default)) is not bool:
 +            raise ValueError(f'asr_mtp.{name} must be a bool')
 +    qkv_rope_backend = settings.get('qkv_rope_backend', 'auto')
@@ -3030,7 +3433,7 @@
      for name, default in (('num_heads', 5), ('max_context_tokens', 512),
                            ('cache_mib', 512), ('max_requests', 64)):
          if type(settings.get(name, default)) is not int or settings.get(name, default) < 1:
-@@ -279,25 +470,84 @@
+@@ -279,25 +499,86 @@
      if type(trained) is not int or trained < 1:
          raise ValueError('invalid checkpoint num_heads')
      heads = min(settings.get('num_heads', trained), trained, runner.speculative_config.num_speculative_tokens)
@@ -3101,7 +3504,8 @@
 +    worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits,
 +                       eos, graphs=graphs, profile_stages=settings.get('profile_stages', False),
 +                       acceptance_stats=settings.get('acceptance_stats', False),
-+                       cold_heads=cold_heads, warm_heads=warm_heads, request_heads=request_heads)
++                       cold_heads=cold_heads, warm_heads=warm_heads, request_heads=request_heads,
++                       device_rejection=settings.get('device_rejection', False))
      logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
 -                'verify_base_signature=%s',
 -                heads, cap, slots, arena.storage.numel() * arena.storage.element_size() / 1024 ** 2,
@@ -3109,7 +3513,7 @@
 +                'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s '
 +                'native_fusion=%s profile_stages=%s kv_cache_backend=%s kv_write_backend=%s '
 +                'qkv_rope_backend=%s row_write_backend=%s acceptance_stats=%s cold_heads=%d warm_heads=%d '
-+                'chunk_heads=%s finish_heads=%s',
++                'chunk_heads=%s finish_heads=%s device_rejection=%s',
 +                heads, cap, slots, getattr(arena, 'cache_bytes',
 +                    arena.storage.numel() * arena.storage.element_size()) / 1024 ** 2,
 +                settings['checkpoint'], settings.get('verify_base_signature', False),
@@ -3121,7 +3525,8 @@
 +                getattr(arena, 'write_backend', 'separate_scatter_nd'),
 +                model.qkv_rope.backend if native_fusion else 'legacy',
 +                settings.get('row_write_backend', 'auto'), settings.get('acceptance_stats', False),
-+                cold_heads, warm_heads, request_heads['chunk'], request_heads['finish'])
++                cold_heads, warm_heads, request_heads['chunk'], request_heads['finish'],
++                settings.get('device_rejection', False))
      return worker
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_metrics.py
@@ -3453,12 +3858,14 @@
 +    main()
 --- a/vllm_ascend/patch/worker/patch_external_draft_mtp.py
 +++ b/vllm_ascend/patch/worker/patch_external_draft_mtp.py
-@@ -8,13 +8,15 @@
+@@ -8,13 +8,16 @@
  replaced. Without additional_config.asr_mtp, every original method is retained.
  """
  import inspect
+-
 +import logging
-
++from copy import copy
++
 +from vllm_ascend.spec_decode.asr_mtp_worker import load_worker, request_enabled
  from vllm_ascend.spec_decode.external_draft_proposer import AscendExternalDraftProposer
 -from vllm_ascend.spec_decode.asr_mtp_worker import request_enabled, load_worker
@@ -3470,7 +3877,7 @@
 
 
  class AscendExternalDraftMTPProposer(AscendExternalDraftProposer):
-@@ -27,7 +29,8 @@
+@@ -27,7 +30,8 @@
          self.online = load_worker(self.runner, target, self.settings)
 
      def dummy_run(self, *args, is_profile=False, **kwargs):
@@ -3480,7 +3887,54 @@
          if is_profile and self.online is not None:
              self.online.profile()
 
-@@ -125,4 +128,54 @@
+@@ -57,6 +61,11 @@
+     original_get = cls._get_drafter
+     original_propose = cls.propose_draft_token_ids
+     original_update = cls._update_states
++    original_bookkeeping = cls._bookkeeping_sync
++    if tuple(inspect.signature(original_bookkeeping).parameters) != (
++            'self', 'scheduler_output', 'sampler_output', 'logits', 'hidden_states',
++            'num_scheduled_tokens', 'spec_decode_metadata'):
++        raise RuntimeError('ASR MTP patch requires the supported v0.23 bookkeeping API')
+     original_graph_setup = getattr(cls, '_check_and_update_cudagraph_mode', None)
+     expected = ('self', 'valid_sampled_token_ids', 'sampling_metadata', 'scheduler_output',
+                 'spec_decode_metadata', 'spec_decode_common_attn_metadata', 'positions',
+@@ -96,6 +105,29 @@
+             # lifetime. Batch removal for mere unscheduling must not evict state.
+             drafter.online.finish(scheduler_output.finished_req_ids)
+         return original_update(self, scheduler_output)
++
++    def bookkeeping(self, scheduler_output, sampler_output, logits, hidden_states,
++                    num_scheduled_tokens, spec_decode_metadata):
++        drafter = self.drafter
++        handoff = (getattr(drafter.online, 'device_handoff', None)
++                   if isinstance(drafter, AscendExternalDraftMTPProposer) else None)
++        cpu = None
++        if handoff is not None:
++            cpu = handoff.prepare(scheduler_output, sampler_output, hidden_states)
++        if cpu is None:
++            return original_bookkeeping(self, scheduler_output, sampler_output, logits,
++                                        hidden_states, num_scheduled_tokens, spec_decode_metadata)
++        # The original sampler tensor is still used by other runner paths.
++        # Only bookkeeping sees CPU output; rejection filtering stays upstream.
++        local_sampler = copy(sampler_output)
++        local_sampler.sampled_token_ids = cpu
++        try:
++            return original_bookkeeping(self, scheduler_output, local_sampler, logits,
++                                        hidden_states, num_scheduled_tokens, spec_decode_metadata)
++        except BaseException:
++            handoff.pending = None
++            drafter.online.finish(tuple(self.input_batch.req_ids))
++            raise
+
+     def graph_setup(self, attention_backends, kv_cache_groups):
+         if (not isinstance(self.drafter, AscendExternalDraftMTPProposer) or
+@@ -121,8 +153,59 @@
+     cls._get_drafter = get_drafter
+     cls.propose_draft_token_ids = propose
+     cls._update_states = update
++    cls._bookkeeping_sync = bookkeeping
+     cls._check_and_update_cudagraph_mode = graph_setup
      cls._asr_mtp_patch_installed = True
 
 
