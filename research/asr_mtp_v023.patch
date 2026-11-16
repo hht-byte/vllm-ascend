@@ -823,10 +823,12 @@
 +    from .asr_mtp_fused import add_rms_norm
 +    from .asr_mtp_heads import project_norm_rope
 +    from .asr_mtp_row_copy import prepare_row_writer
++    from .asr_mtp_staging import UploadBatch
 +except ImportError:
 +    from asr_mtp_fused import add_rms_norm
 +    from asr_mtp_heads import project_norm_rope
 +    from asr_mtp_row_copy import prepare_row_writer
++    from asr_mtp_staging import UploadBatch
 +
 +logger = logging.getLogger(__name__)
 +MAX_MTP_GRAPHS = 64
@@ -1003,6 +1005,8 @@
 +        self.output = torch.empty(
 +            (batch_size, heads.num_heads), device=device, dtype=torch.long
 +        )
++        self.uploads = UploadBatch(device)
++        self.metadata_upload = self.uploads.buffer(self.metadata)
 +        self.query_index = torch.arange(query_size, device=device)
 +        self.key_index = torch.arange(context_size, device=device)
 +        self.hidden_index = torch.arange(
@@ -1075,12 +1079,8 @@
 +                    *([0] * (self.context + depth + 1 - len(tokens))),
 +                ]
 +            )
-+        # Fresh pinned storage per upload: never mutate a staging buffer whose
-+        # asynchronous H2D might still be pending from an earlier replay.
-+        host = torch.tensor(
-+            rows, dtype=torch.long, pin_memory=self.metadata.device.type == "npu"
-+        )
-+        self.metadata.copy_(host, non_blocking=True)
++        # Reuse pinned host storage only after its preceding H2D completes.
++        self.metadata_upload.copy(rows)
 +
 +    def _hidden_indices(self, base, positions):
 +        return (
@@ -1419,6 +1419,74 @@
 +                depth,
 +            )
 +        return program.output
+--- /dev/null
++++ b/vllm_ascend/spec_decode/asr_mtp_staging.py
+@@ -0,0 +1,65 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Persistent host staging with one H2D lifetime fence per auxiliary program.
++
++Used outside capture, serially on the runner stream. The fence protects CPU
++storage reuse, not graph completion; stream order protects device storage.
++"""
++
++import torch
++
++
++class UploadBatch:
++    def __init__(self, device, *, event=None):
++        self.device = torch.device(device)
++        self.event = event
++        if self.event is None and self.device.type == "npu":
++            self.event = torch.npu.Event()
++        self.active = self.pending = self.dirty = False
++
++    def buffer(self, target):
++        return UploadBuffer(self, target)
++
++    def __enter__(self):
++        if self.active:
++            raise RuntimeError("nested MTP upload batch")
++        self.active = True
++        return self
++
++    def before_write(self):
++        # Defer the query until a write is actually needed: unchanged tables
++        # alone do not query, synchronize or record an event.
++        if self.pending:
++            if not self.event.query():
++                self.event.synchronize()
++            self.pending = False
++
++    def __exit__(self, *exc):
++        try:
++            # Also fence successful copies preceding a later staging error.
++            if self.dirty and self.event is not None:
++                self.event.record()
++                self.pending = True
++        finally:
++            self.active = self.dirty = False
++
++
++class UploadBuffer:
++    def __init__(self, owner, target):
++        self.owner, self.target = owner, target
++        self.host = torch.empty(
++            target.shape,
++            dtype=target.dtype,
++            device="cpu",
++            pin_memory=owner.device.type == "npu",
++        )
++        self.array = self.host.numpy()
++
++    def copy(self, values):
++        if not self.owner.active:
++            with self.owner:
++                self.copy(values)
++            return
++        self.owner.before_write()
++        self.array[...] = values
++        self.owner.dirty = True
++        self.target.copy_(self.host, non_blocking=True)
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_token_attention.py
 @@ -0,0 +1,363 @@
@@ -1787,7 +1855,7 @@
 +        return replay
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_token_graph.py
-@@ -0,0 +1,647 @@
+@@ -0,0 +1,651 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Packed auxiliary MTP graphs keyed by execution depth and fresh-token capacity."""
 +
@@ -1803,12 +1871,14 @@
 +    from .asr_mtp_graph import captured_depth, depth_key
 +    from .asr_mtp_heads import project_norm_rope
 +    from .asr_mtp_row_copy import prepare_row_writer
++    from .asr_mtp_staging import UploadBatch
 +    from .asr_mtp_token_attention import PackedAttention, PackedNPUCapture
 +except ImportError:
 +    from asr_mtp_fused import add_rms_norm
 +    from asr_mtp_graph import captured_depth, depth_key
 +    from asr_mtp_heads import project_norm_rope
 +    from asr_mtp_row_copy import prepare_row_writer
++    from asr_mtp_staging import UploadBatch
 +    from asr_mtp_token_attention import PackedAttention, PackedNPUCapture
 +
 +logger = logging.getLogger(__name__)
@@ -1898,6 +1968,8 @@
 +        self.sequence_width = context_size + count + 1
 +        size = 5 * count * requests + 3 * requests + requests * self.sequence_width
 +        self.metadata = torch.zeros(size, device=device, dtype=torch.long)
++        self.uploads = UploadBatch(device)
++        self.metadata_upload = self.uploads.buffer(self.metadata)
 +        offset = 0
 +
 +        def view(shape):
@@ -1964,6 +2036,7 @@
 +                "block_size": arena.block_size,
 +                "num_blocks": arena.total_blocks,
 +                "max_blocks": len(arena.block_rows[0]),
++                "uploads": self.uploads,
 +            }
 +        self.attention = attention_class(
 +            cfg.num_attention_heads,
@@ -2059,12 +2132,6 @@
 +            *([0] * (r - n)),
 +            *flatten(sequences),
 +        ]
-+        # All validation precedes upload. The fresh pinned buffer is never
-+        # mutated while the asynchronous transfer may still be pending.
-+        host = torch.tensor(
-+            payload, dtype=torch.long, pin_memory=self.metadata.device.type == "npu"
-+        )
-+        self.metadata.copy_(host, non_blocking=True)
 +        if self.paged_kv:
 +            tables = [
 +                [
@@ -2077,7 +2144,12 @@
 +                    orders[: self.execution_heads], segments[: self.execution_heads]
 +                )
 +            ]
-+            self.attention.set_tables(tables)
++        # One fence covers metadata and changed PA tables. Repeated buckets
++        # cannot overwrite pinned storage until the preceding H2D completes.
++        with self.uploads:
++            self.metadata_upload.copy(payload)
++            if self.paged_kv:
++                self.attention.set_tables(tables)
 +        for d, (q_ends, kv_ends) in enumerate(segments[: self.execution_heads]):
 +            self.attention.stage(d, q_ends, kv_ends)
 +
@@ -2633,7 +2705,7 @@
 +        )
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_paged_attention.py
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,132 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""FIA TND queries reading auxiliary PA cache directly through fixed block tables."""
 +
@@ -2641,13 +2713,15 @@
 +from torch.nn import functional as F
 +
 +try:
++    from .asr_mtp_staging import UploadBatch
 +    from .asr_mtp_token_attention import PackedAttention
 +except ImportError:
++    from asr_mtp_staging import UploadBatch
 +    from asr_mtp_token_attention import PackedAttention
 +
 +
 +class PagedAttention(PackedAttention):
-+    def __init__(self, *args, max_batch, block_size, num_blocks, max_blocks, **kwargs):
++    def __init__(self, *args, max_batch, block_size, num_blocks, max_blocks, uploads=None, **kwargs):
 +        super().__init__(*args, **kwargs)
 +        self.block_size, self.num_blocks = block_size, num_blocks
 +        self.tables = torch.zeros(
@@ -2657,6 +2731,8 @@
 +        )
 +        self.table_rows = None
 +        self.kv_lengths = {}
++        self.uploads = uploads if uploads is not None else UploadBatch(self.device)
++        self.table_upload = self.uploads.buffer(self.tables.view(-1))
 +
 +    def set_tables(self, rows):
 +        """Upload all heads in one transfer; values originate in CPU slot metadata."""
@@ -2678,10 +2754,7 @@
 +        normalized = tuple(tuple(tuple(row) for row in table) for table in rows)
 +        if normalized == self.table_rows:
 +            return
-+        host = torch.tensor(
-+            payload, dtype=torch.int32, pin_memory=self.device.type == "npu"
-+        )
-+        self.tables.view(-1).copy_(host, non_blocking=True)
++        self.table_upload.copy(payload)
 +        self.table_rows = normalized
 +
 +    def stage(self, head, q_ends, kv_ends):

@@ -100,6 +100,17 @@ class PackedFixture:
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "requires Torch")
 class PackedProgramTests(PackedFixture, unittest.TestCase):
+    def test_stage_reuses_pinned_storage_for_reordered_and_shrinking_groups(self):
+        from unittest.mock import patch
+
+        pointer = self.program.metadata_upload.host.data_ptr()
+        rows = [row + [5] for row in self.ids]
+        with patch("torch.tensor", side_effect=AssertionError("hot-path tensor construction")):
+            self.program.stage(self.b, rows, [3, 2, 1])
+            self.program.stage(self.b[1:2], rows[1:2], [3])
+        self.assertEqual(pointer, self.program.metadata_upload.host.data_ptr())
+        self.assertEqual(self.program.slots.tolist(), [self.b[1].slot, 0, 0, 0])
+
     def test_exact_logical_bucket_has_positive_dummy_and_full_kv_segment(self):
         from asr_mtp_token_graph import PackedMTPProgram
 

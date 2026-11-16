@@ -14,10 +14,12 @@ try:
     from .asr_mtp_fused import add_rms_norm
     from .asr_mtp_heads import project_norm_rope
     from .asr_mtp_row_copy import prepare_row_writer
+    from .asr_mtp_staging import UploadBatch
 except ImportError:
     from asr_mtp_fused import add_rms_norm
     from asr_mtp_heads import project_norm_rope
     from asr_mtp_row_copy import prepare_row_writer
+    from asr_mtp_staging import UploadBatch
 
 logger = logging.getLogger(__name__)
 MAX_MTP_GRAPHS = 64
@@ -194,6 +196,8 @@ class FixedMTPProgram:
         self.output = torch.empty(
             (batch_size, heads.num_heads), device=device, dtype=torch.long
         )
+        self.uploads = UploadBatch(device)
+        self.metadata_upload = self.uploads.buffer(self.metadata)
         self.query_index = torch.arange(query_size, device=device)
         self.key_index = torch.arange(context_size, device=device)
         self.hidden_index = torch.arange(
@@ -266,12 +270,8 @@ class FixedMTPProgram:
                     *([0] * (self.context + depth + 1 - len(tokens))),
                 ]
             )
-        # Fresh pinned storage per upload: never mutate a staging buffer whose
-        # asynchronous H2D might still be pending from an earlier replay.
-        host = torch.tensor(
-            rows, dtype=torch.long, pin_memory=self.metadata.device.type == "npu"
-        )
-        self.metadata.copy_(host, non_blocking=True)
+        # Reuse pinned host storage only after its preceding H2D completes.
+        self.metadata_upload.copy(rows)
 
     def _hidden_indices(self, base, positions):
         return (

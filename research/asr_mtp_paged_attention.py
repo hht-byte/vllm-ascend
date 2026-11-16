@@ -5,13 +5,15 @@ import torch
 from torch.nn import functional as F
 
 try:
+    from .asr_mtp_staging import UploadBatch
     from .asr_mtp_token_attention import PackedAttention
 except ImportError:
+    from asr_mtp_staging import UploadBatch
     from asr_mtp_token_attention import PackedAttention
 
 
 class PagedAttention(PackedAttention):
-    def __init__(self, *args, max_batch, block_size, num_blocks, max_blocks, **kwargs):
+    def __init__(self, *args, max_batch, block_size, num_blocks, max_blocks, uploads=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.block_size, self.num_blocks = block_size, num_blocks
         self.tables = torch.zeros(
@@ -21,6 +23,8 @@ class PagedAttention(PackedAttention):
         )
         self.table_rows = None
         self.kv_lengths = {}
+        self.uploads = uploads if uploads is not None else UploadBatch(self.device)
+        self.table_upload = self.uploads.buffer(self.tables.view(-1))
 
     def set_tables(self, rows):
         """Upload all heads in one transfer; values originate in CPU slot metadata."""
@@ -42,10 +46,7 @@ class PagedAttention(PackedAttention):
         normalized = tuple(tuple(tuple(row) for row in table) for table in rows)
         if normalized == self.table_rows:
             return
-        host = torch.tensor(
-            payload, dtype=torch.int32, pin_memory=self.device.type == "npu"
-        )
-        self.tables.view(-1).copy_(host, non_blocking=True)
+        self.table_upload.copy(payload)
         self.table_rows = normalized
 
     def stage(self, head, q_ends, kv_ends):

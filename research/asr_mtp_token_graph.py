@@ -13,12 +13,14 @@ try:
     from .asr_mtp_graph import captured_depth, depth_key
     from .asr_mtp_heads import project_norm_rope
     from .asr_mtp_row_copy import prepare_row_writer
+    from .asr_mtp_staging import UploadBatch
     from .asr_mtp_token_attention import PackedAttention, PackedNPUCapture
 except ImportError:
     from asr_mtp_fused import add_rms_norm
     from asr_mtp_graph import captured_depth, depth_key
     from asr_mtp_heads import project_norm_rope
     from asr_mtp_row_copy import prepare_row_writer
+    from asr_mtp_staging import UploadBatch
     from asr_mtp_token_attention import PackedAttention, PackedNPUCapture
 
 logger = logging.getLogger(__name__)
@@ -108,6 +110,8 @@ class PackedMTPProgram:
         self.sequence_width = context_size + count + 1
         size = 5 * count * requests + 3 * requests + requests * self.sequence_width
         self.metadata = torch.zeros(size, device=device, dtype=torch.long)
+        self.uploads = UploadBatch(device)
+        self.metadata_upload = self.uploads.buffer(self.metadata)
         offset = 0
 
         def view(shape):
@@ -174,6 +178,7 @@ class PackedMTPProgram:
                 "block_size": arena.block_size,
                 "num_blocks": arena.total_blocks,
                 "max_blocks": len(arena.block_rows[0]),
+                "uploads": self.uploads,
             }
         self.attention = attention_class(
             cfg.num_attention_heads,
@@ -269,12 +274,6 @@ class PackedMTPProgram:
             *([0] * (r - n)),
             *flatten(sequences),
         ]
-        # All validation precedes upload. The fresh pinned buffer is never
-        # mutated while the asynchronous transfer may still be pending.
-        host = torch.tensor(
-            payload, dtype=torch.long, pin_memory=self.metadata.device.type == "npu"
-        )
-        self.metadata.copy_(host, non_blocking=True)
         if self.paged_kv:
             tables = [
                 [
@@ -287,7 +286,12 @@ class PackedMTPProgram:
                     orders[: self.execution_heads], segments[: self.execution_heads]
                 )
             ]
-            self.attention.set_tables(tables)
+        # One fence covers metadata and changed PA tables. Repeated buckets
+        # cannot overwrite pinned storage until the preceding H2D completes.
+        with self.uploads:
+            self.metadata_upload.copy(payload)
+            if self.paged_kv:
+                self.attention.set_tables(tables)
         for d, (q_ends, kv_ends) in enumerate(segments[: self.execution_heads]):
             self.attention.stage(d, q_ends, kv_ends)
 
