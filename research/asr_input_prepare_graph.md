@@ -103,6 +103,54 @@ the earlier approximately 2 ms handoff gap and end-to-end commit latency.
 Local validation uses Torch CPU; the real NPU graph/slot-kernel test is skipped
 without Ascend hardware. No hardware speedup is claimed from CPU tests.
 
+## CPU-authoritative slot packing and mRoPE decode
+
+The preparation owner can also pack the CPU-authoritative block table and slot
+mapping in its existing upload. `cpu_slot_mapping=True` is the default within
+the opt-in fused preparation graph. It replaces per-step block-table
+`clone().pin_memory()` and the generic device slot kernel with persistent host
+storage and graph copies. For an independent ablation, set
+`additional_config["asr_input_prepare_graph"]["cpu_slot_mapping"] = False`.
+Graph misses and `fuse_handoff=False` retain the original block upload and slot
+kernel. This option requires the same synchronous, single-device constraints.
+
+Each replay snapshots active block rows, pads inactive rows with zero and pads
+all unused slots with -1. New block allocations, request reordering and batch
+shrinking are reflected in the next snapshot. Cache groups use their own
+logical block sizes. Slot addresses and attention lengths retain their existing
+semantics; the CPU computes no target-model or MTP forward pass.
+
+After a completed preparation replay, the target attention builder reuses its
+device query starts, including FULL's dummy request. This removes a redundant
+pin/upload after slot mapping. Other builders and callers retain their original
+snapshot behavior.
+
+Pure-decode embedding capture also supports mRoPE ASR. Token embedding uses only
+the input IDs; preprocessing returns the runner's original three-axis positions
+through `_get_positions`. The CPU position calculation and position upload are
+retained. Audio/prefill and other existing embedding guards
+remain in place. `capture_decode_embedding=False` disables this part for
+comparison. Inspect `embedding_replays`, rather than capture alone, to confirm
+that traffic used the embedding variant.
+
+Startup `ASR_INPUT_PREPARE_GRAPH_READY` reports `cpu_slot_mapping` alongside the
+existing graph counters. Keep `asr_mtp.profile_stages=False` for performance
+comparisons. Short profiling runs can attribute preparation and metadata work;
+per-step logs are excluded from the main measurements.
+
+For a checkout at `f9e8710d3`, apply the focused update with all three source
+files together:
+
+```bash
+git apply --check examples/910b/asr_turnaround_v023.patch
+git apply examples/910b/asr_turnaround_v023.patch
+python tests/ut/worker/test_asr_cpu_slots_standalone.py
+python tests/ut/attention/test_asr_query_start_reuse_standalone.py
+```
+
+The patch adds the focused tests as well as the helper, runner and attention
+changes. Updating to the branch containing this commit needs no extra patch.
+
 ## Patch delivery
 
 `asr_input_prepare_graph_v023.patch` targets `310P-graph` at `2b3cb3c97`, which
