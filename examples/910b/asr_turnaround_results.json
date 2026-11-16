@@ -1,0 +1,212 @@
+{
+  "scope": "Independent native ASR on 910B3, FP16 Qwen3-ASR-1.7B, vLLM 0.23.0, TorchNPU 2.10.0.post4, CANN 9.1.0",
+  "baseline_delivery_commit": "f9e8710d3e1d2b87300fb27a239a619545d8bded",
+  "candidate": "CPU slot/table packing + target query starts reuse + mRoPE pure-decode embedding capture",
+  "profile_stages": false,
+  "physical_device": 1,
+  "boundary": "MTP last compute kernel (ScatterNdUpdate) end -> preparation MODEL_EXECUTE start -> target decoder first RmsNorm start",
+  "limitations": [
+    "Independent public-input simulation, not production traffic replay.",
+    "No general complete-request latency improvement established.",
+    "First CPU turnaround improvement was not consistent across all runs.",
+    "Extra mRoPE position-upload packing was rejected: incremental benefit mixed and too small."
+  ],
+  "experiments": {
+    "shape_profile_abba": {
+      "record_shapes": true,
+      "variants": {
+        "baseline": {
+          "runs": [
+            "baseline-final-1",
+            "baseline-final-4"
+          ],
+          "matched_steps": 42,
+          "timings": {
+            "post_mtp_to_prep_ms": {
+              "median_ms": 3.59475,
+              "mean_ms": 3.6008452380952383
+            },
+            "prep_to_verify_ms": {
+              "median_ms": 1.458875,
+              "mean_ms": 1.5232738095238096
+            },
+            "post_mtp_to_verify_ms": {
+              "median_ms": 5.04175,
+              "mean_ms": 5.124119047619048
+            }
+          },
+          "groups": [
+            {
+              "requests": 2,
+              "tokens": 7,
+              "count": 6,
+              "post_mtp_to_verify_median_ms": 4.843375
+            },
+            {
+              "requests": 2,
+              "tokens": 8,
+              "count": 12,
+              "post_mtp_to_verify_median_ms": 4.986750000000001
+            },
+            {
+              "requests": 4,
+              "tokens": 14,
+              "count": 6,
+              "post_mtp_to_verify_median_ms": 5.269375
+            },
+            {
+              "requests": 4,
+              "tokens": 16,
+              "count": 18,
+              "post_mtp_to_verify_median_ms": 5.116625
+            }
+          ]
+        },
+        "candidate": {
+          "runs": [
+            "candidate-v2-final-2",
+            "candidate-v2-final-3"
+          ],
+          "matched_steps": 42,
+          "timings": {
+            "post_mtp_to_prep_ms": {
+              "median_ms": 3.6247499999999997,
+              "mean_ms": 3.636011904761905
+            },
+            "prep_to_verify_ms": {
+              "median_ms": 0.99175,
+              "mean_ms": 1.0509761904761905
+            },
+            "post_mtp_to_verify_ms": {
+              "median_ms": 4.600625,
+              "mean_ms": 4.686988095238095
+            }
+          },
+          "groups": [
+            {
+              "requests": 2,
+              "tokens": 7,
+              "count": 6,
+              "post_mtp_to_verify_median_ms": 4.425875
+            },
+            {
+              "requests": 2,
+              "tokens": 8,
+              "count": 12,
+              "post_mtp_to_verify_median_ms": 4.713125
+            },
+            {
+              "requests": 4,
+              "tokens": 14,
+              "count": 6,
+              "post_mtp_to_verify_median_ms": 4.709875
+            },
+            {
+              "requests": 4,
+              "tokens": 16,
+              "count": 18,
+              "post_mtp_to_verify_median_ms": 4.592625
+            }
+          ]
+        }
+      }
+    },
+    "low_overhead_profile": {
+      "record_shapes": false,
+      "variants": {
+        "baseline": {
+          "runs": [
+            "baseline-lowprofile-1"
+          ],
+          "matched_steps": 56,
+          "timings": {
+            "post_mtp_to_prep_ms": {
+              "median_ms": 3.474625,
+              "mean_ms": 3.485080357142857
+            },
+            "prep_to_verify_ms": {
+              "median_ms": 1.3282500000000002,
+              "mean_ms": 1.354625
+            },
+            "post_mtp_to_verify_ms": {
+              "median_ms": 4.812749999999999,
+              "mean_ms": 4.839705357142857
+            }
+          },
+          "groups": [
+            {
+              "requests": 2,
+              "tokens": 7,
+              "count": 8,
+              "post_mtp_to_verify_median_ms": 4.583875
+            },
+            {
+              "requests": 2,
+              "tokens": 8,
+              "count": 16,
+              "post_mtp_to_verify_median_ms": 4.844250000000001
+            },
+            {
+              "requests": 4,
+              "tokens": 14,
+              "count": 8,
+              "post_mtp_to_verify_median_ms": 4.8458749999999995
+            },
+            {
+              "requests": 4,
+              "tokens": 16,
+              "count": 24,
+              "post_mtp_to_verify_median_ms": 4.82725
+            }
+          ]
+        },
+        "candidate": {
+          "runs": [
+            "candidate-v2-lowprofile-2"
+          ],
+          "matched_steps": 56,
+          "timings": {
+            "post_mtp_to_prep_ms": {
+              "median_ms": 3.30025,
+              "mean_ms": 3.3084151785714284
+            },
+            "prep_to_verify_ms": {
+              "median_ms": 0.825625,
+              "mean_ms": 0.8580848214285715
+            },
+            "post_mtp_to_verify_ms": {
+              "median_ms": 4.14825,
+              "mean_ms": 4.1665
+            }
+          },
+          "groups": [
+            {
+              "requests": 2,
+              "tokens": 7,
+              "count": 8,
+              "post_mtp_to_verify_median_ms": 3.9035
+            },
+            {
+              "requests": 2,
+              "tokens": 8,
+              "count": 16,
+              "post_mtp_to_verify_median_ms": 4.184
+            },
+            {
+              "requests": 4,
+              "tokens": 14,
+              "count": 8,
+              "post_mtp_to_verify_median_ms": 4.1598749999999995
+            },
+            {
+              "requests": 4,
+              "tokens": 16,
+              "count": 24,
+              "post_mtp_to_verify_median_ms": 4.16725
+            }
+          ]
+        }
+      }
+    }
+  }
+}

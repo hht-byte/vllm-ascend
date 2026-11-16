@@ -103,7 +103,11 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionBackend,
+    AscendAttentionMetadataBuilder,
+    AscendAttentionState,
+)
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
@@ -912,7 +916,8 @@ class NPUModelRunner(GPUModelRunner):
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit_block_table(num_reqs)
+        if input_prepare_bucket is None or not self._input_prepare_graph.packs_block_tables:
+            self.input_batch.block_table.commit_block_table(num_reqs)
 
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
@@ -3334,6 +3339,8 @@ class NPUModelRunner(GPUModelRunner):
             )
 
             extra_attn_metadata_args = {}
+            if input_layout_prepared and type(builder) is AscendAttentionMetadataBuilder:
+                extra_attn_metadata_args["reuse_query_start_loc"] = True
             if use_spec_decode and isinstance(builder, GDNAttentionMetadataBuilder):
                 assert ubid is None, "UBatching not supported with GDN yet"
                 extra_attn_metadata_args = dict(
@@ -5232,12 +5239,13 @@ class NPUModelRunner(GPUModelRunner):
             cuda_graph_size += self._input_prepare_graph.capture()
             logger.info(
                 "ASR_INPUT_PREPARE_GRAPH_READY graphs=%d token_sizes=%s reserved_bytes=%d "
-                "embedding_graphs=%d fuse_handoff=%s",
+                "embedding_graphs=%d fuse_handoff=%s cpu_slot_mapping=%s",
                 len(self._input_prepare_graph.entries),
                 self._input_prepare_graph.token_sizes,
                 self._input_prepare_graph.reserved_bytes,
                 len(self._input_prepare_graph.embedding_entries),
                 self._input_prepare_graph.fuse_handoff,
+                self._input_prepare_graph.packs_block_tables,
             )
 
         mgr = self.encoder_cudagraph_manager

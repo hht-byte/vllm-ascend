@@ -6,6 +6,7 @@ from bisect import bisect_left
 from collections.abc import Mapping
 from time import monotonic
 
+import numpy as np
 import torch
 
 
@@ -14,14 +15,28 @@ def settings(runner, *, prepare_inputs):
     opts = config.get("asr_input_prepare_graph", {})
     if not isinstance(opts, Mapping):
         raise TypeError("asr_input_prepare_graph must be a mapping")
-    if set(opts) - {"enabled", "token_sizes", "pack_spec_metadata", "fuse_handoff", "capture_decode_embedding", "reuse_rejection_buffer"}:
+    if set(opts) - {
+        "enabled",
+        "token_sizes",
+        "pack_spec_metadata",
+        "fuse_handoff",
+        "capture_decode_embedding",
+        "reuse_rejection_buffer",
+        "cpu_slot_mapping",
+    }:
         raise ValueError("unknown asr_input_prepare_graph setting")
     on = opts.get("enabled", False)
     if type(on) is not bool:
         raise TypeError("asr_input_prepare_graph.enabled must be a bool")
     if not on:
         return None
-    for name in ("pack_spec_metadata", "fuse_handoff", "capture_decode_embedding", "reuse_rejection_buffer"):
+    for name in (
+        "pack_spec_metadata",
+        "fuse_handoff",
+        "capture_decode_embedding",
+        "reuse_rejection_buffer",
+        "cpu_slot_mapping",
+    ):
         if type(opts.get(name, True)) is not bool:
             raise TypeError(f"asr_input_prepare_graph.{name} must be a bool")
     if config.get("asr_sync_input_packing", False):
@@ -114,6 +129,9 @@ class InputPrepareGraph:
         opts = (runner.vllm_config.additional_config or {}).get("asr_input_prepare_graph", {})
         self.fuse_handoff = opts.get("fuse_handoff", True)
         self.capture_decode_embedding = opts.get("capture_decode_embedding", True)
+        self.cpu_slot_mapping = opts.get("cpu_slot_mapping", True)
+        self.packs_block_tables = False
+        self.table_fields = []
         self.want_embedding = (
             self.fuse_handoff
             and self.capture_decode_embedding
@@ -122,7 +140,6 @@ class InputPrepareGraph:
             and not getattr(self.runner, "lora_config", None)
             and not getattr(self.runner.model_config, "quantization", None)
             and not getattr(self.runner.model_config, "is_encoder_decoder", False)
-            and not getattr(self.runner, "uses_mrope", False)
             and not getattr(self.runner, "uses_xdrope_dim", 0)
         )
         self.entries, self.embedding_entries = {}, {}
@@ -200,6 +217,42 @@ class InputPrepareGraph:
             self.cpu[name] = self.host[start : start + size].view(dtype).numpy()
         self.position_offset = layout["positions"][0]
 
+    def _pack_table_storage(self):
+        # Final cache groups are known only at capture time. Append their fixed
+        # storage before capturing any graph; all runtime uploads stay one copy.
+        if (
+            not self.cpu_slot_mapping
+            or not self.fuse_handoff
+            or any(not hasattr(table.block_table, "np") for table in self.tables.block_tables)
+        ):
+            return
+        start = self.host.numel()
+        layout = []
+        for i, table in enumerate(self.tables.block_tables):
+            rows, width = table.block_table.gpu.shape
+            if rows < self.max_requests or table.block_table.np.shape != (rows, width):
+                raise ValueError("unsupported CPU block table layout")
+            for name, count in ((f"blocks_{i}", rows * width), (f"slots_{i}", table.max_num_batched_tokens)):
+                start = (start + 7) // 8 * 8
+                layout.append((name, start, count))
+                start += count * 4
+            self.table_fields.append((f"blocks_{i}", f"slots_{i}", rows, width))
+        host = torch.zeros(start, dtype=torch.uint8, pin_memory=self.runner.pin_memory)
+        device = torch.zeros(start, dtype=torch.uint8, device=self.runner.device)
+        host[: self.host.numel()].copy_(self.host)
+        # Preserve offsets of existing fields when replacing the startup storage.
+        old_base = self.host.data_ptr()
+        for name, values in self.inputs.items():
+            offset = self.cpu[name].ctypes.data - old_base
+            size = values.numel() * values.element_size()
+            self.inputs[name] = device[offset : offset + size].view(values.dtype)
+            self.cpu[name] = host[offset : offset + size].view(values.dtype).numpy()
+        for name, offset, count in layout:
+            self.inputs[name] = device[offset : offset + count * 4].view(torch.int32)
+            self.cpu[name] = host[offset : offset + count * 4].view(torch.int32).numpy()
+        self.host, self.device = host, device
+        self.packs_block_tables = True
+
     def select(self, total_tokens):
         if self.staged is not None:
             raise RuntimeError("previous input preparation was not finalized")
@@ -232,12 +285,18 @@ class InputPrepareGraph:
                 out[:tokens].copy_(self.inputs[name][:tokens])
             else:
                 out.copy_(self.inputs[name])
-        for table in self.tables.block_tables:
-            # The slot kernel clears tokens:capacity itself. It does not clear
-            # actual_tokens:tokens for a fixed bucket: explicitly clear that too.
-            table.slot_mapping.gpu[:tokens].fill_(-1)
-        self.tables.compute_slot_mapping(self.max_requests, self.inputs["slot_qsl"], self.outputs["positions"][:tokens])
-        if self.fuse_handoff:
+        if self.packs_block_tables:
+            for table, (blocks, slots, rows, width) in zip(self.tables.block_tables, self.table_fields):
+                table.block_table.gpu.copy_(self.inputs[blocks].view(rows, width))
+                table.slot_mapping.gpu[: table.max_num_batched_tokens].copy_(self.inputs[slots])
+        else:
+            for table in self.tables.block_tables:
+                # Clear the whole captured prefix, including inactive tokens.
+                table.slot_mapping.gpu[:tokens].fill_(-1)
+            self.tables.compute_slot_mapping(
+                self.max_requests, self.inputs["slot_qsl"], self.outputs["positions"][:tokens]
+            )
+        if self.fuse_handoff and not self.packs_block_tables:
             for table in self.tables.block_tables:
                 table.block_table.gpu[: self.max_requests].masked_fill_(self.inputs["block_padding"][:, None], 0)
         if embed:
@@ -257,6 +316,7 @@ class InputPrepareGraph:
         ):
             raise ValueError("unsupported input preparation block table layout")
         before = self.backend.reserved()
+        self._pack_table_storage()
         # Zero private qsl makes every request inactive during capture. Runtime
         # lengths are device inputs to the fixed-grid existing slot kernel.
         self.device.zero_()
@@ -313,6 +373,18 @@ class InputPrepareGraph:
         self.cpu["positions"][t:bucket] = 0
         self.cpu["logits"][:n] = self.cpu["qsl"][1 : n + 1] - 1
         self.cpu["block_padding"].fill(False)
+        if self.packs_block_tables:
+            request_rows = np.repeat(np.arange(n), np.diff(qsl))
+            positions = np.asarray(positions)
+            for table, (blocks, slots, rows, width) in zip(self.tables.block_tables, self.table_fields):
+                logical = positions // table.block_size
+                if np.any(positions < 0) or np.any(logical >= width):
+                    raise ValueError("CPU slot positions exceed block table capacity")
+                snapshot = self.cpu[blocks].reshape(rows, width)
+                snapshot.fill(0)
+                snapshot[:n] = table.block_table.np[:n]
+                self.cpu[slots].fill(-1)
+                self.cpu[slots][:t] = snapshot[request_rows, logical] * table.block_size + positions % table.block_size
         self.staged = (n, t, bucket)
         self.completed = self.embedding_schedule = None
 
@@ -340,7 +412,8 @@ class InputPrepareGraph:
             and padded <= bucket
             and not scheduler_output.scheduled_encoder_inputs
             and not r.enable_prompt_embeds
-            and not r.uses_mrope
+            # Pruning may recompute mRoPE deltas even on pure decode.
+            and not getattr(r, "is_multimodal_pruning_enabled", False)
             and not r.uses_xdrope_dim
             and not r.lora_config
             and r.input_batch.prev_sampled_token_ids is None
@@ -371,7 +444,7 @@ class InputPrepareGraph:
                 raise RuntimeError("input embedding storage changed after capture")
             self.cpu["embed_ids"][:t] = self.runner.input_ids.np[:t]
             self.cpu["embed_ids"][t:bucket] = 0
-        size = self.position_offset + bucket * 8
+        size = self.host.numel() if self.packs_block_tables else self.position_offset + bucket * 8
         self.device[:size].copy_(self.host[:size], non_blocking=True)
         self.record_upload()  # Covers this copy and any earlier verifier upload.
         (self.embedding_entries if embed else self.entries)[bucket].replay()
@@ -406,7 +479,9 @@ class InputPrepareGraph:
         return (
             input_ids,
             embeds,
-            r.positions[:num_input_tokens],
+            # Embedding is independent of RoPE. Preserve the runner's original
+            # three-axis positions; the 1-D preparation positions map KV slots.
+            r._get_positions(num_input_tokens) if r.uses_mrope else r.positions[:num_input_tokens],
             None,
             {**r._init_model_kwargs(), **r._extract_mm_kwargs(scheduler_output)},
             None,

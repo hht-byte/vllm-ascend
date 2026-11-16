@@ -428,6 +428,7 @@ class WiringTests(unittest.TestCase):
                 reserved_bytes=1024,
                 embedding_entries={},
                 fuse_handoff=True,
+                packs_block_tables=False,
             ),
             encoder_cudagraph_manager=None,
         )

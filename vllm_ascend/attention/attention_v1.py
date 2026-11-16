@@ -278,6 +278,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
+        *,
+        reuse_query_start_loc: bool = False,
     ) -> AscendMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
@@ -311,8 +313,15 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # Get attn_mask from singleton AttentionMaskBuilder
         attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config)
 
-        # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
-        query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
+        # The synchronous ASR preparation graph has already installed the final
+        # device query starts, including FULL's dummy request. Its runner stream
+        # orders this batch's consumers before the next overwrite. Other callers
+        # retain the private snapshot and its original lifetime semantics.
+        query_start_loc = (
+            common_attn_metadata.query_start_loc[: num_reqs + 1]
+            if reuse_query_start_loc
+            else query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
+        )
 
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
         seq_lens_list = seq_lens.tolist()

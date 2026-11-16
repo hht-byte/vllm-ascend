@@ -19,6 +19,7 @@ class HandoffTests(unittest.TestCase):
         self.r.num_spec_tokens = 5
         self.r.supports_mm_inputs = True
         self.r.enable_prompt_embeds = self.r.uses_mrope = False
+        self.r.is_multimodal_pruning_enabled = False
         self.r.uses_xdrope_dim = 0
         self.r.lora_config = None
         self.r.model_config.is_encoder_decoder = False
@@ -115,8 +116,8 @@ class HandoffTests(unittest.TestCase):
             (self.schedule, "scheduled_encoder_inputs", {"audio": [0]}),
             (self.r.input_batch, "prev_sampled_token_ids", torch.tensor([[1]])),
             (self.r, "enable_prompt_embeds", True),
-            (self.r, "uses_mrope", True),
             (self.r, "uses_xdrope_dim", 3),
+            (self.r, "is_multimodal_pruning_enabled", True),
             (self.r, "lora_config", object()),
         ]
         for obj, key, value in cases:
@@ -152,6 +153,23 @@ class HandoffTests(unittest.TestCase):
         graph.capture()
         self.assertFalse(graph.embedding_entries)
         self.assertEqual(graph.cpu["embed_ids"].size, 0)
+
+    def test_mrope_decode_embedding_keeps_original_three_axis_positions(self):
+        self.r.uses_mrope = True
+        positions = torch.arange(96).reshape(3, 32)
+        self.r._get_positions = lambda n: positions[:, :n]
+        graph = load().InputPrepareGraph(self.r, (8, 16, 32), backend=self.backend)
+        self.graph = graph
+        graph.capture()
+        self.stage()
+        graph.finish(8, 3, scheduler_output=self.schedule, allow_embedding=True)
+        self.assertEqual(graph.embedding_replays, 1, "mRoPE unnecessarily excludes pure token embedding")
+        result = graph.preprocess_result(self.schedule, 8)
+        self.assertIsNotNone(result)
+        torch.testing.assert_close(result[2], positions[:, :8])
+        self.assertEqual(result[2].data_ptr(), positions.data_ptr())
+        expected = self.embedding(torch.tensor([0, 1, 2, 3, 4, 0, 0, 0]))
+        torch.testing.assert_close(result[1], expected)
 
     def test_actual_runner_defer_and_padding_guards(self):
         source = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
@@ -314,10 +332,16 @@ class NPUHandoffTests(unittest.TestCase):
             )
 
         r.input_batch.block_table.compute_slot_mapping = compute
+        r.uses_mrope = True
+        mrope_cpu = np.arange(96).reshape(3, 32)
+        mrope_positions = torch.from_numpy(mrope_cpu).to("npu")
+        r._get_positions = lambda n: mrope_positions[:, :n]
         graph = load().InputPrepareGraph(r, (8, 16, 32))
         graph.capture()
         packer = load_metadata().SyncSpecDecodeMetadata(r, upload_owner=graph)
         for shift, padded, embed in [(0, 8, True), (4, 32, False), (9, 16, True), (3, 8, False), (7, 32, True)]:
+            mrope_cpu[:] = np.arange(96).reshape(3, 32) + shift
+            mrope_positions.copy_(torch.from_numpy(mrope_cpu))
             r.input_ids.np[:5] = np.arange(5) + shift
             graph.stage(graph.select(5), [10, 20], [13, 22], [10, 11, 12, 20, 21], [0, 3, 5], [False, False], [])
             metadata = packer.prepare(np.array([2, 1], np.int32), np.array([3, 5]), r.input_ids.np, NS)
@@ -328,6 +352,8 @@ class NPUHandoffTests(unittest.TestCase):
                     torch.tensor([shift + i for i in range(5)] + [0] * (padded - 5), device="npu")
                 )
                 torch.testing.assert_close(result[1].cpu(), expected.cpu())
+                expected_pos = torch.from_numpy(mrope_cpu[:, :padded].copy())
+                torch.testing.assert_close(result[2].cpu(), expected_pos)
             else:
                 self.assertIsNone(result)
             self.assertEqual(metadata.draft_token_ids.cpu().tolist(), [shift + 1, shift + 2, shift + 4])
