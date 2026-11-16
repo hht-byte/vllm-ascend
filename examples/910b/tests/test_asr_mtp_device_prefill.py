@@ -238,6 +238,19 @@ del _Fixture
 
 @unittest.skipUnless(importlib.util.find_spec('vllm'), 'requires installed vLLM parser')
 class DevicePrefillParserTests(unittest.TestCase):
+    def test_handoff_cpu_parser_matches_installed_parser(self):
+        from asr_mtp_device_rejection import CPUHandoffParser
+        from vllm.v1.sample.rejection_sampler import RejectionSampler
+        generator = torch.Generator().manual_seed(32)
+        for batch in (1, 4, 8):
+            for width in (2, 4, 16):
+                tokens = torch.randint(-2, 70, (batch, width), generator=generator)
+                for discard in ([], [0], list(range(batch))):
+                    expected = RejectionSampler.parse_output(tokens, 64, discard, logprobs_tensors=None)
+                    actual = CPUHandoffParser(tokens).parse(tokens, 64, discard,
+                        parser=RejectionSampler.parse_output, logprobs_tensors=None)
+                    self.assertEqual(actual, expected)
+
     def test_upstream_cpu_parser_handles_single_sample_and_discarded_prefill_rows(self):
         from vllm.v1.sample.rejection_sampler import RejectionSampler
         # This is the padded CPU block returned to original bookkeeping. Row 1

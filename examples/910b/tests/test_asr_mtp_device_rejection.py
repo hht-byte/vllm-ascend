@@ -111,10 +111,10 @@ class DeviceRejectionTests(_PagedFixture):
         worker, scheduler, sampler = self.make_worker()
         hidden = torch.randn(12, 12)
         events = []
-        real_run, real_readback = self.program.run, self.program.rejection.readback
+        real_run, real_readback = self.program.run, self.program.rejection.finish_readback
         worker.graphs.entries[3, 32] = (self.program, lambda prelude=None: (
             events.append('launch'), prelude(), real_run()))
-        with patch.object(self.program.rejection, 'readback', side_effect=lambda n: (
+        with patch.object(self.program.rejection, 'finish_readback', side_effect=lambda n: (
                 events.append('readback'), real_readback(n))[1]):
             cpu = worker.device_handoff.prepare(scheduler, sampler, hidden)
         self.assertEqual(events, ['launch', 'readback'])
