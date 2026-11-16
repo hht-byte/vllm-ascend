@@ -98,19 +98,98 @@ an upgrade against the actual installed source, checking runner contracts.
 rg -n 'ASR_MTP_CONFIG|ASR_MTP_GRAPH_READY|ASR_MTP_DEVICE_REJECTION' "$LOG"
 ```
 
-Expect `device_rejection=True`, a positive `prelude_graphs`, and an initial
+Expect `ASR_MTP_DEVICE_REJECTION_HOOK installed=True`, `device_rejection=True`,
+a positive `prelude_graphs`, and an initial
 `ASR_MTP_DEVICE_REJECTION batches=1` line, then every 100 eligible batches.
 The cumulative `cold_requests`, `warm_requests` and `cache_only_requests`
 separate head execution from hidden-only prefill/rollback rows.
-Fallback reasons are printed in that line. A lack of eligible batches is not
-evidence that the prelude ran. `readbacks` is combined handoff copies, not all
-readbacks in the engine.
+Fallbacks also emit `ASR_MTP_DEVICE_REJECTION_FALLBACK` independently: once per
+reason on its first occurrence and then every 100 total fallback batches.
+Thus a completely falling-back workload still reports `attempts`, successful
+`batches`, `fallback_batches`, reason counters and CPU gate values. Batch
+diagnostics include request count versus `max_batch`, sampler shape/dtype and
+unsupported flags; geometry includes confirmed/executed/cached offsets;
+context diagnostics include the actual optimistic end versus its limit.
+No token payload or extra device read is used for these diagnostics.
+Attempts cover synchronous bookkeeping calls, including prefill; successful
+batches can include cache-only prefill and are not a count of rejection rounds.
+`readbacks` is combined handoff copies, not all readbacks in the engine.
+
+If capture succeeds but there is no handoff activity, check the installed
+hook, not only the `spec_decode` files:
+
+```bash
+rg -n -C 3 'def bookkeeping|handoff.prepare|cls\._bookkeeping_sync = bookkeeping' \
+  vllm_ascend/patch/worker/patch_external_draft_mtp.py
+```
+
+No match means the runtime entry was omitted from the installed patch: graph
+capture alone cannot activate the handoff. If the other files already contain
+the device rejection upgrade and the hook still matches the documented old
+baseline, repair **only** that file with the same focused patch:
+
+```bash
+git apply --check --include='vllm_ascend/patch/worker/patch_external_draft_mtp.py' \
+  examples/910b/asr_mtp_device_rejection_v023.patch
+git apply --include='vllm_ascend/patch/worker/patch_external_draft_mtp.py' \
+  examples/910b/asr_mtp_device_rejection_v023.patch
+```
+
+If the check fails, regenerate the upgrade against the actual installed
+checkout with `research/build_asr_mtp_patch.py`; do not force or stack a full
+patch onto a partially updated installation. Restart the engine after repair.
+The current loader checks a capability marker on the bound bookkeeping method
+before loading weights when `device_rejection=True`; a missing/old/overridden
+hook now fails startup explicitly. Deploy the hook and loader together. The
+default OFF path does not require the marker.
 
 Compare the same workload ON/OFF. Check text/token parity first, then the
 rejection-end→MTP-start span, total step time, throughput, commit P95 and memory.
 Do not infer a speedup from draft acceptance alone. `ASR_MTP_HOST_STAGE` measures
 the late proposal call; in this mode it excludes the work already performed by
 the early handoff, so use the profiler for complete timing.
+
+## Post-handoff CPU work and optional stage timing
+
+The pending proposal path validates only the newly confirmed token suffix. It
+does not materialize the full token history again or recompute per-head cost
+already recorded by early execution. The combined readback still uses one
+buffer/event: submit the copy, compute rejection-independent CPU accounting,
+then wait once before consuming results. This overlaps small CPU work with
+queued MTP/D2H; it does not remove the required synchronous engine boundary.
+
+On runners with `_rejection_output_buffer`, the bookkeeping hook temporarily
+uses a CPU-only parser for the exact completed handoff tensor. This avoids
+NumPy masks and per-row indexed copies. Placeholder/vocabulary/discard rules
+match vLLM 0.23, including logprob and different-tensor fallback. The original
+buffer is restored in `finally`; other samplers and requests are unchanged.
+
+Set the existing `additional_config.asr_mtp.profile_stages` to `true` for a
+short diagnostic run. `ASR_MTP_HANDOFF_STAGE` records:
+
+| Field | Host interval |
+| --- | --- |
+| `prepare_host_ms` | Eligibility, optimistic metadata, staging |
+| `replay_submit_ms` | Prelude/MTP replay submission |
+| `readback_submit_ms` | Combined D2H enqueue and event record |
+| `overlap_cpu_ms` | Independent accounting before waiting |
+| `readback_wait_ms` | Completion wait, including queued device work |
+| `result_host_ms` | CPU result materialization and counters |
+| `bookkeeping_host_ms` | Original runner bookkeeping with CPU mirror |
+| `late_propose_host_ms` | Pending proposal consumption |
+| `turnaround_host_ms` | Late proposal return to next `_update_states` entry |
+| `cpu_parser_used` | Whether this runner exposes the CPU parser seam |
+
+The log is emitted on the next `_update_states`; the final batch with no next
+engine step has no turnaround sample. Turnaround includes output delivery,
+scheduling and possibly waiting for new work; it is not scheduler CPU time or
+device idle time. These fields are host spans, not NPU event durations, and
+must not be added to overlapping device durations. With the default `false`,
+there are no timing-clock reads, new timing events or per-step timing logs.
+
+The independent NPU simulation and its limitations are recorded in
+`asr_mtp_post_handoff_validation.md`. Benchmark without profiling enabled;
+collect a separate short trace when attribution is needed.
 
 ## Validation limits
 

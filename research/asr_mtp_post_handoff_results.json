@@ -1,0 +1,804 @@
+{
+  "scope": "Independent 910B MTP handoff simulation, not end-to-end ASR latency",
+  "method": "60 ABBA blocks after 15 warmup blocks; 120 samples per variant per case; shared unchanged graphs; profile_stages=False",
+  "baseline_root_head": "41a2dde544690c430355f00f502d0f9a3b0de8c9",
+  "delivery_head": "271fa79db29e6064430e84c77673b4bf7d26208e",
+  "runs": [
+    {
+      "name": "real3a",
+      "raw_sha256": "0bc824ebc7be15d886f895f18cb2c16286a9704749eb3799e59ed8fd721accb2",
+      "environment": {
+        "scope": "synthetic NPU handoff + actual CPU rejection parser + state/proposal update; no target decoder/audio/scheduler",
+        "width": 2048,
+        "heads": 3,
+        "vocab": 151936,
+        "checkpoint": "/home/llm-optimize-streaming-20261116/asr-runtime/mtp-inference.pt",
+        "model": "/home/llm-optimize-streaming-20261116/asr-runtime/models/Qwen3-ASR-1.7B",
+        "qkv_rope": "native",
+        "torch": "2.10.0+cpu",
+        "torch_npu": "2.10.0.post4",
+        "common_graphs": true,
+        "reset_timing_excluded": true,
+        "order": "ABBA",
+        "device": "Ascend910B3"
+      },
+      "cases": [
+        {
+          "batch": 1,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "e7afa115af794074446af2c0a5b14f7bb87a5b974577503dd08640bc1fd8f3f9",
+          "handoff": {
+            "baseline_median_ms": 4.678584999055602,
+            "optimized_median_ms": 4.6093499986454844,
+            "median_reduction_percent": 1.4798277775030844,
+            "paired_mean_saving_ms": 0.06520599902917941,
+            "paired_mean_saving_ci95_ms": [
+              0.05956041798223547,
+              0.07017659933505153
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.17399000353179872,
+            "optimized_median_ms": 0.1207550085382536,
+            "median_reduction_percent": 30.59658251217622,
+            "paired_mean_saving_ms": 0.052812917662474014,
+            "paired_mean_saving_ci95_ms": [
+              0.05219545976312171,
+              0.05339042503692326
+            ]
+          }
+        },
+        {
+          "batch": 4,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "5dc42935cb8a0042859312d46601e8af58c19fb9749576b27a1e54c8a3c00726",
+          "handoff": {
+            "baseline_median_ms": 5.008299995097332,
+            "optimized_median_ms": 4.90739502129145,
+            "median_reduction_percent": 2.014754984818379,
+            "paired_mean_saving_ms": 0.1235840000542036,
+            "paired_mean_saving_ci95_ms": [
+              0.1015933604867314,
+              0.15439315249750504
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.34131498250644654,
+            "optimized_median_ms": 0.26009998691733927,
+            "median_reduction_percent": 23.794734996015986,
+            "paired_mean_saving_ms": 0.08297358654090203,
+            "paired_mean_saving_ci95_ms": [
+              0.08061995258079455,
+              0.08664350548012105
+            ]
+          }
+        },
+        {
+          "batch": 8,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "15b742977e854795c4f1dd3dda7dd06bca4132ca0eff3cdfd667e7cfae2a47b2",
+          "handoff": {
+            "baseline_median_ms": 5.944539996562526,
+            "optimized_median_ms": 5.80922000517603,
+            "median_reduction_percent": 2.276374479181653,
+            "paired_mean_saving_ms": 0.1322012503806036,
+            "paired_mean_saving_ci95_ms": [
+              0.12783726956210253,
+              0.1363104150974929
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.5261000042082742,
+            "optimized_median_ms": 0.4233999934513122,
+            "median_reduction_percent": 19.52100549999326,
+            "paired_mean_saving_ms": 0.10229133549728431,
+            "paired_mean_saving_ci95_ms": [
+              0.10157765063922852,
+              0.10300577475694203
+            ]
+          }
+        },
+        {
+          "batch": 1,
+          "cold": true,
+          "history": 59,
+          "outputs_equal": true,
+          "output_digest": "9b5ae695689b08d704be72ae881b9f3c54f1d2c0d92fea254c67749db5e7865b",
+          "handoff": {
+            "baseline_median_ms": 5.205879991990514,
+            "optimized_median_ms": 5.142920010257512,
+            "median_reduction_percent": 1.2094013275347981,
+            "paired_mean_saving_ms": 0.06171300022591216,
+            "paired_mean_saving_ci95_ms": [
+              0.05708695000066655,
+              0.06612762960988523
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.16328001220244914,
+            "optimized_median_ms": 0.11213500692974776,
+            "median_reduction_percent": 31.323494273926954,
+            "paired_mean_saving_ms": 0.0513865010968099,
+            "paired_mean_saving_ci95_ms": [
+              0.05090396910721513,
+              0.051896010045311414
+            ]
+          }
+        },
+        {
+          "batch": 4,
+          "cold": true,
+          "history": 59,
+          "outputs_equal": true,
+          "output_digest": "0f758cd2ab615dd806ee8f6bc6c1fbee9a79d069766e9744132bce80f2b1abcd",
+          "handoff": {
+            "baseline_median_ms": 6.556645006639883,
+            "optimized_median_ms": 6.456100003561005,
+            "median_reduction_percent": 1.5334824895515409,
+            "paired_mean_saving_ms": 0.09956924962655951,
+            "paired_mean_saving_ci95_ms": [
+              0.09518081325344005,
+              0.1040738934413336
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.3040000010514632,
+            "optimized_median_ms": 0.2281050110468641,
+            "median_reduction_percent": 24.96545715200543,
+            "paired_mean_saving_ms": 0.07609333188156597,
+            "paired_mean_saving_ci95_ms": [
+              0.07534821581430151,
+              0.07686637232230473
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "real3b",
+      "raw_sha256": "382a209a7d6c6f1016db310b7c85baad7b6d984e183bbeb5b7cb3f7dbf0d82a5",
+      "environment": {
+        "scope": "synthetic NPU handoff + actual CPU rejection parser + state/proposal update; no target decoder/audio/scheduler",
+        "width": 2048,
+        "heads": 3,
+        "vocab": 151936,
+        "checkpoint": "/home/llm-optimize-streaming-20261116/asr-runtime/mtp-inference.pt",
+        "model": "/home/llm-optimize-streaming-20261116/asr-runtime/models/Qwen3-ASR-1.7B",
+        "qkv_rope": "native",
+        "torch": "2.10.0+cpu",
+        "torch_npu": "2.10.0.post4",
+        "common_graphs": true,
+        "reset_timing_excluded": true,
+        "order": "ABBA",
+        "device": "Ascend910B3"
+      },
+      "cases": [
+        {
+          "batch": 1,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "e7afa115af794074446af2c0a5b14f7bb87a5b974577503dd08640bc1fd8f3f9",
+          "handoff": {
+            "baseline_median_ms": 4.684904997702688,
+            "optimized_median_ms": 4.6175349853001535,
+            "median_reduction_percent": 1.4380230215035428,
+            "paired_mean_saving_ms": 0.06482858492139106,
+            "paired_mean_saving_ci95_ms": [
+              0.05933441424228174,
+              0.06953479666966209
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.1772499963408336,
+            "optimized_median_ms": 0.12398500985000283,
+            "median_reduction_percent": 30.050768739316446,
+            "paired_mean_saving_ms": 0.052937834455709286,
+            "paired_mean_saving_ci95_ms": [
+              0.052154150422817715,
+              0.0535940926783951
+            ]
+          }
+        },
+        {
+          "batch": 4,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "5dc42935cb8a0042859312d46601e8af58c19fb9749576b27a1e54c8a3c00726",
+          "handoff": {
+            "baseline_median_ms": 5.015075003029779,
+            "optimized_median_ms": 4.9113200075225905,
+            "median_reduction_percent": 2.0688622890885244,
+            "paired_mean_saving_ms": 0.11659691687479305,
+            "paired_mean_saving_ci95_ms": [
+              0.10182422201978625,
+              0.1424246301333672
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.34511501144152135,
+            "optimized_median_ms": 0.2645600034156814,
+            "median_reduction_percent": 23.341496415750584,
+            "paired_mean_saving_ms": 0.0809457509603817,
+            "paired_mean_saving_ci95_ms": [
+              0.08006520169753155,
+              0.08185727260449008
+            ]
+          }
+        },
+        {
+          "batch": 8,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "15b742977e854795c4f1dd3dda7dd06bca4132ca0eff3cdfd667e7cfae2a47b2",
+          "handoff": {
+            "baseline_median_ms": 5.967895005596802,
+            "optimized_median_ms": 5.829330009873956,
+            "median_reduction_percent": 2.3218403740832616,
+            "paired_mean_saving_ms": 0.13619474872636297,
+            "paired_mean_saving_ci95_ms": [
+              0.13188342512269932,
+              0.1403072046014131
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.5316649767337367,
+            "optimized_median_ms": 0.4280399880371988,
+            "median_reduction_percent": 19.4906554374061,
+            "paired_mean_saving_ms": 0.1037830843415577,
+            "paired_mean_saving_ci95_ms": [
+              0.10293713514329283,
+              0.10463086468007532
+            ]
+          }
+        },
+        {
+          "batch": 1,
+          "cold": true,
+          "history": 59,
+          "outputs_equal": true,
+          "output_digest": "9b5ae695689b08d704be72ae881b9f3c54f1d2c0d92fea254c67749db5e7865b",
+          "handoff": {
+            "baseline_median_ms": 5.188610026380047,
+            "optimized_median_ms": 5.126625022967346,
+            "median_reduction_percent": 1.194636002658822,
+            "paired_mean_saving_ms": 0.002062584098894149,
+            "paired_mean_saving_ci95_ms": [
+              -0.10101736933696277,
+              0.06582217611745969
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.1618149981368333,
+            "optimized_median_ms": 0.11091999476775527,
+            "median_reduction_percent": 31.452587186040947,
+            "paired_mean_saving_ms": 0.050087250322879605,
+            "paired_mean_saving_ci95_ms": [
+              0.04824677652626027,
+              0.05135214936065798
+            ]
+          }
+        },
+        {
+          "batch": 4,
+          "cold": true,
+          "history": 59,
+          "outputs_equal": true,
+          "output_digest": "0f758cd2ab615dd806ee8f6bc6c1fbee9a79d069766e9744132bce80f2b1abcd",
+          "handoff": {
+            "baseline_median_ms": 6.547040000441484,
+            "optimized_median_ms": 6.443630016292445,
+            "median_reduction_percent": 1.5794921696226982,
+            "paired_mean_saving_ms": 0.1609710011204394,
+            "paired_mean_saving_ci95_ms": [
+              0.09432167498137763,
+              0.2860429598331393
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.3067949874093756,
+            "optimized_median_ms": 0.23026499547995627,
+            "median_reduction_percent": 24.94499423724307,
+            "paired_mean_saving_ms": 0.07835075084585696,
+            "paired_mean_saving_ci95_ms": [
+              0.07623746382402412,
+              0.08119380419278362
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "real5",
+      "raw_sha256": "100775e9325ce2df9e98b2df414d546e65c89e01b7e234a7d867113ee947e6cc",
+      "environment": {
+        "scope": "synthetic NPU handoff + actual CPU rejection parser + state/proposal update; no target decoder/audio/scheduler",
+        "width": 2048,
+        "heads": 5,
+        "vocab": 151936,
+        "checkpoint": "/home/llm-optimize-streaming-20261116/asr-runtime/mtp-inference.pt",
+        "model": "/home/llm-optimize-streaming-20261116/asr-runtime/models/Qwen3-ASR-1.7B",
+        "qkv_rope": "native",
+        "torch": "2.10.0+cpu",
+        "torch_npu": "2.10.0.post4",
+        "common_graphs": true,
+        "reset_timing_excluded": true,
+        "order": "ABBA",
+        "device": "Ascend910B3"
+      },
+      "cases": [
+        {
+          "batch": 1,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "7a2e21dcfadeca0b6fcd6d4f508ef2cea085d926f5b3ea2e73ab27094a9a5e2f",
+          "handoff": {
+            "baseline_median_ms": 6.83717499487102,
+            "optimized_median_ms": 6.779600007575937,
+            "median_reduction_percent": 0.8420873729028999,
+            "paired_mean_saving_ms": -0.08448566465328138,
+            "paired_mean_saving_ci95_ms": [
+              -0.3929467739726533,
+              0.08507899120862324
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.15922501916065812,
+            "optimized_median_ms": 0.11719501344487071,
+            "median_reduction_percent": 26.39660898604076,
+            "paired_mean_saving_ms": 0.04308116501003193,
+            "paired_mean_saving_ci95_ms": [
+              0.04107158095090805,
+              0.045060144536061365
+            ]
+          }
+        },
+        {
+          "batch": 4,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "a3c01a395942ac85cc88265ec485d616e50607479889687f4b3545fb2d503544",
+          "handoff": {
+            "baseline_median_ms": 8.21981999615673,
+            "optimized_median_ms": 8.125599997583777,
+            "median_reduction_percent": 1.1462537940855944,
+            "paired_mean_saving_ms": 0.24977283513483903,
+            "paired_mean_saving_ci95_ms": [
+              0.0907581701600672,
+              0.5554168373479721
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.34076500742230564,
+            "optimized_median_ms": 0.2711849956540391,
+            "median_reduction_percent": 20.41876667284589,
+            "paired_mean_saving_ms": 0.07256908478060116,
+            "paired_mean_saving_ci95_ms": [
+              0.06957344798744695,
+              0.07624395194701114
+            ]
+          }
+        },
+        {
+          "batch": 8,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "f385dc7e0927ce03c843f8c3e781a0d680477fddf0c2915f3482ff5884be8be7",
+          "handoff": {
+            "baseline_median_ms": 8.605684997746721,
+            "optimized_median_ms": 8.479409996652976,
+            "median_reduction_percent": 1.4673439839688385,
+            "paired_mean_saving_ms": 0.2840424182068091,
+            "paired_mean_saving_ci95_ms": [
+              0.12473921022926031,
+              0.5919837080000434
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.5389699945226312,
+            "optimized_median_ms": 0.4462300130398944,
+            "median_reduction_percent": 17.20689137154604,
+            "paired_mean_saving_ms": 0.0956073337874841,
+            "paired_mean_saving_ci95_ms": [
+              0.09241835741098234,
+              0.10003190544011886
+            ]
+          }
+        },
+        {
+          "batch": 1,
+          "cold": true,
+          "history": 59,
+          "outputs_equal": true,
+          "output_digest": "19a325bfb40a121feea7535241a140cb68d1598744bbebf06f9a7205a7f7213b",
+          "handoff": {
+            "baseline_median_ms": 7.725880001089536,
+            "optimized_median_ms": 7.672595005715266,
+            "median_reduction_percent": 0.6896948356272081,
+            "paired_mean_saving_ms": 0.054678167847062774,
+            "paired_mean_saving_ci95_ms": [
+              0.04981292027271896,
+              0.05984029855729508
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.14670001110062003,
+            "optimized_median_ms": 0.10511498840060085,
+            "median_reduction_percent": 28.346979927286064,
+            "paired_mean_saving_ms": 0.04258825089588451,
+            "paired_mean_saving_ci95_ms": [
+              0.041365644938196056,
+              0.0444389342070887
+            ]
+          }
+        },
+        {
+          "batch": 4,
+          "cold": true,
+          "history": 59,
+          "outputs_equal": true,
+          "output_digest": "0cdc20962ebdd3640a30f6d76b4721369e0b759813e75cae4ba0333818962cdd",
+          "handoff": {
+            "baseline_median_ms": 9.886605010251515,
+            "optimized_median_ms": 9.790080002858303,
+            "median_reduction_percent": 0.9763210656552279,
+            "paired_mean_saving_ms": 0.09381849959027022,
+            "paired_mean_saving_ci95_ms": [
+              0.08613543346048877,
+              0.10058836885339889
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.2937950048362836,
+            "optimized_median_ms": 0.2282899949932471,
+            "median_reduction_percent": 22.296161869579436,
+            "paired_mean_saving_ms": 0.06691991778401037,
+            "paired_mean_saving_ci95_ms": [
+              0.06549491895687728,
+              0.06877941071555446
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "final3",
+      "raw_sha256": "2fcceb1600d799ed28545263fb2a39904e9f1a0217beb603b42102092c715c4f",
+      "environment": {
+        "scope": "synthetic NPU handoff + actual CPU rejection parser + state/proposal update; no target decoder/audio/scheduler",
+        "width": 2048,
+        "heads": 3,
+        "vocab": 151936,
+        "checkpoint": "/home/llm-optimize-streaming-20261116/asr-runtime/mtp-inference.pt",
+        "model": "/home/llm-optimize-streaming-20261116/asr-runtime/models/Qwen3-ASR-1.7B",
+        "qkv_rope": "native",
+        "torch": "2.10.0+cpu",
+        "torch_npu": "2.10.0.post4",
+        "common_graphs": true,
+        "reset_timing_excluded": true,
+        "order": "ABBA",
+        "profiled": false,
+        "device": "Ascend910B3",
+        "bookkeeping": "delivery NPUModelRunner._bookkeeping_sync"
+      },
+      "cases": [
+        {
+          "batch": 1,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "e7afa115af794074446af2c0a5b14f7bb87a5b974577503dd08640bc1fd8f3f9",
+          "handoff": {
+            "baseline_median_ms": 4.660179998609237,
+            "optimized_median_ms": 4.599255000357516,
+            "median_reduction_percent": 1.3073528977400772,
+            "paired_mean_saving_ms": 0.1835728352792406,
+            "paired_mean_saving_ci95_ms": [
+              0.05431218261946924,
+              0.4375579782329926
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.20342999778222293,
+            "optimized_median_ms": 0.15716000052634627,
+            "median_reduction_percent": 22.744923443104923,
+            "paired_mean_saving_ms": 0.04644633324157136,
+            "paired_mean_saving_ci95_ms": [
+              0.04482379801023247,
+              0.04836111588398732
+            ]
+          }
+        },
+        {
+          "batch": 4,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "5dc42935cb8a0042859312d46601e8af58c19fb9749576b27a1e54c8a3c00726",
+          "handoff": {
+            "baseline_median_ms": 5.001889992854558,
+            "optimized_median_ms": 4.903949986328371,
+            "median_reduction_percent": 1.9580599866470316,
+            "paired_mean_saving_ms": 0.09982258197851479,
+            "paired_mean_saving_ci95_ms": [
+              0.09591058535079355,
+              0.10394729033578186
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.3763050044653937,
+            "optimized_median_ms": 0.3026400081580505,
+            "median_reduction_percent": 19.575874738098975,
+            "paired_mean_saving_ms": 0.0736136670942263,
+            "paired_mean_saving_ci95_ms": [
+              0.07260297047954131,
+              0.07461517552656005
+            ]
+          }
+        },
+        {
+          "batch": 8,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "15b742977e854795c4f1dd3dda7dd06bca4132ca0eff3cdfd667e7cfae2a47b2",
+          "handoff": {
+            "baseline_median_ms": 5.958000008831732,
+            "optimized_median_ms": 5.827304994454607,
+            "median_reduction_percent": 2.1936054747128453,
+            "paired_mean_saving_ms": 0.18599083608326814,
+            "paired_mean_saving_ci95_ms": [
+              0.12042808982490291,
+              0.31010623407685967
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.5699800094589591,
+            "optimized_median_ms": 0.4751349915750325,
+            "median_reduction_percent": 16.64006040737397,
+            "paired_mean_saving_ms": 0.09683508493859942,
+            "paired_mean_saving_ci95_ms": [
+              0.09503248841307746,
+              0.09905378434268641
+            ]
+          }
+        },
+        {
+          "batch": 1,
+          "cold": true,
+          "history": 59,
+          "outputs_equal": true,
+          "output_digest": "9b5ae695689b08d704be72ae881b9f3c54f1d2c0d92fea254c67749db5e7865b",
+          "handoff": {
+            "baseline_median_ms": 5.210480012465268,
+            "optimized_median_ms": 5.149254997377284,
+            "median_reduction_percent": 1.175035984045869,
+            "paired_mean_saving_ms": 0.05863000163420414,
+            "paired_mean_saving_ci95_ms": [
+              0.046662269590645636,
+              0.06719517340267582
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.1927150005940348,
+            "optimized_median_ms": 0.14843998360447586,
+            "median_reduction_percent": 22.97434909222599,
+            "paired_mean_saving_ms": 0.04451308413990773,
+            "paired_mean_saving_ci95_ms": [
+              0.04401015416685065,
+              0.04500813515430006
+            ]
+          }
+        },
+        {
+          "batch": 4,
+          "cold": true,
+          "history": 59,
+          "outputs_equal": true,
+          "output_digest": "0f758cd2ab615dd806ee8f6bc6c1fbee9a79d069766e9744132bce80f2b1abcd",
+          "handoff": {
+            "baseline_median_ms": 6.533749998197891,
+            "optimized_median_ms": 6.43967000360135,
+            "median_reduction_percent": 1.4399080868182867,
+            "paired_mean_saving_ms": 0.15399266533980457,
+            "paired_mean_saving_ci95_ms": [
+              0.09102611864970336,
+              0.27646338487708516
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.3391700010979548,
+            "optimized_median_ms": 0.27022999711334705,
+            "median_reduction_percent": 20.326091270288195,
+            "paired_mean_saving_ms": 0.1316548315420126,
+            "paired_mean_saving_ci95_ms": [
+              0.0683321472388343,
+              0.2574360124951151
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "final5",
+      "raw_sha256": "1ba1a17d00933d6f459f2798046711c0ed2cf3f1860185df3dbdbf6644d9a16e",
+      "environment": {
+        "scope": "synthetic NPU handoff + actual CPU rejection parser + state/proposal update; no target decoder/audio/scheduler",
+        "width": 2048,
+        "heads": 5,
+        "vocab": 151936,
+        "checkpoint": "/home/llm-optimize-streaming-20261116/asr-runtime/mtp-inference.pt",
+        "model": "/home/llm-optimize-streaming-20261116/asr-runtime/models/Qwen3-ASR-1.7B",
+        "qkv_rope": "native",
+        "torch": "2.10.0+cpu",
+        "torch_npu": "2.10.0.post4",
+        "common_graphs": true,
+        "reset_timing_excluded": true,
+        "order": "ABBA",
+        "profiled": false,
+        "device": "Ascend910B3",
+        "bookkeeping": "delivery NPUModelRunner._bookkeeping_sync"
+      },
+      "cases": [
+        {
+          "batch": 1,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "7a2e21dcfadeca0b6fcd6d4f508ef2cea085d926f5b3ea2e73ab27094a9a5e2f",
+          "handoff": {
+            "baseline_median_ms": 6.988840003032237,
+            "optimized_median_ms": 6.927210008143447,
+            "median_reduction_percent": 0.8818343940060203,
+            "paired_mean_saving_ms": 0.1567586657377736,
+            "paired_mean_saving_ci95_ms": [
+              0.03570710184552202,
+              0.379312469655512
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.21031999494880438,
+            "optimized_median_ms": 0.16304499877151102,
+            "median_reduction_percent": 22.47765182231054,
+            "paired_mean_saving_ms": 0.04798116715392098,
+            "paired_mean_saving_ci95_ms": [
+              0.047200997008379396,
+              0.04897711078835224
+            ]
+          }
+        },
+        {
+          "batch": 4,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "a3c01a395942ac85cc88265ec485d616e50607479889687f4b3545fb2d503544",
+          "handoff": {
+            "baseline_median_ms": 8.361719999811612,
+            "optimized_median_ms": 8.261830007540993,
+            "median_reduction_percent": 1.1946105857750466,
+            "paired_mean_saving_ms": 0.09991749951344293,
+            "paired_mean_saving_ci95_ms": [
+              0.09498362561619919,
+              0.10436348580697086
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.3955100110033527,
+            "optimized_median_ms": 0.32040498626884073,
+            "median_reduction_percent": 18.989411808813937,
+            "paired_mean_saving_ms": 0.07562233246668863,
+            "paired_mean_saving_ci95_ms": [
+              0.07472098507908716,
+              0.07655668599909404
+            ]
+          }
+        },
+        {
+          "batch": 8,
+          "cold": false,
+          "history": 96,
+          "outputs_equal": true,
+          "output_digest": "f385dc7e0927ce03c843f8c3e781a0d680477fddf0c2915f3482ff5884be8be7",
+          "handoff": {
+            "baseline_median_ms": 8.796230002189986,
+            "optimized_median_ms": 8.656345002236776,
+            "median_reduction_percent": 1.5902835637356394,
+            "paired_mean_saving_ms": 0.10836550136446021,
+            "paired_mean_saving_ci95_ms": [
+              0.05406059185891839,
+              0.13880961981461346
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.6120000034570694,
+            "optimized_median_ms": 0.5133899976499379,
+            "median_reduction_percent": 16.112745955899133,
+            "paired_mean_saving_ms": 0.09753333385257672,
+            "paired_mean_saving_ci95_ms": [
+              0.09502482840616722,
+              0.09935786170293189
+            ]
+          }
+        },
+        {
+          "batch": 1,
+          "cold": true,
+          "history": 59,
+          "outputs_equal": true,
+          "output_digest": "19a325bfb40a121feea7535241a140cb68d1598744bbebf06f9a7205a7f7213b",
+          "handoff": {
+            "baseline_median_ms": 7.877265001297928,
+            "optimized_median_ms": 7.823295003618114,
+            "median_reduction_percent": 0.6851362455233101,
+            "paired_mean_saving_ms": 0.05381066487946858,
+            "paired_mean_saving_ci95_ms": [
+              0.04978190263500437,
+              0.057762822901471125
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.19744999008253217,
+            "optimized_median_ms": 0.15319499652832747,
+            "median_reduction_percent": 22.41326704331894,
+            "paired_mean_saving_ms": 0.04447083265404217,
+            "paired_mean_saving_ci95_ms": [
+              0.04383789034060707,
+              0.045033777702580366
+            ]
+          }
+        },
+        {
+          "batch": 4,
+          "cold": true,
+          "history": 59,
+          "outputs_equal": true,
+          "output_digest": "0cdc20962ebdd3640a30f6d76b4721369e0b759813e75cae4ba0333818962cdd",
+          "handoff": {
+            "baseline_median_ms": 10.018865010351874,
+            "optimized_median_ms": 9.929609994287603,
+            "median_reduction_percent": 0.8908695343439521,
+            "paired_mean_saving_ms": 0.09135166789443853,
+            "paired_mean_saving_ci95_ms": [
+              0.08509862639281589,
+              0.09689182908914518
+            ]
+          },
+          "cpu_tail": {
+            "baseline_median_ms": 0.3521350008668378,
+            "optimized_median_ms": 0.28212998586241156,
+            "median_reduction_percent": 19.880163809930128,
+            "paired_mean_saving_ms": 0.06981258411542512,
+            "paired_mean_saving_ci95_ms": [
+              0.06899014169903239,
+              0.07062117712242375
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "source_sha256": {
+    "baseline": {
+      "asr_mtp_device_rejection.py": "44c9429ae0172c8798548a398379957f27a75b7ddc83693dc1be7023731ed29a",
+      "asr_mtp_worker.py": "ca9d01af120a79133aba2cdb9cb8c4a720e8553d55513fbe599497d6996ea0e1",
+      "patch_external_draft_mtp.py": "93b392a1a5ca4a763eb97a36f36876f59e17a736c69680ef332f7c1932185b59"
+    },
+    "optimized": {
+      "asr_mtp_device_rejection.py": "4382439f1394ca4d12480f4b7aa3d40ec8f6afdda84ac5471830c49113a99aa4",
+      "asr_mtp_worker.py": "9a54ceb5c7557b1e4e7ae50aca2d50c929c82618761904b0ebbc012c0432ae5d",
+      "patch_external_draft_mtp.py": "267c2e6612c254a46d1022784c9728b8dfaf9c2b1e9525feacc4cae0ab504423"
+    }
+  }
+}

@@ -25,6 +25,23 @@ def graph_inputs(support='ALWAYS'):
 
 
 class WorkerPatchTests(unittest.TestCase):
+    def test_device_rejection_enabled_with_old_hook_fails_before_loading_weights(self):
+        from asr_mtp_worker import load_worker
+        runner = SimpleNamespace(
+            vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(),
+                cache_config=SimpleNamespace(enable_prefix_caching=False), quant_config=None),
+            use_async_scheduling=False,
+            _bookkeeping_sync=lambda *args: None)
+        with self.assertRaisesRegex(RuntimeError, 'patch_external_draft_mtp.py'):
+            load_worker(runner, None, {'device_rejection': True, 'checkpoint': 'unused.pt'})
+
+    def test_installed_bookkeeping_hook_satisfies_device_handoff_startup_contract(self):
+        from asr_mtp_worker import validate_device_handoff_hook
+        runner, _ = self.graph_runner()
+        validate_device_handoff_hook(runner, enabled=True)
+        # Default OFF must remain usable with the old hook or a custom runner.
+        validate_device_handoff_hook(SimpleNamespace(), enabled=False)
+
     def test_graph_capture_precedes_original_profile_and_is_reserved_once(self):
         runner, namespace = self.graph_runner()
         events = []
@@ -112,6 +129,8 @@ class WorkerPatchTests(unittest.TestCase):
                                   num_scheduled_tokens, spec_decode_metadata):
                 self.seen_sampler = sampler_output
                 self.order.append('bookkeeping')
+                if hasattr(self, 'on_bookkeeping'):
+                    self.on_bookkeeping()
                 return 'bookkept'
             def _get_drafter(self):
                 return 'original'
@@ -146,8 +165,12 @@ class WorkerPatchTests(unittest.TestCase):
         modules = {external.__name__: external, worker.__name__: worker,
                    runner_module.__name__: runner_module}
         namespace = {'__name__': 'isolated_mtp_patch'}
+        source = Path(__file__).with_name('patch_external_draft_mtp.py')
+        if not source.exists():
+            # Delivery tests live in examples/910b/tests after patch install.
+            source = Path(__file__).resolve().parents[3] / 'vllm_ascend/patch/worker/patch_external_draft_mtp.py'
         with patch.dict(sys.modules, modules):
-            exec(Path(__file__).with_name('patch_external_draft_mtp.py').read_text(encoding='utf-8'), namespace)  # noqa: S102
+            exec(source.read_text(encoding='utf-8'), namespace)  # noqa: S102
         return Runner, namespace
 
     def graph_runner(self, *, mtp=True, mode='FULL'):
@@ -184,6 +207,47 @@ class WorkerPatchTests(unittest.TestCase):
         runner._bookkeeping_sync('schedule', sampler, None, 'hidden', 4, 'spec')
         self.assertEqual(runner.order, ['bookkeeping'])
         self.assertIs(runner.seen_sampler, sampler)
+
+    def test_handoff_timing_covers_bookkeeping_late_propose_and_turnaround(self):
+        runner, namespace = self.graph_runner()
+        runner.order = []
+        handoff = SimpleNamespace(profile={'batch': 1}, prepare=lambda *a: object())
+        runner.drafter.online = SimpleNamespace(device_handoff=handoff, profile_stages=True,
+                                               finish=lambda *a: None)
+        runner._bookkeeping_sync('schedule', SimpleNamespace(sampled_token_ids=object()), None, 'hidden', 4, 'spec')
+        self.assertIn('bookkeeping_host_ms', handoff.profile)
+        runner.drafter.propose_engine = lambda *a: [[]]
+        runner.propose_draft_token_ids([], None, 'schedule', None, None, None, 4, 'hidden')
+        self.assertIn('late_propose_host_ms', handoff.profile)
+        with self.assertLogs(namespace['logger'].name, level='INFO') as logs:
+            runner._update_states(SimpleNamespace(finished_req_ids=[]))
+        text = '\n'.join(logs.output)
+        self.assertIn('ASR_MTP_HANDOFF_STAGE', text)
+        self.assertIn('turnaround_host_ms', text)
+        self.assertIsNone(handoff.profile)
+
+    def test_handoff_cpu_parser_is_scoped_and_restored_on_success_or_error(self):
+        runner, _ = self.graph_runner()
+        runner.order = []
+        previous, parser = object(), object()
+        handoff = SimpleNamespace(prepare=lambda *a: object(), cpu_parser=parser, pending=object())
+        finished = []
+        runner.input_batch = SimpleNamespace(req_ids=['r'])
+        runner.drafter.online = SimpleNamespace(device_handoff=handoff,
+                                               finish=lambda ids: finished.extend(ids))
+        runner._rejection_output_buffer = previous
+        runner.on_bookkeeping = lambda: self.assertIs(runner._rejection_output_buffer, parser)
+        runner._bookkeeping_sync('s', SimpleNamespace(sampled_token_ids=object()), None, None, 1, None)
+        self.assertIs(runner._rejection_output_buffer, previous)
+        def fail():
+            self.assertIs(runner._rejection_output_buffer, parser)
+            raise RuntimeError('bookkeeping failed')
+        runner.on_bookkeeping = fail
+        with self.assertRaisesRegex(RuntimeError, 'bookkeeping failed'):
+            runner._bookkeeping_sync('s', SimpleNamespace(sampled_token_ids=object()), None, None, 1, None)
+        self.assertIs(runner._rejection_output_buffer, previous)
+        self.assertIsNone(handoff.pending)
+        self.assertEqual(finished, ['r'])
 
     def test_non_spec_prefill_handoff_runs_before_bookkeeping(self):
         runner, _ = self.graph_runner()

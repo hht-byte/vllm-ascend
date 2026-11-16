@@ -10,6 +10,7 @@ replaced. Without additional_config.asr_mtp, every original method is retained.
 import inspect
 import logging
 from copy import copy
+from time import perf_counter
 
 from vllm_ascend.spec_decode.asr_mtp_worker import load_worker, request_enabled
 from vllm_ascend.spec_decode.external_draft_proposer import AscendExternalDraftProposer
@@ -91,7 +92,15 @@ def install():
                 num_scheduled_tokens, hidden_states, aux_hidden_states=None,
                 sample_hidden_states=None, target_model_batch_desc=None):
         if isinstance(self.drafter, AscendExternalDraftMTPProposer):
-            return self.drafter.propose_engine(valid_sampled_token_ids, scheduler_output, hidden_states)
+            handoff = getattr(self.drafter.online, 'device_handoff', None)
+            profile = getattr(handoff, 'profile', None)
+            started = perf_counter() if profile is not None else 0.0
+            result = self.drafter.propose_engine(valid_sampled_token_ids, scheduler_output, hidden_states)
+            if profile is not None:
+                ended = perf_counter()
+                profile['late_propose_host_ms'] = (ended - started) * 1000
+                profile['_late_finished'] = ended
+            return result
         return original_propose(
             self, valid_sampled_token_ids, sampling_metadata, scheduler_output,
             spec_decode_metadata, spec_decode_common_attn_metadata, positions,
@@ -100,11 +109,20 @@ def install():
 
     def update(self, scheduler_output):
         drafter = self.drafter
+        profile = handoff = None
         if isinstance(drafter, AscendExternalDraftMTPProposer) and drafter.online is not None:
+            handoff = getattr(drafter.online, 'device_handoff', None)
+            profile = getattr(handoff, 'profile', None)
+            if profile is not None and '_late_finished' in profile:
+                profile['turnaround_host_ms'] = (perf_counter() - profile.pop('_late_finished')) * 1000
             # Before original_update: abort+resubmit of the same ID is a new
             # lifetime. Batch removal for mere unscheduling must not evict state.
             drafter.online.finish(scheduler_output.finished_req_ids)
-        return original_update(self, scheduler_output)
+        result = original_update(self, scheduler_output)
+        if profile is not None:
+            logger.info('ASR_MTP_HANDOFF_STAGE %s', profile)
+            handoff.profile = None
+        return result
 
     def bookkeeping(self, scheduler_output, sampler_output, logits, hidden_states,
                     num_scheduled_tokens, spec_decode_metadata):
@@ -121,13 +139,30 @@ def install():
         # Only bookkeeping sees CPU output; rejection filtering stays upstream.
         local_sampler = copy(sampler_output)
         local_sampler.sampled_token_ids = cpu
+        profile = getattr(handoff, 'profile', None)
+        started = perf_counter() if profile is not None else 0.0
+        # Limit the fast CPU parser to this completed handoff, on runners with
+        # the optional buffer seam. No class/global sampler replacement.
+        previous_buffer = getattr(self, '_rejection_output_buffer', None)
+        cpu_parser = getattr(handoff, 'cpu_parser', None)
+        replace_buffer = cpu_parser is not None and hasattr(self, '_rejection_output_buffer')
+        if profile is not None:
+            profile['cpu_parser_used'] = replace_buffer
+        if replace_buffer:
+            self._rejection_output_buffer = cpu_parser
         try:
-            return original_bookkeeping(self, scheduler_output, local_sampler, logits,
-                                        hidden_states, num_scheduled_tokens, spec_decode_metadata)
+            result = original_bookkeeping(self, scheduler_output, local_sampler, logits,
+                                          hidden_states, num_scheduled_tokens, spec_decode_metadata)
+            if profile is not None:
+                profile['bookkeeping_host_ms'] = (perf_counter() - started) * 1000
+            return result
         except BaseException:
             handoff.pending = None
             drafter.online.finish(tuple(self.input_batch.req_ids))
             raise
+        finally:
+            if replace_buffer:
+                self._rejection_output_buffer = previous_buffer
 
     def graph_setup(self, attention_backends, kv_cache_groups):
         if (not isinstance(self.drafter, AscendExternalDraftMTPProposer) or
@@ -153,6 +188,7 @@ def install():
     cls._get_drafter = get_drafter
     cls.propose_draft_token_ids = propose
     cls._update_states = update
+    bookkeeping._asr_mtp_device_rejection = True
     cls._bookkeeping_sync = bookkeeping
     cls._check_and_update_cudagraph_mode = graph_setup
     cls._asr_mtp_patch_installed = True

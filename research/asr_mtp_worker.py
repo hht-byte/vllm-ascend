@@ -296,8 +296,8 @@ class MTPWorker:
                 continue
             if start < state.length:
                 state.crop_heads(start)  # recomputation/preemption overwrites old rows
-            query_start = int(runner.query_start_loc.np[i])
             if pending is None:
+                query_start = int(runner.query_start_loc.np[i])
                 state.target[start:end].copy_(hidden[query_start:query_start + end - start])
             state.length = end
             state.crop_heads(end)
@@ -314,14 +314,19 @@ class MTPWorker:
                 if self.acceptance is not None:
                     self.acceptance.finish(req_id)
                 continue
-            row = batch.token_ids_cpu[i, :confirmed].tolist()
-            if row[-len(tokens):] != tokens:
+            if pending is None:
+                row = batch.token_ids_cpu[i, :confirmed].tolist()
+                if row[-len(tokens):] != tokens:
+                    raise RuntimeError('ASR MTP must run after confirmed tokens are bookkept')
+                inputs.append(row)
+            elif batch.token_ids_cpu[i, confirmed-len(tokens):confirmed].tolist() != tokens:
+                # Pending drafts no longer need the full history; retain the
+                # bookkeeping contract on the newly confirmed tail only.
                 raise RuntimeError('ASR MTP must run after confirmed tokens are bookkept')
             states.append(state)
-            inputs.append(row)
             limits.append(limit)
             indices.append(i)
-            if self.acceptance is not None:
+            if self.acceptance is not None and pending is None:
                 fresh_counts[i] = sum(state.length - head.valid for head in state.heads[:limit])
         if states:
             before = self.heads.processed_positions
@@ -423,6 +428,18 @@ def validate_engine(runner):
         raise ValueError('ASR MTP currently requires an unquantized target without LoRA')
 
 
+def validate_device_handoff_hook(runner, *, enabled):
+    if not enabled:
+        return
+    bookkeeping = getattr(runner, '_bookkeeping_sync', None)
+    if not getattr(bookkeeping, '_asr_mtp_device_rejection', False):
+        raise RuntimeError('asr_mtp.device_rejection=True requires the device handoff hook in '
+                           'patch_external_draft_mtp.py; update the worker hook together with '
+                           'asr_mtp_worker.py and restart the engine. Captured prelude graphs '
+                           'alone do not activate device rejection.')
+    logger.info('ASR_MTP_DEVICE_REJECTION_HOOK installed=True')
+
+
 def base_signature(model_path):
     root = Path(model_path)
     value = hashlib.sha256((root / 'config.json').read_bytes())
@@ -464,6 +481,7 @@ def load_worker(runner, target, settings):
                           ('device_rejection', False)):
         if type(settings.get(name, default)) is not bool:
             raise ValueError(f'asr_mtp.{name} must be a bool')
+    validate_device_handoff_hook(runner, enabled=settings.get('device_rejection', False))
     qkv_rope_backend = settings.get('qkv_rope_backend', 'auto')
     if qkv_rope_backend not in ('auto', 'torch', 'native', 'triton'):
         raise ValueError('asr_mtp.qkv_rope_backend must be auto, torch, native or triton')

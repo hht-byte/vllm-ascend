@@ -8,6 +8,7 @@ device-derived lengths, drive/sequence, and last-row indices into stable buffers
 import logging
 from collections import Counter
 from dataclasses import replace
+from time import perf_counter
 
 import torch
 
@@ -17,7 +18,27 @@ except ImportError:
     from asr_mtp_staging import UploadBatch
 
 MAX_STOPS = 8
+FALLBACK_LOG_INTERVAL = 100
 logger = logging.getLogger(__name__)
+
+
+class CPUHandoffParser:
+    """Parse only this completed CPU mirror; preserve upstream fallback rules."""
+    def __init__(self, tokens):
+        if tokens.device.type != 'cpu':
+            raise ValueError('handoff parser requires completed CPU output')
+        self.tokens = tokens
+
+    def parse(self, tokens, vocab_size, discard, *, parser, logprobs_tensors):
+        if tokens is not self.tokens or logprobs_tensors is not None:
+            return parser(tokens, vocab_size, discard, logprobs_tensors=logprobs_tensors)
+        # v0.23 parse_output keeps values other than placeholder -1 below vocab.
+        # One CPU tolist avoids NumPy mask allocation and per-row indexed copies.
+        rows = [[token for token in row if token != -1 and token < vocab_size]
+                for row in tokens.tolist()]
+        for index in discard:
+            rows[int(index)] = []
+        return rows, None
 
 
 class RejectionPrelude:
@@ -46,9 +67,12 @@ class RejectionPrelude:
         self.column = torch.arange(sample_width, device=device)[None, :]
         self.position = torch.arange(program.sequence_width, device=device)[None, :]
         self.replay = self.run
+        self.readback_pending = False
 
     def stage(self, previous, counts, remaining, model_remaining, minimum_left, stops,
               sampled, hidden, *, starts=None, sample_counts=None):
+        if self.readback_pending:
+            raise RuntimeError('cannot stage while combined readback is pending')
         p, b = self.program, len(previous)
         total = sum(counts)
         if (not 0 < b <= p.max_batch or total > p.tokens or
@@ -123,12 +147,25 @@ class RejectionPrelude:
         self.graph = graph
 
     def readback(self, count):
+        self.submit_readback()
+        return self.finish_readback(count)
+
+    def submit_readback(self):
         # Only wait after MTP. Scheduler still needs CPU samples, but they and
         # drafts now cross the boundary together, not on either side of MTP.
+        if self.readback_pending:
+            raise RuntimeError('combined readback is already pending')
         self.host.copy_(self.combined, non_blocking=True)
+        self.readback_pending = True
         if self.event is not None:
             self.event.record(torch.npu.current_stream())
+
+    def finish_readback(self, count):
+        if not self.readback_pending:
+            raise RuntimeError('no combined readback is pending')
+        if self.event is not None:
             self.event.synchronize()
+        self.readback_pending = False
         # This single completion fence also covers both preceding H2D uploads.
         # Their next reuse no longer needs an Event::query / synchronize.
         self.uploads.pending = self.program.uploads.pending = False
@@ -147,9 +184,21 @@ class DeviceRejectionHandoff:
     """One pending serial batch; guards never inspect device tensor values."""
     def __init__(self, worker):
         self.worker, self.pending, self.stats = worker, None, Counter()
+        self.profile = None
 
-    def miss(self, reason):
+    def miss(self, reason, **details):
         self.stats['fallback_'+reason] += 1
+        self.stats['fallback_batches'] += 1
+        # Do not depend on a successful handoff to reveal why none ran. Only
+        # CPU metadata/shape attributes are passed here; never read token data.
+        if (self.stats['fallback_'+reason] == 1 or
+                self.stats['fallback_batches'] % FALLBACK_LOG_INTERVAL == 0):
+            logger.info('ASR_MTP_DEVICE_REJECTION_FALLBACK reason=%s attempts=%d '
+                        'batches=%d fallback_batches=%d fallbacks=%s details=%s',
+                        reason, self.stats['attempts'], self.stats['batches'],
+                        self.stats['fallback_batches'],
+                        {k: v for k, v in self.stats.items()
+                         if k.startswith('fallback_') and k != 'fallback_batches'}, details)
 
     @torch.inference_mode()
     def prepare(self, scheduler, sampler, hidden):
@@ -164,16 +213,24 @@ class DeviceRejectionHandoff:
             from asr_mtp_token_graph import required_tokens
             from asr_mtp_worker import request_enabled, request_type, stop_ids
         w, r = self.worker, self.worker.runner
+        timed = w.profile_stages
+        started = perf_counter() if timed else None
+        self.profile = None
         batch, graphs = r.input_batch, w.graphs
         if self.pending is not None:
             raise RuntimeError('previous device rejection handoff was not consumed')
+        self.stats['attempts'] += 1
         samples = sampler.sampled_token_ids
         n = len(batch.req_ids)
         if (not graphs.ready or not 0 < n <= graphs.options.max_batch or
                 samples.ndim != 2 or samples.shape[0] != n or samples.shape[1] < 1 or
                 samples.dtype not in (torch.int32, torch.int64) or sampler.logprobs_tensors is not None or
                 getattr(r, 'routed_experts_initialized', False) or r.use_async_scheduling):
-            return self.miss('batch')
+            return self.miss('batch', graphs_ready=graphs.ready, num_requests=n,
+                             max_batch=graphs.options.max_batch, sample_shape=tuple(samples.shape),
+                             sample_dtype=str(samples.dtype), has_logprobs=sampler.logprobs_tensors is not None,
+                             routed_experts=bool(getattr(r, 'routed_experts_initialized', False)),
+                             async_scheduling=r.use_async_scheduling)
         previous, counts, states, rows, limits, remaining, capacity, minimum, stops = (
             [] for _ in range(9))
         starts, sample_counts, missing = [], [], []
@@ -187,7 +244,9 @@ class DeviceRejectionHandoff:
             if (not request_enabled(params) or
                     req in w.disabled or params.temperature != 0 or params.n != 1 or
                     req in batch.spec_decode_unsupported_reqs):
-                return self.miss('request')
+                return self.miss('request', request_id=req, mtp_enabled=request_enabled(params),
+                                 disabled=w.disabled.get(req), temperature=params.temperature,
+                                 n=params.n, unsupported=req in batch.spec_decode_unsupported_reqs)
             c = int(batch.num_tokens_no_spec[i])
             start = int(batch.num_computed_tokens_cpu[i])
             count = scheduler.num_scheduled_tokens.get(req, 0)
@@ -201,12 +260,19 @@ class DeviceRejectionHandoff:
                     (not partial and (end != c+len(draft) or i in discarded)) or
                     sample_count > samples.shape[1] or int(r.query_start_loc.np[i]) != cursor or
                     (getattr(scheduler, 'num_invalid_spec_tokens', None) or {}).get(req, 0)):
-                return self.miss('geometry')
+                return self.miss('geometry', request_id=req, confirmed=c, start=start, count=count,
+                                 state_length=None if state is None else state.length,
+                                 draft_length=len(draft), partial=partial, discarded=i in discarded,
+                                 sample_count=sample_count, sample_width=samples.shape[1],
+                                 query_start=int(r.query_start_loc.np[i]), expected_query_start=cursor,
+                                 invalid_spec_tokens=(getattr(scheduler, 'num_invalid_spec_tokens', None)
+                                                      or {}).get(req, 0))
             if end > graphs.options.context:
-                return self.miss('context')
+                return self.miss('context', request_id=req, context_end=end,
+                                 context_limit=graphs.options.context)
             if state is None:
                 if len(missing) >= len(free_slots):
-                    return self.miss('slots')
+                    return self.miss('slots', cold_requests=len(missing)+1, free_slots=len(free_slots))
                 # Geometry/capacity preflight is CPU-only. Lease real arena
                 # views only after the complete mixed batch is known to fit.
                 state = RequestHistory(free_slots[len(missing)], None,
@@ -224,7 +290,7 @@ class DeviceRejectionHandoff:
                 limit = 0
             stop = stop_ids(params, w.eos)
             if len(stop) > MAX_STOPS:
-                return self.miss('budget')
+                return self.miss('budget', request_id=req, stop_count=len(stop), max_stops=MAX_STOPS)
             previous.append(c)
             counts.append(count)
             starts.append(start)
@@ -239,16 +305,18 @@ class DeviceRejectionHandoff:
             stops.append(stop)
             cursor += count
         if hidden.shape[0] < cursor:
-            return self.miss('hidden')
+            return self.miss('hidden', hidden_rows=hidden.shape[0], scheduled_rows=cursor)
         upper = optimistic_states(states, previous, counts, starts)
         needed = max(cursor, required_tokens(upper, limits, w.heads.num_heads))
         depth = captured_depth(graphs.options, w.heads.num_heads, max(1, max(limits)))
         bucket = next((t for t in graphs.options.tokens if needed <= t), None)
         if bucket is None or depth is None:
-            return self.miss('tokens')
+            return self.miss('tokens', needed_tokens=needed, max_tokens=max(graphs.options.tokens),
+                             requested_heads=max(limits), captured_heads=graphs.options.head_counts)
         program, replay = graphs.entries[depth_key(graphs.options, depth, bucket)]
         if not hasattr(program, 'rejection') or samples.shape[1] > program.rejection.width:
-            return self.miss('capture')
+            return self.miss('capture', bucket=bucket, heads=depth, sample_width=samples.shape[1],
+                             prelude_width=getattr(getattr(program, 'rejection', None), 'width', None))
         leased = []
         try:
             for req in missing:
@@ -268,19 +336,30 @@ class DeviceRejectionHandoff:
                 del w.states[req]
                 w.arena.release(state)
             raise
+        staged = perf_counter() if timed else None
         if any(limits):
             replay(prelude=prelude.replay)
         else:
             # Chunked prefill / pending rollback: cache target hidden without
             # running any auxiliary heads or charging a fake proposal round.
             prelude.replay()
-        combined = prelude.readback(n)
-        # These lists are CPU data; no more device reads in late propose().
-        proposal = combined[:, prelude.width:].tolist()
+        launched = perf_counter() if timed else None
+        prelude.submit_readback()
+        submitted = perf_counter() if timed else None
+        # CPU-known execution cost is independent of rejection output. Do it
+        # while the stream runs MTP and its queued D2H, before the one wait.
         costs = [sum(s.length-h.valid for h in s.heads[:limit])
                  for s, limit in zip(upper, limits)]
-        self.pending = (scheduler, tuple(batch.req_ids), proposal, upper, costs)
+        total_cost = sum(costs)
         active = sum(limit > 0 for limit in limits)
+        reused = sum(h.valid for s, limit in zip(upper, limits) for h in s.heads[:limit])
+        cold = sum(bool(limit) and req not in w.proposed for req, limit in zip(batch.req_ids, limits))
+        before_wait = perf_counter() if timed else None
+        combined = prelude.finish_readback(n)
+        ready = perf_counter() if timed else None
+        # These lists are CPU data; no more device reads in late propose().
+        proposal = combined[:, prelude.width:].tolist()
+        self.pending = (scheduler, tuple(batch.req_ids), proposal, upper, costs)
         if active:
             graphs.stats['replays'] += 1
             graphs.stats[f'replays_h{depth}'] += 1
@@ -288,31 +367,38 @@ class DeviceRejectionHandoff:
             w.stats['graph_head_batches'] += 1
         # Execution happened even if CPU bookkeeping subsequently drops every
         # proposal at EOS/length. Account it once, independently of consumption.
-        w.heads.processed_positions += sum(costs)
-        w.heads.reused_positions += sum(h.valid for s, limit in zip(upper, limits)
-                                       for h in s.heads[:limit])
-        w.stats['head_positions'] += sum(costs)
+        w.heads.processed_positions += total_cost
+        w.heads.reused_positions += reused
+        w.stats['head_positions'] += total_cost
         w.stats['head_batches'] += bool(active)
         self.stats['batches'] += 1
         self.stats['requests'] += n
-        self.stats['cold_requests'] += sum(bool(limit) and req not in w.proposed
-                                           for req, limit in zip(batch.req_ids, limits))
-        self.stats['warm_requests'] += sum(bool(limit) and req in w.proposed
-                                           for req, limit in zip(batch.req_ids, limits))
+        self.stats['cold_requests'] += cold
+        self.stats['warm_requests'] += active-cold
         self.stats['cache_only_requests'] += n-active
-        self.stats['optimistic_positions'] += sum(costs)
+        self.stats['optimistic_positions'] += total_cost
         if self.stats['batches'] == 1 or self.stats['batches'] % 100 == 0:
             logger.info('ASR_MTP_DEVICE_REJECTION batches=%d requests=%d bucket=%d '
                         'readbacks=%d optimistic_positions=%d cold_requests=%d '
-                        'warm_requests=%d cache_only_requests=%d fallbacks=%s',
+                        'warm_requests=%d cache_only_requests=%d attempts=%d fallbacks=%s',
                         self.stats['batches'], self.stats['requests'], bucket,
                         self.stats['batches'], self.stats['optimistic_positions'],
                         self.stats['cold_requests'], self.stats['warm_requests'],
-                        self.stats['cache_only_requests'],
-                        {k: v for k, v in self.stats.items() if k.startswith('fallback_')})
+                        self.stats['cache_only_requests'], self.stats['attempts'],
+                        {k: v for k, v in self.stats.items()
+                         if k.startswith('fallback_') and k != 'fallback_batches'})
         # Always width >= 2: even non-spec prefill must take the original CPU
         # rejection parser, not _to_list's unconditional device event wait.
-        return combined[:, :prelude.width]
+        cpu = combined[:, :prelude.width]
+        self.cpu_parser = CPUHandoffParser(cpu)
+        if timed:
+            self.profile = {'batch': self.stats['batches'], 'requests': n,
+                'prepare_host_ms': (staged-started)*1000, 'replay_submit_ms': (launched-staged)*1000,
+                'readback_submit_ms': (submitted-launched)*1000,
+                'overlap_cpu_ms': (before_wait-submitted)*1000,
+                'readback_wait_ms': (ready-before_wait)*1000,
+                'result_host_ms': (perf_counter()-ready)*1000}
+        return cpu
 
     def take(self, scheduler):
         pending, self.pending = self.pending, None
