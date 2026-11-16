@@ -45,8 +45,9 @@ def make_batch_invariant_matmul_patch(source):
     The exact initializer body is bound by its normalized source SHA256, making
     this independent of Python-version changes in AST serialization. Parsing
     and unique module/function anchors are checked before and after rewriting.
-    Only the AscendC branch's two matmul registrations change. Other operator
-    registrations, including the existing Triton-only branch, remain intact.
+    The AscendC branch selects its two matmul implementations explicitly and
+    uses the exact default-sum ABI adapter below. Other operator registrations,
+    including the existing Triton-only branch, remain intact.
     """
     source = source.replace("\r\n", "\n")
     tree = ast.parse(source)
@@ -73,7 +74,9 @@ def make_batch_invariant_matmul_patch(source):
         "    if blue_matmul_backend not in ('ascendc', 'triton'):\n"
         "        raise ValueError('Unknown batch-invariant matmul backend')\n"
         "    if blue_matmul_backend == 'triton' and not HAS_TRITON:\n"
-        "        raise ValueError('Requested batch-invariant Triton is unavailable')\n",
+        "        raise ValueError('Requested batch-invariant Triton is unavailable')\n"
+        "    from vllm_ascend.patch.worker.blue_batch_invariant import defaultSumCallable\n"
+        "    blue_default_sum = defaultSumCallable(torch)\n",
         1,
     )
     for name, triton_function, ascendc_function in (
@@ -88,6 +91,12 @@ def make_batch_invariant_matmul_patch(source):
         if changed.count(old) != 1:
             raise ValueError("Unknown stock matmul registration anchor")
         changed = changed.replace(old, new, 1)
+    old_sum = ('        _batch_invariant_LIB.impl("aten::sum", '
+               'torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant, "NPU")')
+    if changed.count(old_sum) != 1:
+        raise ValueError("Unknown stock default-sum registration anchor")
+    changed = changed.replace(
+        old_sum, '        _batch_invariant_LIB.impl("aten::sum", blue_default_sum, "NPU")', 1)
     changed += (
         "\n\n    BLUE_BATCH_INVARIANT_MATMUL_BACKEND = (\n"
         "        blue_matmul_backend if HAS_ASCENDC_BATCH_INVARIANT\n"
@@ -97,6 +106,25 @@ def make_batch_invariant_matmul_patch(source):
         anchor, anchor + _BACKEND_MARKER + " = None\n", 1)
     ast.parse(source)
     return source
+
+
+def defaultSumCallable(torch):
+    """Adapt aten.sum.default(x, *, dtype=None) using its untouched dim overload.
+
+    Capture dim_IntList before registration. It receives explicit all-dimension
+    reduction axes (axis zero for a scalar), keepdim=False and the caller's
+    dtype. No patched default/global sum, host transfer or output guess is used.
+    """
+    aten = getattr(getattr(torch, "ops", None), "aten", None)
+    operation = getattr(getattr(aten, "sum", None), "dim_IntList", None)
+    if not callable(operation):
+        raise ValueError("Untouched aten.sum.dim_IntList overload is unavailable")
+
+    def default_sum(x, *, dtype=None):
+        dimensions = list(range(x.dim())) or [0]
+        return operation(x, dimensions, False, dtype=dtype)
+
+    return default_sum
 
 
 class _FiaBridge:

@@ -13,6 +13,12 @@ attention/reduction and the other stock registrations remain in place. It
 adds no linear override. Invalid or unavailable selections fail before
 registration. A kernel failure never changes the selected backend.
 
+The default `Tensor.sum()` registration preserves PyTorch's dtype and all-axis
+contract through the untouched dimensioned overload, including scalar and empty
+tensors. The AscendC primitive requires an explicit dimension and cannot be
+registered directly as that default overload. Single-dimension row reductions
+retain the stock implementation.
+
 The [official Ascend 0.23 guide](https://docs.vllm.ai/projects/ascend/en/v0.23.0/user_guide/feature_guide/batch_invariance.html)
 describes target PIECEWISE execution. Its listed model coverage does not
 establish ASR or custom MTP graph compatibility. The common FIA adapter maps

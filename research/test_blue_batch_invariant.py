@@ -1,6 +1,7 @@
 """CPU contract tests for the isolated AscendC FIA compatibility bridge."""
 
 import ast
+import builtins
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -287,7 +288,13 @@ class MatmulSourceTransformTests(unittest.TestCase):
         self.old_fia, self.old_rms, self.old_sum = object(), object(), object()
         self.npu = SimpleNamespace(npu_fused_infer_attention_score=self.old_fia,
                                    npu_add_rms_norm=self.old_rms)
-        self.torch = SimpleNamespace(ops=SimpleNamespace(batch_invariant_ops=self.ops),
+        self.dim_sum_calls = []
+        self.dim_sum_result = object()
+        def dim_sum(x, dim, keepdim, *, dtype=None):
+            self.dim_sum_calls.append((x, dim, keepdim, dtype))
+            return self.dim_sum_result
+        self.torch = SimpleNamespace(ops=SimpleNamespace(batch_invariant_ops=self.ops,
+            aten=SimpleNamespace(sum=SimpleNamespace(dim_IntList=dim_sum))),
                                      sum=self.old_sum)
         self.functions = {name: object() for name in (
             'addmm_batch_invariant', 'bmm_batch_invariant', 'softmax_batch_invariant',
@@ -316,6 +323,11 @@ class MatmulSourceTransformTests(unittest.TestCase):
             os=SimpleNamespace(environ=environment),
             logger=SimpleNamespace(debug=lambda *args: None),
             HAS_TRITON=has_triton, HAS_ASCENDC_BATCH_INVARIANT=has_ascendc)
+        def helper_import(name, *args, **kwargs):
+            if name != 'vllm_ascend.patch.worker.blue_batch_invariant':
+                raise AssertionError('Unexpected transformed initializer import')
+            return self.module
+        namespace['__builtins__'] = {**vars(builtins), '__import__': helper_import}
         exec(compile(tree, '<transformed frozen batch initializer>', 'exec'), namespace)
         return namespace
 
@@ -328,15 +340,18 @@ class MatmulSourceTransformTests(unittest.TestCase):
     def test_default_selects_ascendc_mm_and_preserves_every_other_registration(self):
         namespace = self.prepare()
         namespace['enable_batch_invariant_mode']()
-        self.assertEqual(self.registrations, [
+        self.assertEqual(self.registrations[:-1], [
             ('aten::addmm', self.functions['addmm_batch_invariant'], 'NPU'),
             ('aten::bmm', self.functions['bmm_batch_invariant'], 'NPU'),
             ('aten::softmax', self.functions['softmax_batch_invariant'], 'NPU'),
             ('aten::_softmax', self.functions['softmax_batch_invariant'], 'NPU'),
             ('aten::mm', self.ops.npu_mm_batch_invariant, 'NPU'),
             ('aten::matmul', self.ops.npu_matmul_batch_invariant, 'NPU'),
-            ('aten::sum', self.ops.npu_reduce_sum_batch_invariant, 'NPU'),
         ])
+        self.assertEqual(self.registrations[-1][::2], ('aten::sum', 'NPU'))
+        sample = SimpleNamespace(dim=lambda: 2)
+        self.assertIs(self.registrations[-1][1](sample), self.dim_sum_result)
+        self.assertEqual(self.dim_sum_calls, [(sample, [0, 1], False, None)])
         self.assertIs(self.npu.npu_fused_infer_attention_score,
                       self.ops.npu_fused_infer_attention_score_batch_invariant)
         self.assertIs(self.npu.npu_add_rms_norm, self.functions['add_rms_norm'])
@@ -349,7 +364,10 @@ class MatmulSourceTransformTests(unittest.TestCase):
         functions = {name: fn for name, fn, key in self.registrations}
         self.assertIs(functions['aten::mm'], self.functions['mm_batch_invariant'])
         self.assertIs(functions['aten::matmul'], self.functions['matmul_batch_invariant'])
-        self.assertIs(functions['aten::sum'], self.ops.npu_reduce_sum_batch_invariant)
+        sample = SimpleNamespace(dim=lambda: 1)
+        requested_dtype = object()
+        self.assertIs(functions['aten::sum'](sample, dtype=requested_dtype), self.dim_sum_result)
+        self.assertEqual(self.dim_sum_calls, [(sample, [0], False, requested_dtype)])
         self.assertNotIn('aten::linear', functions)
         self.assertEqual(len(functions), 7)
         self.assertIs(self.npu.npu_fused_infer_attention_score,
@@ -394,6 +412,17 @@ class MatmulSourceTransformTests(unittest.TestCase):
         self.assertIsNone(namespace['BLUE_BATCH_INVARIANT_MATMUL_BACKEND'])
         self.assertIs(self.npu.npu_fused_infer_attention_score, self.old_fia)
 
+    def test_missing_default_sum_dim_overload_fails_before_library_or_mutations(self):
+        namespace = self.prepare('triton')
+        del self.torch.ops.aten.sum.dim_IntList
+        with self.assertRaises(ValueError):
+            namespace['enable_batch_invariant_mode']()
+        self.assertEqual(self.library_calls, [])
+        self.assertEqual(self.registrations, [])
+        self.assertIsNone(namespace['BLUE_BATCH_INVARIANT_MATMUL_BACKEND'])
+        self.assertIs(self.npu.npu_fused_infer_attention_score, self.old_fia)
+        self.assertIs(self.torch.sum, self.old_sum)
+
     def test_stock_triton_only_branch_reports_actual_backend(self):
         namespace = self.prepare(has_ascendc=False)
         namespace['enable_batch_invariant_mode']()
@@ -431,6 +460,62 @@ class MatmulSourceTransformTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.module.make_batch_invariant_matmul_patch(
                 STOCK_SOURCE.replace('import os\n', ''))
+
+
+class DefaultSumContractTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('blue_batch_invariant', SOURCE)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.assertTrue(callable(getattr(self.module, 'defaultSumCallable', None)),
+                        'Default sum compatibility factory is missing')
+        self.calls, self.result = [], object()
+        def dimension_sum(x, dim, keepdim, *, dtype=None):
+            self.calls.append((x, dim, keepdim, dtype))
+            return self.result
+        def forbidden(*args, **kwargs):
+            raise AssertionError('Default/global sum recursion or tensor transfer')
+        self.forbidden = forbidden
+        self.sum_ops = SimpleNamespace(dim_IntList=dimension_sum, default=forbidden)
+        self.torch = SimpleNamespace(ops=SimpleNamespace(aten=SimpleNamespace(sum=self.sum_ops)),
+                                     sum=forbidden)
+
+    def test_int_bool_float_rank_scalar_and_empty_inputs_use_explicit_all_dimensions(self):
+        operation = self.module.defaultSumCallable(self.torch)
+        for label, rank, shape, expected in (
+            ('int64', 1, (3,), [0]), ('bool', 2, (2, 3), [0, 1]),
+            ('float32', 3, (2, 3, 4), [0, 1, 2]),
+            ('float64-scalar', 0, (), [0]), ('float32-empty', 2, (0, 3), [0, 1]),
+        ):
+            sample = SimpleNamespace(dim=lambda rank=rank: rank, dtype=label, shape=shape,
+                                     cpu=self.forbidden, to=self.forbidden, clone=self.forbidden)
+            with self.subTest(label=label):
+                self.assertIs(operation(sample), self.result)
+                self.assertEqual(self.calls[-1], (sample, expected, False, None))
+
+    def test_requested_dtype_is_forwarded_by_identity_and_only_as_keyword(self):
+        operation = self.module.defaultSumCallable(self.torch)
+        sample, dtype = SimpleNamespace(dim=lambda: 1), object()
+        self.assertIs(operation(sample, dtype=dtype), self.result)
+        self.assertIs(self.calls[-1][3], dtype)
+        with self.assertRaises(TypeError): operation(sample, dtype)
+        with self.assertRaises(TypeError): operation(sample, dim=0)
+        with self.assertRaises(TypeError): operation(sample, out=object())
+        self.assertEqual(len(self.calls), 1)
+
+    def test_factory_captures_untouched_dimension_overload_without_default_recursion(self):
+        operation = self.module.defaultSumCallable(self.torch)
+        self.sum_ops.dim_IntList = self.forbidden
+        sample = SimpleNamespace(dim=lambda: 0)
+        self.assertIs(operation(sample), self.result)
+        self.assertEqual(self.calls, [(sample, [0], False, None)])
+
+    def test_unavailable_dimension_overload_is_rejected_during_factory_construction(self):
+        for value in (None, object()):
+            self.sum_ops.dim_IntList = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.module.defaultSumCallable(self.torch)
+        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":
