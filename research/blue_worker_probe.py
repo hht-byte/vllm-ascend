@@ -1,9 +1,54 @@
 """Bounded control-plane observations; no request text, IDs or tensors leave here."""
 import hashlib
+from functools import wraps
+import importlib
+import os
 from pathlib import Path
 import sys
 
 _WEIGHT_HASHES={}
+_BATCH_BRIDGE = 'vllm_ascend.patch.worker.blue_batch_invariant'
+
+
+def batch_invariant_status():
+    """Inspect loaded registration objects without importing operator packages."""
+    envs = sys.modules.get('vllm.envs')
+    requested = (getattr(envs, 'VLLM_BATCH_INVARIANT', False) if envs is not None
+                 else os.environ.get('VLLM_BATCH_INVARIANT', '0') == '1')
+    module = sys.modules.get('vllm_ascend.batch_invariant')
+    bridge = sys.modules.get(_BATCH_BRIDGE)
+    check = getattr(bridge, 'fia_bridge_installed', None)
+    torch_npu = sys.modules.get('torch_npu')
+    return {'requested': requested is True,
+            'registered': getattr(module, '_batch_invariant_LIB', None) is not None,
+            'has_ascendc': getattr(module, 'HAS_ASCENDC_BATCH_INVARIANT', False) is True,
+            'has_triton': getattr(module, 'HAS_TRITON', False) is True,
+            'bridge_registered': bool(check(torch_npu)) if callable(check) and torch_npu is not None else False}
+
+
+def install_batch_initializer(cls):
+    module = sys.modules.get(cls.__module__)
+    original = getattr(module, 'init_batch_invariance', None)
+    if not callable(original) or getattr(original, '_blue_batch_invariant_initializer', False):
+        return
+    @wraps(original)
+    def initialize(*args, **kwargs):
+        result = original(*args, **kwargs)
+        status = batch_invariant_status()
+        if status['requested']:
+            if not all(status[key] for key in ('registered', 'has_ascendc', 'has_triton')):
+                raise RuntimeError('full batch-invariant operator registration is unavailable')
+            torch = sys.modules.get('torch')
+            torch_npu = sys.modules.get('torch_npu')
+            ops = getattr(getattr(torch, 'ops', None), 'batch_invariant_ops', None)
+            if torch_npu is None or ops is None:
+                raise RuntimeError('batch-invariant operator namespace is unavailable')
+            importlib.import_module(_BATCH_BRIDGE).install_fia_bridge(torch_npu, ops)
+            if not batch_invariant_status()['bridge_registered']:
+                raise RuntimeError('batch-invariant FIA compatibility bridge is unavailable')
+        return result
+    initialize._blue_batch_invariant_initializer = True
+    module.init_batch_invariance = initialize
 
 
 def probe(self,reset=False):
@@ -33,6 +78,8 @@ def probe(self,reset=False):
         weight_sha=_WEIGHT_HASHES[key]
     files={}
     for name in ('vllm','vllm.v1.core.sched.scheduler','vllm_ascend',
+                 'vllm_ascend.batch_invariant',
+                 _BATCH_BRIDGE,
                  'vllm_ascend.worker.model_runner_v1','vllm_ascend.worker.worker',
                  'vllm_ascend.spec_decode.external_draft_proposer',
                  'vllm_ascend.patch.worker.patch_external_draft',
@@ -61,7 +108,7 @@ def probe(self,reset=False):
     stats=getattr(online,'stats',{})
     handoff=getattr(online,'device_handoff',None)
     return {'hardware_class':torch.npu.get_device_name(0).replace('Ascend',''),
-        'memory':memory,'module_files':files,'mtp':{
+        'memory':memory,'module_files':files,'batch_invariant':batch_invariant_status(),'mtp':{
             'loaded':online is not None,'heads':getattr(getattr(online,'heads',None),'num_heads',0),
             'weights_sha256':weight_sha,'head_batches':int(stats.get('head_batches',0)),
             'graph_replays':int(getattr(graphs,'stats',{}).get('replays',0)),
@@ -72,3 +119,4 @@ def probe(self,reset=False):
 
 def install(cls):
     if not hasattr(cls,'blue_mtp_probe'):cls.blue_mtp_probe=probe
+    install_batch_initializer(cls)

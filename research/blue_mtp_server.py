@@ -5,10 +5,116 @@ from contextlib import asynccontextmanager
 import hashlib
 import io
 import json
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
+import re
 import sys
 
 EXTERNAL_CLASS='vllm_ascend.spec_decode.external_draft_proposer.AscendExternalDraftProposer'
+
+
+def runtime_modes(config):
+    mode = config.get('mode', 'mtp')
+    graph = config.get('graph_mode', 'full')
+    target = config.get('target_graph_mode', graph)
+    invariant = config.get('batch_invariant', False)
+    if type(invariant) is not bool:
+        raise ValueError('batch_invariant must be a bool')
+    if mode not in ('ar', 'mtp') or graph not in ('off', 'full') or target not in ('off', 'full', 'piecewise'):
+        raise ValueError('unsupported engine graph mode')
+    if invariant and target == 'full':
+        raise ValueError('batch-invariant target requires piecewise or off graphs')
+    if mode == 'mtp' and graph == 'full' and target == 'off':
+        raise ValueError('target graph off with full MTP graphs is not supported')
+    return mode, graph, target, invariant
+
+
+def configure_runtime(config, assets):
+    """Verify the fixed runtime tree completely before changing process state.
+
+    runtime-deps/tree.json is the exact relative-file -> lowercase SHA256 map.
+    Its canonical sorted compact JSON (without newline) is pinned by the common
+    configuration. Only python/ and a flattened opp/ vendor root are permitted.
+    """
+    _, _, _, requested = runtime_modes(config)
+    if not requested:
+        return None
+    expected = config.get('batch_invariant_vendor_sha256')
+    if not isinstance(expected, str) or re.fullmatch('[0-9a-f]{64}', expected) is None:
+        raise ValueError('missing pinned batch-invariant dependency tree')
+    assets = Path(assets).absolute()
+    root = assets / 'runtime-deps'
+    if root.is_symlink() or not root.is_dir() or not root.resolve().is_relative_to(assets.resolve()):
+        raise ValueError('batch-invariant dependency root is unavailable or escaped assets')
+    for relative in ('python', 'opp', 'opp/op_api/lib'):
+        path = root / relative
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError('batch-invariant dependency layout is incomplete')
+    manifest = root / 'tree.json'
+    if manifest.is_symlink() or not manifest.is_file() or manifest.stat().st_size > 16 * 1024**2:
+        raise ValueError('batch-invariant dependency manifest is unavailable')
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('duplicate batch-invariant dependency entry')
+            result[key] = value
+        return result
+    pinned = json.loads(manifest.read_text(encoding='utf-8'), object_pairs_hook=pairs)
+    if not isinstance(pinned, dict) or not pinned:
+        raise ValueError('invalid batch-invariant dependency manifest')
+    for name, value in pinned.items():
+        relative = PurePosixPath(name)
+        if (not isinstance(name, str) or '\\' in name or relative.is_absolute()
+                or str(relative) != name or '..' in relative.parts
+                or len(relative.parts) < 2 or relative.parts[0] not in ('python', 'opp')
+                or not isinstance(value, str) or re.fullmatch('[0-9a-f]{64}', value) is None):
+            raise ValueError('invalid batch-invariant dependency file pin')
+    actual = {}
+    for directory, directories, filenames in os.walk(root, followlinks=False):
+        for name in [*directories, *filenames]:
+            path = Path(directory) / name
+            if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+                raise ValueError('batch-invariant dependency symlink or escape is forbidden')
+        for name in filenames:
+            path = Path(directory) / name
+            relative = path.relative_to(root).as_posix()
+            if relative == 'tree.json':
+                continue
+            if not path.is_file():
+                raise ValueError('batch-invariant dependency must be a regular file')
+            value = hashlib.sha256()
+            with path.open('rb') as stream:
+                for block in iter(lambda: stream.read(1024**2), b''):
+                    value.update(block)
+            actual[relative] = value.hexdigest()
+    canonical = json.dumps(actual, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if actual != pinned or hashlib.sha256(canonical).hexdigest() != expected:
+        raise ValueError('batch-invariant dependency content does not match its pin')
+    if not all(any(name.startswith(prefix) for name in actual) for prefix in ('python/', 'opp/')):
+        raise ValueError('batch-invariant dependency roots must contain pinned files')
+    # Every check above is side-effect free. Only registered fixed paths below
+    # become visible to the loader, preserving existing vendor search entries.
+    python = str(root / 'python')
+    opp = str(root / 'opp')
+    library = str(root / 'opp/op_api/lib')
+    custom = [part for part in os.environ.get('ASCEND_CUSTOM_OPP_PATH', '').split(':') if part]
+    if opp not in custom:
+        custom.append(opp)
+    libraries = [part for part in os.environ.get('LD_LIBRARY_PATH', '').split(':') if part and part != library]
+    os.environ['VLLM_BATCH_INVARIANT'] = '1'
+    os.environ['ASCEND_CUSTOM_OPP_PATH'] = ':'.join(custom)
+    os.environ['LD_LIBRARY_PATH'] = ':'.join([library, *libraries])
+    sys.path[:] = [python, *[path for path in sys.path if path != python]]
+    return {'batch_invariant_vendor_sha256': expected}
+
+
+def validate_batch_invariant_status(config, result):
+    if config.get('batch_invariant', False):
+        status = result.get('batch_invariant', {})
+        if not isinstance(status, dict) or any(status.get(key) is not True for key in (
+                'requested', 'registered', 'has_ascendc', 'has_triton', 'bridge_registered')):
+            raise RuntimeError('full batch-invariant worker registration is unconfirmed')
 
 
 class RequestUnavailable(RuntimeError):
@@ -47,18 +153,17 @@ async def finalize_request(state, request_id, *, finished):
 
 
 def engine_options(config):
-    mode=config.get('mode','mtp');graph=config.get('graph_mode','full')
-    if mode not in ('ar','mtp') or graph not in ('off','full'):raise ValueError('unsupported engine mode')
+    mode,graph,target,_=runtime_modes(config)
     options=dict(model=config.get('model','/model'),dtype='bfloat16',trust_remote_code=False,
         tensor_parallel_size=1,seed=0,async_scheduling=False,enable_prefix_caching=False,
-        enable_chunked_prefill=True,enforce_eager=graph=='off',block_size=128,
+        enable_chunked_prefill=True,enforce_eager=target=='off',block_size=128,
         max_num_seqs=config.get('max_num_seqs',20),max_model_len=config.get('max_model_len',1024),
         max_num_batched_tokens=config.get('max_num_batched_tokens',2048),
         kv_cache_memory_bytes=config.get('kv_cache_memory_bytes',2*1024**3),
         gpu_memory_utilization=0.5,mm_processor_cache_gb=0,
         limit_mm_per_prompt={'audio':{'count':1,'length':96000}},disable_log_stats=True)
-    if graph=='full':
-        options['compilation_config']={'cudagraph_mode':'FULL',
+    if target in ('full','piecewise'):
+        options['compilation_config']={'cudagraph_mode':'FULL' if target=='full' else 'PIECEWISE',
             'cudagraph_capture_sizes':[1,2,4,8,16,32,64,128,256]}
     if mode=='mtp':
         options['speculative_config']={'method':'custom_class','model':EXTERNAL_CLASS,'num_speculative_tokens':5}
@@ -94,13 +199,14 @@ def request_extra(mode,initial_draft,diagnostics_allowed):
 
 
 def application(config):
+    assets=Path(config.get('assets','/assets')).resolve()
+    configure_runtime(config,assets)
     import numpy as np
     import soundfile as sf
     from fastapi import FastAPI,HTTPException,Request
     from vllm import AsyncEngineArgs,SamplingParams
     from vllm.v1.engine.async_llm import AsyncLLM
     from vllm.transformers_utils.processors.qwen3_asr import Qwen3ASRProcessor
-    assets=Path(config.get('assets','/assets')).resolve()
     manifest=json.loads((assets/'manifest.json').read_text())
     cases={row['case_id']:row for row in manifest['cases']}
     state={'engine':None,'active':set(),'served':0,
@@ -124,6 +230,7 @@ def application(config):
         workers=await state['engine'].collective_rpc('blue_mtp_probe',timeout=30,kwargs={'reset':reset})
         if len(workers)!=1:raise RuntimeError('one NPU worker required')
         result=workers[0]
+        validate_batch_invariant_status(config,result)
         result.update(identity=config.get('identity',{}),active_requests=len(state['active']),served=state['served'],
                       cleanup_uncertain=state['cleanup_uncertain'],quarantined=state['quarantined'])
         return result

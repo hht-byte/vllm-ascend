@@ -101,6 +101,7 @@ def build(vllm_root, ascend_root, mtp_source, output):
         (tooling/'patch_external_draft_first_verify.py', 'vllm_ascend/patch/worker/patch_external_draft_first_verify.py'),
         (mtp_source/'patch_external_draft_mtp.py', 'vllm_ascend/patch/worker/patch_external_draft_mtp.py'),
         (tooling/'blue_worker_probe.py', 'vllm_ascend/patch/worker/blue_worker_probe.py'),
+        (tooling/'blue_batch_invariant.py', 'vllm_ascend/patch/worker/blue_batch_invariant.py'),
     ):
         changes[destination] = source.read_text(encoding='utf-8').replace('\r\n', '\n')
     for name, text in changes.items():
