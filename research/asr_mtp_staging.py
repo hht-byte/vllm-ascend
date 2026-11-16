@@ -61,5 +61,11 @@ class UploadBuffer:
             return
         self.owner.before_write()
         self.array[...] = values
+        self.upload()
+
+    def upload(self):
+        """Copy staged bytes after the caller fences and fills the host views."""
+        if not self.owner.active:
+            raise RuntimeError("direct MTP upload requires an active batch")
         self.owner.dirty = True
         self.target.copy_(self.host, non_blocking=True)

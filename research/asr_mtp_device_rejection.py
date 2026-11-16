@@ -6,8 +6,10 @@ confirmed end cannot see the extra computed tail. A separate small graph writes
 device-derived lengths, drive/sequence, and last-row indices into stable buffers.
 """
 import logging
+import json
 from collections import Counter
 from dataclasses import replace
+from time import perf_counter
 
 import torch
 
@@ -125,14 +127,15 @@ class RejectionPrelude:
     def readback(self, count):
         # Only wait after MTP. Scheduler still needs CPU samples, but they and
         # drafts now cross the boundary together, not on either side of MTP.
-        self.host.copy_(self.combined, non_blocking=True)
+        host = self.host[:count]
+        host.copy_(self.combined[:count], non_blocking=True)
         if self.event is not None:
             self.event.record(torch.npu.current_stream())
             self.event.synchronize()
         # This single completion fence also covers both preceding H2D uploads.
         # Their next reuse no longer needs an Event::query / synchronize.
         self.uploads.pending = self.program.uploads.pending = False
-        return self.host[:count]
+        return host
 
 
 def optimistic_states(states, previous, counts, starts=None):
@@ -147,9 +150,15 @@ class DeviceRejectionHandoff:
     """One pending serial batch; guards never inspect device tensor values."""
     def __init__(self, worker):
         self.worker, self.pending, self.stats = worker, None, Counter()
+        self.last_timings = None
 
     def miss(self, reason):
         self.stats['fallback_'+reason] += 1
+        self.stats['fallbacks'] += 1
+        if self.stats['fallbacks'] == 1 or self.stats['fallbacks'] % 100 == 0:
+            logger.info('ASR_MTP_DEVICE_REJECTION_FALLBACK fallbacks=%d reasons=%s',
+                        self.stats['fallbacks'],
+                        {k: v for k, v in self.stats.items() if k.startswith('fallback_')})
 
     @torch.inference_mode()
     def prepare(self, scheduler, sampler, hidden):
@@ -164,6 +173,9 @@ class DeviceRejectionHandoff:
             from asr_mtp_token_graph import required_tokens
             from asr_mtp_worker import request_enabled, request_type, stop_ids
         w, r = self.worker, self.worker.runner
+        profiled = w.profile_stages
+        started = perf_counter() if profiled else None
+        self.last_timings = None
         batch, graphs = r.input_batch, w.graphs
         if self.pending is not None:
             raise RuntimeError('previous device rejection handoff was not consumed')
@@ -249,6 +261,7 @@ class DeviceRejectionHandoff:
         program, replay = graphs.entries[depth_key(graphs.options, depth, bucket)]
         if not hasattr(program, 'rejection') or samples.shape[1] > program.rejection.width:
             return self.miss('capture')
+        preflight_done = perf_counter() if profiled else None
         leased = []
         try:
             for req in missing:
@@ -260,9 +273,11 @@ class DeviceRejectionHandoff:
             # No valid head span for cache-only rows. These stay in original
             # batch order for sample readback and late external-draft routing.
             program.stage(upper, rows, limits, allow_inactive=True)
+            program_done = perf_counter() if profiled else None
             prelude = program.rejection
             prelude.stage(previous, counts, remaining, capacity, minimum, stops, samples, hidden,
                           starts=starts, sample_counts=sample_counts)
+            prelude_done = perf_counter() if profiled else None
         except BaseException:
             for req, state in reversed(leased):
                 del w.states[req]
@@ -274,9 +289,30 @@ class DeviceRejectionHandoff:
             # Chunked prefill / pending rollback: cache target hidden without
             # running any auxiliary heads or charging a fake proposal round.
             prelude.replay()
+        replay_done = perf_counter() if profiled else None
         combined = prelude.readback(n)
+        readback_done = perf_counter() if profiled else None
         # These lists are CPU data; no more device reads in late propose().
         proposal = combined[:, prelude.width:].tolist()
+        if profiled:
+            self.last_timings = {
+                'preflight_host_ms': (preflight_done-started)*1000,
+                'program_stage_host_ms': (program_done-preflight_done)*1000,
+                'prelude_stage_host_ms': (prelude_done-program_done)*1000,
+                'replay_host_ms': (replay_done-prelude_done)*1000,
+                'combined_readback_host_ms': (readback_done-replay_done)*1000,
+                'cpu_conversion_host_ms': (perf_counter()-readback_done)*1000,
+                'batch': n, 'capacity': program.max_batch,
+                'bucket': bucket, 'depth': depth,
+                'active_requests': sum(limit > 0 for limit in limits),
+            }
+            if any(limits):
+                # Only this invocation's replay timing is meaningful. Cache-only
+                # prefill never invokes replay and must not reuse an old sample.
+                self.last_timings.update(getattr(replay, 'last_timings', {}))
+            if self.stats['batches'] % 100 == 0:
+                logger.info('ASR_MTP_DEVICE_HANDOFF_HOST_STAGE %s',
+                            json.dumps(self.last_timings, separators=(',', ':')))
         costs = [sum(s.length-h.valid for h in s.heads[:limit])
                  for s, limit in zip(upper, limits)]
         self.pending = (scheduler, tuple(batch.req_ids), proposal, upper, costs)

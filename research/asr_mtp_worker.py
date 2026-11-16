@@ -314,11 +314,18 @@ class MTPWorker:
                 if self.acceptance is not None:
                     self.acceptance.finish(req_id)
                 continue
-            row = batch.token_ids_cpu[i, :confirmed].tolist()
-            if row[-len(tokens):] != tokens:
+            if pending is None:
+                row = batch.token_ids_cpu[i, :confirmed].tolist()
+                suffix = row[-len(tokens):]
+            else:
+                # Early execution already staged the full input. Late CPU
+                # bookkeeping only needs to validate its sampled append.
+                suffix = batch.token_ids_cpu[i, max(0, confirmed-len(tokens)):confirmed].tolist()
+            if suffix != tokens:
                 raise RuntimeError('ASR MTP must run after confirmed tokens are bookkept')
             states.append(state)
-            inputs.append(row)
+            if pending is None:
+                inputs.append(row)
             limits.append(limit)
             indices.append(i)
             if self.acceptance is not None:

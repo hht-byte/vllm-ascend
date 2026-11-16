@@ -806,7 +806,7 @@
 +    tl.store(cache + destination[:, None] * WIDTH + column[None, :], value, mask=valid)
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_graph.py
-@@ -0,0 +1,612 @@
+@@ -0,0 +1,613 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Bounded, independent auxiliary graphs; target forward/verification is untouched."""
 +
@@ -1107,7 +1107,8 @@
 +
 +    def _write(self, indices, value, valid, sink):
 +        addresses = torch.where(valid, indices, sink)
-+        updates = value.reshape(-1, self.row_width)
++        # Packed QKV leaves V strided; already dense rows retain their storage.
++        updates = value.reshape(-1, self.row_width).contiguous()
 +        if self.npu_row_update is not None:
 +            # Explicit device API avoids legacy index_copy_ implementations that
 +            # fetch each index on the host and cannot be safely captured.
@@ -1421,7 +1422,7 @@
 +        return program.output
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_staging.py
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,71 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Persistent host staging with one H2D lifetime fence per auxiliary program.
 +
@@ -1485,11 +1486,17 @@
 +            return
 +        self.owner.before_write()
 +        self.array[...] = values
++        self.upload()
++
++    def upload(self):
++        """Copy staged bytes after the caller fences and fills the host views."""
++        if not self.owner.active:
++            raise RuntimeError("direct MTP upload requires an active batch")
 +        self.owner.dirty = True
 +        self.target.copy_(self.host, non_blocking=True)
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_device_rejection.py
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,360 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Opt-in rejection/prefill handoff, without a host sample read before MTP.
 +
@@ -1498,8 +1505,10 @@
 +device-derived lengths, drive/sequence, and last-row indices into stable buffers.
 +"""
 +import logging
++import json
 +from collections import Counter
 +from dataclasses import replace
++from time import perf_counter
 +
 +import torch
 +
@@ -1617,14 +1626,15 @@
 +    def readback(self, count):
 +        # Only wait after MTP. Scheduler still needs CPU samples, but they and
 +        # drafts now cross the boundary together, not on either side of MTP.
-+        self.host.copy_(self.combined, non_blocking=True)
++        host = self.host[:count]
++        host.copy_(self.combined[:count], non_blocking=True)
 +        if self.event is not None:
 +            self.event.record(torch.npu.current_stream())
 +            self.event.synchronize()
 +        # This single completion fence also covers both preceding H2D uploads.
 +        # Their next reuse no longer needs an Event::query / synchronize.
 +        self.uploads.pending = self.program.uploads.pending = False
-+        return self.host[:count]
++        return host
 +
 +
 +def optimistic_states(states, previous, counts, starts=None):
@@ -1639,9 +1649,15 @@
 +    """One pending serial batch; guards never inspect device tensor values."""
 +    def __init__(self, worker):
 +        self.worker, self.pending, self.stats = worker, None, Counter()
++        self.last_timings = None
 +
 +    def miss(self, reason):
 +        self.stats['fallback_'+reason] += 1
++        self.stats['fallbacks'] += 1
++        if self.stats['fallbacks'] == 1 or self.stats['fallbacks'] % 100 == 0:
++            logger.info('ASR_MTP_DEVICE_REJECTION_FALLBACK fallbacks=%d reasons=%s',
++                        self.stats['fallbacks'],
++                        {k: v for k, v in self.stats.items() if k.startswith('fallback_')})
 +
 +    @torch.inference_mode()
 +    def prepare(self, scheduler, sampler, hidden):
@@ -1656,6 +1672,9 @@
 +            from asr_mtp_token_graph import required_tokens
 +            from asr_mtp_worker import request_enabled, request_type, stop_ids
 +        w, r = self.worker, self.worker.runner
++        profiled = w.profile_stages
++        started = perf_counter() if profiled else None
++        self.last_timings = None
 +        batch, graphs = r.input_batch, w.graphs
 +        if self.pending is not None:
 +            raise RuntimeError('previous device rejection handoff was not consumed')
@@ -1741,6 +1760,7 @@
 +        program, replay = graphs.entries[depth_key(graphs.options, depth, bucket)]
 +        if not hasattr(program, 'rejection') or samples.shape[1] > program.rejection.width:
 +            return self.miss('capture')
++        preflight_done = perf_counter() if profiled else None
 +        leased = []
 +        try:
 +            for req in missing:
@@ -1752,9 +1772,11 @@
 +            # No valid head span for cache-only rows. These stay in original
 +            # batch order for sample readback and late external-draft routing.
 +            program.stage(upper, rows, limits, allow_inactive=True)
++            program_done = perf_counter() if profiled else None
 +            prelude = program.rejection
 +            prelude.stage(previous, counts, remaining, capacity, minimum, stops, samples, hidden,
 +                          starts=starts, sample_counts=sample_counts)
++            prelude_done = perf_counter() if profiled else None
 +        except BaseException:
 +            for req, state in reversed(leased):
 +                del w.states[req]
@@ -1766,9 +1788,30 @@
 +            # Chunked prefill / pending rollback: cache target hidden without
 +            # running any auxiliary heads or charging a fake proposal round.
 +            prelude.replay()
++        replay_done = perf_counter() if profiled else None
 +        combined = prelude.readback(n)
++        readback_done = perf_counter() if profiled else None
 +        # These lists are CPU data; no more device reads in late propose().
 +        proposal = combined[:, prelude.width:].tolist()
++        if profiled:
++            self.last_timings = {
++                'preflight_host_ms': (preflight_done-started)*1000,
++                'program_stage_host_ms': (program_done-preflight_done)*1000,
++                'prelude_stage_host_ms': (prelude_done-program_done)*1000,
++                'replay_host_ms': (replay_done-prelude_done)*1000,
++                'combined_readback_host_ms': (readback_done-replay_done)*1000,
++                'cpu_conversion_host_ms': (perf_counter()-readback_done)*1000,
++                'batch': n, 'capacity': program.max_batch,
++                'bucket': bucket, 'depth': depth,
++                'active_requests': sum(limit > 0 for limit in limits),
++            }
++            if any(limits):
++                # Only this invocation's replay timing is meaningful. Cache-only
++                # prefill never invokes replay and must not reuse an old sample.
++                self.last_timings.update(getattr(replay, 'last_timings', {}))
++            if self.stats['batches'] % 100 == 0:
++                logger.info('ASR_MTP_DEVICE_HANDOFF_HOST_STAGE %s',
++                            json.dumps(self.last_timings, separators=(',', ':')))
 +        costs = [sum(s.length-h.valid for h in s.heads[:limit])
 +                 for s, limit in zip(upper, limits)]
 +        self.pending = (scheduler, tuple(batch.req_ids), proposal, upper, costs)
@@ -2186,7 +2229,7 @@
 +        return replay
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_token_graph.py
-@@ -0,0 +1,682 @@
+@@ -0,0 +1,689 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Packed auxiliary MTP graphs keyed by execution depth and fresh-token capacity."""
 +
@@ -2380,6 +2423,8 @@
 +        )
 +
 +    def stage(self, states, inputs, limits, *, allow_inactive=False):
++        import numpy as np
++
 +        n, h, r = len(states), self.heads.num_heads, self.max_batch + 1
 +        if not n or not n == len(inputs) == len(limits) or n > self.max_batch:
 +            raise ValueError("packed MTP requires aligned bounded requests")
@@ -2393,10 +2438,12 @@
 +            if (
 +                type(limit) is not int
 +                or not (0 if allow_inactive else 1) <= limit <= self.execution_heads
++                or type(state.length) is not int
 +                or not 0 < state.length <= self.context
 +                or len(tokens) != state.length + 1
 +                or any(
-+                    not 0 <= head.valid < state.length for head in state.heads[:limit]
++                    type(head.valid) is not int or not 0 <= head.valid < state.length
++                    for head in state.heads[:limit]
 +                )
 +            ):
 +                raise ValueError("packed MTP history/drive/budget mismatch")
@@ -2441,28 +2488,20 @@
 +            start_rows.append(starts)
 +            last_rows.append(last)
 +
-+        def flatten(rows):
-+            return [x for row in rows for x in row]
-+
-+        sequences = [
-+            list(tokens) + [0] * (self.sequence_width - len(tokens))
-+            for tokens in inputs
-+        ]
-+        sequences.extend([[0] * self.sequence_width for _ in range(r - n)])
-+        payload = [
-+            *flatten(q_rows),
-+            *flatten(kv_rows),
-+            *flatten(orders),
-+            *flatten(start_rows),
-+            *flatten(last_rows),
-+            *slots,
-+            *([0] * (r - n)),
-+            *[state.length for state in states],
-+            *([0] * (r - n)),
-+            *limits,
-+            *([0] * (r - n)),
-+            *flatten(sequences),
-+        ]
++        # Convert all inputs before touching pinned storage: a malformed late
++        # token must not partially overwrite an earlier asynchronous upload.
++        array = self.metadata_upload.array
++        rows = np.asarray(
++            (q_rows, kv_rows, orders, start_rows, last_rows), dtype=array.dtype
++        )
++        padding = [0] * (r - n)
++        requests = np.asarray(
++            (slots + padding, [state.length for state in states] + padding,
++             list(limits) + padding), dtype=array.dtype
++        )
++        sequences = [np.array(tokens, dtype=array.dtype, copy=True) for tokens in inputs]
++        if any(row.ndim != 1 for row in sequences):
++            raise ValueError("packed MTP token rows must be one-dimensional")
 +        if self.paged_kv:
 +            tables = [
 +                [
@@ -2478,9 +2517,19 @@
 +        # One fence covers metadata and changed PA tables. Repeated buckets
 +        # cannot overwrite pinned storage until the preceding H2D completes.
 +        with self.uploads:
-+            self.metadata_upload.copy(payload)
++            # PA validates every table before its first write. Do that before
++            # metadata too, so a bad block row leaves both host buffers intact.
 +            if self.paged_kv:
 +                self.attention.set_tables(tables)
++            self.uploads.before_write()
++            boundary = 5 * h * r
++            array[:boundary].reshape(5, h, r)[...] = rows
++            array[boundary:boundary + 3 * r].reshape(3, r)[...] = requests
++            sequence = array[boundary + 3 * r:].reshape(r, self.sequence_width)
++            sequence.fill(0)
++            for i, row in enumerate(sequences):
++                sequence[i, :len(row)] = row
++            self.metadata_upload.upload()
 +        for d, (q_ends, kv_ends) in enumerate(segments[: self.execution_heads]):
 +            self.attention.stage(d, q_ends, kv_ends)
 +        if hasattr(self, 'rejection'):
@@ -2518,7 +2567,8 @@
 +
 +    def _write(self, indices, value, valid, sink):
 +        addresses = torch.where(valid, indices, sink)
-+        updates = value.reshape(-1, self.row_width)
++        # Packed QKV leaves V strided; already dense rows retain their storage.
++        updates = value.reshape(-1, self.row_width).contiguous()
 +        if self.npu_row_update is not None:
 +            self.npu_row_update(self.cache_rows, addresses.reshape(-1, 1), updates)
 +        else:
@@ -3202,7 +3252,7 @@
 +        return result
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_worker.py
-@@ -0,0 +1,584 @@
+@@ -0,0 +1,591 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Worker-local external draft -> MTP handoff for the v0.23 sync runner."""
 +import hashlib
@@ -3519,11 +3569,18 @@
 +                if self.acceptance is not None:
 +                    self.acceptance.finish(req_id)
 +                continue
-+            row = batch.token_ids_cpu[i, :confirmed].tolist()
-+            if row[-len(tokens):] != tokens:
++            if pending is None:
++                row = batch.token_ids_cpu[i, :confirmed].tolist()
++                suffix = row[-len(tokens):]
++            else:
++                # Early execution already staged the full input. Late CPU
++                # bookkeeping only needs to validate its sampled append.
++                suffix = batch.token_ids_cpu[i, max(0, confirmed-len(tokens)):confirmed].tolist()
++            if suffix != tokens:
 +                raise RuntimeError('ASR MTP must run after confirmed tokens are bookkept')
 +            states.append(state)
-+            inputs.append(row)
++            if pending is None:
++                inputs.append(row)
 +            limits.append(limit)
 +            indices.append(i)
 +            if self.acceptance is not None:
