@@ -114,6 +114,13 @@ the early handoff, so use the profiler for complete timing.
 
 ## Validation limits
 
+The subsequent [blue host-staging validation](blue_mtp_host_staging.md) reduces
+metadata preparation and late bookkeeping costs, adds attribution for this early
+path, and provides a focused `asr_mtp_host_staging_v023.patch` for an engine already
+at this document's installed baseline. [Real-weight validation](blue_mtp_trained_validation.md)
+records the trained five-head graph check and the separate public ASR smoke test.
+Those component results do not establish end-to-end MTP service gains.
+
 CPU tests exercise zero/partial/full acceptance, cold/prefill/warm mixing,
 multi-chunk prefill, legacy rollback priority, persistent-cache parity,
 reordering, EOS/minimum/length bounds, stale padded samples, no duplicate

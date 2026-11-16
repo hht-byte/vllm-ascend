@@ -1,0 +1,18 @@
+{
+  "checks": {
+    "confirmed_cache": true,
+    "initial_proposal": true,
+    "partial_rejection": true
+  },
+  "dtype": "bfloat16",
+  "heads": 5,
+  "input_checkpoint_sha256": "c71bb621fccb2a609598a870986b4ece4274d244aed0e6bc9cfb788c35b616b1",
+  "passed": true,
+  "provided_provenance": {
+    "checkpoint_commit": "236ded78a6a573e681dbe2403e060e4edcaca153",
+    "model_commit": "7278e1e70fe206f11671096ffdd38061171dd6e5",
+    "source_commit": "6f39716af53e75a19be8055d71a3e37646fa9cfc",
+    "training_checkpoint_sha256": "ef78c076bf9d565f2006966f0711942964fb414adabf4eef0105bec1d76790bd"
+  },
+  "scope": "synthetic_component"
+}

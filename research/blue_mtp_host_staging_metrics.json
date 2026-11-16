@@ -1,0 +1,246 @@
+{
+  "schema_version": 1,
+  "experiment_id": "blue-mtp-host-staging-20261116-001",
+  "scope": "synthetic_component_staging_only",
+  "baseline_commit": "41a2dde544690c430355f00f502d0f9a3b0de8c9",
+  "candidate_code_commit": "6f39716af53e75a19be8055d71a3e37646fa9cfc",
+  "deployment_base_commit": "271fa79db29e6064430e84c77673b4bf7d26208e",
+  "device": "Ascend910B3",
+  "runtime": {
+    "python": "3.12.13",
+    "torch": "2.10.0+cpu",
+    "torch_npu": "2.10.0.post4",
+    "cann": "9.1.0"
+  },
+  "configuration": {
+    "capacity": 8,
+    "context": 4096,
+    "token_bucket": 64,
+    "heads": 3,
+    "hidden_size": 256,
+    "kv_heads": 1,
+    "dtype": "float16",
+    "warmup_iterations": 10,
+    "rounds": 7,
+    "iterations_per_round": 100,
+    "statistic": "median of round mean wall milliseconds; device synchronized at round boundaries",
+    "profile_enabled": false
+  },
+  "source_sha256": {
+    "asr_mtp_graph.py": "3ac423da55134285581a575d549b9c5cde5f7e13cd5c08438628c689035276ae",
+    "asr_mtp_worker.py": "4d7359ab5aa078fcd3f9dd734c5bcb9111766123af5623c1decdb08777b83e02",
+    "asr_mtp_device_rejection.py": "943a245b6365b7d7db31c6134b1c25a1f79fa97ebcc26cb4b424b7adf71cfeb4",
+    "asr_mtp_staging.py": "5cc15e8c87b730b356b22fa134cdeb7feef08a07778f901dc0cae3d76e7a2dd1",
+    "asr_mtp_token_graph.py": "5618e14986c410162aa7fa5b0077c22d6fcf7af08c87084af8256b7a6cb8eb27"
+  },
+  "staging": [
+    {
+      "batch": 1,
+      "history_tokens": 64,
+      "baseline_median_ms": 2.428251300007105,
+      "candidate_median_ms": 0.2432555000996217,
+      "reduction_percent": 89.98227654201565,
+      "baseline_round_mean_ms": [
+        2.451864699833095,
+        2.453652099939063,
+        2.4480891998973675,
+        2.427105399838183,
+        2.428251300007105,
+        2.4231545999646187,
+        2.4218086001928896
+      ],
+      "candidate_round_mean_ms": [
+        0.2433591999579221,
+        0.2436986000975594,
+        0.24354780005523935,
+        0.24256099975900725,
+        0.2432555000996217,
+        0.24262740014819428,
+        0.2423032998922281
+      ]
+    },
+    {
+      "batch": 4,
+      "history_tokens": 64,
+      "baseline_median_ms": 2.520006900012959,
+      "candidate_median_ms": 0.32614480005577207,
+      "reduction_percent": 87.05778146662635,
+      "baseline_round_mean_ms": [
+        2.520006900012959,
+        2.516176200006157,
+        2.524246899993159,
+        2.521429999906104,
+        2.5425268002436496,
+        2.5184040001477115,
+        2.518663899973035
+      ],
+      "candidate_round_mean_ms": [
+        0.32701070012990385,
+        0.32614480005577207,
+        0.3267313999822363,
+        0.3249799000332132,
+        0.3361596999457106,
+        0.3250930001377128,
+        0.32589020003797486
+      ]
+    },
+    {
+      "batch": 1,
+      "history_tokens": 512,
+      "baseline_median_ms": 2.430768200138118,
+      "candidate_median_ms": 0.264132599986624,
+      "reduction_percent": 89.13378083637858,
+      "baseline_round_mean_ms": [
+        2.4318804999347776,
+        2.4302858000737615,
+        2.4246353999478742,
+        2.430768200138118,
+        2.438427899905946,
+        2.4279707999085076,
+        2.4652293001418
+      ],
+      "candidate_round_mean_ms": [
+        0.264132599986624,
+        0.26432209997437894,
+        0.26414050022140145,
+        0.26426730008097365,
+        0.26392240019049495,
+        0.2631923000444658,
+        0.260132200201042
+      ]
+    },
+    {
+      "batch": 4,
+      "history_tokens": 512,
+      "baseline_median_ms": 2.518600999901537,
+      "candidate_median_ms": 0.40354750002734363,
+      "reduction_percent": 83.97731518239213,
+      "baseline_round_mean_ms": [
+        2.518600999901537,
+        2.51822029997129,
+        2.5304042000789195,
+        2.5227413000538945,
+        2.516535700124223,
+        2.5183103000745177,
+        2.523422900121659
+      ],
+      "candidate_round_mean_ms": [
+        0.4034025999135338,
+        0.40303600020706654,
+        0.40354750002734363,
+        0.4037309001432732,
+        0.403254599950742,
+        0.40366060013184324,
+        0.40376329998252913
+      ]
+    },
+    {
+      "batch": 1,
+      "history_tokens": 2048,
+      "baseline_median_ms": 2.462095000082627,
+      "candidate_median_ms": 0.32651999994413927,
+      "reduction_percent": 86.73812343012023,
+      "baseline_round_mean_ms": [
+        2.465654099942185,
+        2.45813330024248,
+        2.4598730000434443,
+        2.462095000082627,
+        2.461389300005976,
+        2.4694052000995725,
+        2.4662792001618072
+      ],
+      "candidate_round_mean_ms": [
+        0.3268755998578854,
+        0.32651999994413927,
+        0.3263549000257626,
+        0.32623120001517236,
+        0.32746259996201843,
+        0.3265668000676669,
+        0.3259888000320643
+      ]
+    },
+    {
+      "batch": 4,
+      "history_tokens": 2048,
+      "baseline_median_ms": 2.56576829997357,
+      "candidate_median_ms": 0.6693224998889491,
+      "reduction_percent": 73.91336934454121,
+      "baseline_round_mean_ms": [
+        2.556472899741493,
+        2.561949100054335,
+        2.56576829997357,
+        2.5581341999350116,
+        2.5688146002357826,
+        2.5672083999961615,
+        2.5752558998647146
+      ],
+      "candidate_round_mean_ms": [
+        0.6693322001956403,
+        0.6694416000391357,
+        0.6695110999862663,
+        0.6693224998889491,
+        0.6691602998762392,
+        0.6688940999447368,
+        0.669273599924054
+      ]
+    }
+  ],
+  "host_conversion_isolation": {
+    "full_history": {
+      "median_ms": 0.5300596799934283,
+      "round_mean_ms": [
+        0.5310634300112724,
+        0.5300596799934283,
+        0.5304065799864475,
+        0.5306881699943915,
+        0.5300299400114454,
+        0.5298846799996682,
+        0.5295861600025091
+      ],
+      "rounds": 7,
+      "iterations_per_round": 1000
+    },
+    "sampled_suffix": {
+      "median_ms": 0.006772349996026605,
+      "round_mean_ms": [
+        0.006780730007449165,
+        0.007367800018982962,
+        0.006749760010279715,
+        0.006772349996026605,
+        0.006753699999535456,
+        0.006745990016497672,
+        0.006791620020521805
+      ],
+      "rounds": 7,
+      "iterations_per_round": 1000
+    }
+  },
+  "correctness": {
+    "mtp_full_suite": {
+      "run": 222,
+      "skipped": 17,
+      "failures": 0,
+      "errors": 0,
+      "device": "actual NPU plus CPU tests",
+      "triton_device_properties_initialized": true
+    },
+    "project_non_contract_non_npu_tests": "passed",
+    "patch_apply_and_reverse": "passed",
+    "canonical_modules_verified": 15,
+    "broader_research_collection": "not clean; baseline admission/concurrency and budget fixture failures reproduced; unrelated deadline case passes in isolation"
+  },
+  "limitations": [
+    "No target-model forward is timed in this benchmark.",
+    "Random small heads initialize metadata geometry; this is not a trained-ASR latency or acceptance measurement.",
+    "The final service needs same-input MTP on/off token parity and step, latency, throughput and memory comparison.",
+    "Raw profiler traces, weights, audio, transcripts and runtime logs are not included."
+  ],
+  "source_sha256_kind": "executed file bytes before Git newline normalization",
+  "git_blob_sha256": {
+    "asr_mtp_graph.py": "7c5f04d3dc741fd0a520e8a87b5211de9087807647e2b6ad9713bb2ba8f00c0c",
+    "asr_mtp_worker.py": "eb06600cc0989217fc3e9cbcca7a09792062819ef0290d4930842955406688b5",
+    "asr_mtp_device_rejection.py": "c7bb98919e1d22ce80218b0963010f2c23d6dfeb34f7267f14e4c1579a511c29",
+    "asr_mtp_staging.py": "e43553529ca2b40dfaac52597fde72445f7fb48ccfc38ac940c1fab3194c5d98",
+    "asr_mtp_token_graph.py": "ec87e5e27ca5ad56e387759011c9063b7a434afee1bcfc8c7630e773c6f27cb8"
+  }
+}
