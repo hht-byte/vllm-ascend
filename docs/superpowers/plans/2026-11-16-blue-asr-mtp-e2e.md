@@ -15,9 +15,9 @@
 - [x] Add exact-class external-draft transport through the existing typed ngram dispatch; preserve request-owned state across row eviction and replacement batches.
 - [x] Build immutable overlays; verify request-state compatibility and child import origins before NPU execution.
 - [x] Prepare four public Portuguese recordings and deterministic VAD manifest outside Git.
-- [ ] Run real AR, baseline MTP and optimized MTP correctness. Require exact token IDs and text per case; preserve mismatch evidence and do not benchmark a failing configuration.
-- [ ] Execute the specified ramp and three steady-state repeats; compare request latency distributions, completed requests/tokens per second, and separately defined device/Torch memory statistics.
-- [ ] Run targeted CPU/NPU regression checks, validate cleanup, freeze full manifests and restricted summaries, independently review and push code/configuration to the same repositories.
+- [x] Run real AR, baseline MTP and optimized MTP correctness. Require exact token IDs and text per case; preserve mismatch evidence and do not benchmark a failing configuration.
+- [x] Execute the specified ramp and three contiguous steady-state windows; compare request latency distributions, completed requests/tokens per second, and separately defined device/Torch memory statistics.
+- [x] Run targeted CPU/NPU regression checks, validate cleanup, freeze full manifests and restricted local review summaries, independently review and push code/configuration to the same repositories.
 
 ## Constraints and decisions
 
