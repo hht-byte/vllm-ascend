@@ -806,7 +806,7 @@
 +    tl.store(cache + destination[:, None] * WIDTH + column[None, :], value, mask=valid)
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_graph.py
-@@ -0,0 +1,612 @@
+@@ -0,0 +1,613 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Bounded, independent auxiliary graphs; target forward/verification is untouched."""
 +
@@ -1107,7 +1107,8 @@
 +
 +    def _write(self, indices, value, valid, sink):
 +        addresses = torch.where(valid, indices, sink)
-+        updates = value.reshape(-1, self.row_width)
++        # Packed QKV leaves V strided; already dense rows retain their storage.
++        updates = value.reshape(-1, self.row_width).contiguous()
 +        if self.npu_row_update is not None:
 +            # Explicit device API avoids legacy index_copy_ implementations that
 +            # fetch each index on the host and cannot be safely captured.
@@ -1421,7 +1422,7 @@
 +        return program.output
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_staging.py
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,71 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Persistent host staging with one H2D lifetime fence per auxiliary program.
 +
@@ -1485,6 +1486,12 @@
 +            return
 +        self.owner.before_write()
 +        self.array[...] = values
++        self.upload()
++
++    def upload(self):
++        """Copy staged bytes after the caller fences and fills the host views."""
++        if not self.owner.active:
++            raise RuntimeError("direct MTP upload requires an active batch")
 +        self.owner.dirty = True
 +        self.target.copy_(self.host, non_blocking=True)
 --- /dev/null
@@ -2272,7 +2279,7 @@
 +        return replay
 --- /dev/null
 +++ b/vllm_ascend/spec_decode/asr_mtp_token_graph.py
-@@ -0,0 +1,682 @@
+@@ -0,0 +1,689 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Packed auxiliary MTP graphs keyed by execution depth and fresh-token capacity."""
 +
@@ -2466,6 +2473,8 @@
 +        )
 +
 +    def stage(self, states, inputs, limits, *, allow_inactive=False):
++        import numpy as np
++
 +        n, h, r = len(states), self.heads.num_heads, self.max_batch + 1
 +        if not n or not n == len(inputs) == len(limits) or n > self.max_batch:
 +            raise ValueError("packed MTP requires aligned bounded requests")
@@ -2479,10 +2488,12 @@
 +            if (
 +                type(limit) is not int
 +                or not (0 if allow_inactive else 1) <= limit <= self.execution_heads
++                or type(state.length) is not int
 +                or not 0 < state.length <= self.context
 +                or len(tokens) != state.length + 1
 +                or any(
-+                    not 0 <= head.valid < state.length for head in state.heads[:limit]
++                    type(head.valid) is not int or not 0 <= head.valid < state.length
++                    for head in state.heads[:limit]
 +                )
 +            ):
 +                raise ValueError("packed MTP history/drive/budget mismatch")
@@ -2527,28 +2538,20 @@
 +            start_rows.append(starts)
 +            last_rows.append(last)
 +
-+        def flatten(rows):
-+            return [x for row in rows for x in row]
-+
-+        sequences = [
-+            list(tokens) + [0] * (self.sequence_width - len(tokens))
-+            for tokens in inputs
-+        ]
-+        sequences.extend([[0] * self.sequence_width for _ in range(r - n)])
-+        payload = [
-+            *flatten(q_rows),
-+            *flatten(kv_rows),
-+            *flatten(orders),
-+            *flatten(start_rows),
-+            *flatten(last_rows),
-+            *slots,
-+            *([0] * (r - n)),
-+            *[state.length for state in states],
-+            *([0] * (r - n)),
-+            *limits,
-+            *([0] * (r - n)),
-+            *flatten(sequences),
-+        ]
++        # Convert all inputs before touching pinned storage: a malformed late
++        # token must not partially overwrite an earlier asynchronous upload.
++        array = self.metadata_upload.array
++        rows = np.asarray(
++            (q_rows, kv_rows, orders, start_rows, last_rows), dtype=array.dtype
++        )
++        padding = [0] * (r - n)
++        requests = np.asarray(
++            (slots + padding, [state.length for state in states] + padding,
++             list(limits) + padding), dtype=array.dtype
++        )
++        sequences = [np.array(tokens, dtype=array.dtype, copy=True) for tokens in inputs]
++        if any(row.ndim != 1 for row in sequences):
++            raise ValueError("packed MTP token rows must be one-dimensional")
 +        if self.paged_kv:
 +            tables = [
 +                [
@@ -2564,9 +2567,19 @@
 +        # One fence covers metadata and changed PA tables. Repeated buckets
 +        # cannot overwrite pinned storage until the preceding H2D completes.
 +        with self.uploads:
-+            self.metadata_upload.copy(payload)
++            # PA validates every table before its first write. Do that before
++            # metadata too, so a bad block row leaves both host buffers intact.
 +            if self.paged_kv:
 +                self.attention.set_tables(tables)
++            self.uploads.before_write()
++            boundary = 5 * h * r
++            array[:boundary].reshape(5, h, r)[...] = rows
++            array[boundary:boundary + 3 * r].reshape(3, r)[...] = requests
++            sequence = array[boundary + 3 * r:].reshape(r, self.sequence_width)
++            sequence.fill(0)
++            for i, row in enumerate(sequences):
++                sequence[i, :len(row)] = row
++            self.metadata_upload.upload()
 +        for d, (q_ends, kv_ends) in enumerate(segments[: self.execution_heads]):
 +            self.attention.stage(d, q_ends, kv_ends)
 +        if hasattr(self, 'rejection'):
@@ -2604,7 +2617,8 @@
 +
 +    def _write(self, indices, value, valid, sink):
 +        addresses = torch.where(valid, indices, sink)
-+        updates = value.reshape(-1, self.row_width)
++        # Packed QKV leaves V strided; already dense rows retain their storage.
++        updates = value.reshape(-1, self.row_width).contiguous()
 +        if self.npu_row_update is not None:
 +            self.npu_row_update(self.cache_rows, addresses.reshape(-1, 1), updates)
 +        else:

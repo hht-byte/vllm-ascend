@@ -19,7 +19,7 @@ from asr_mtp_graph import GraphOptions
 from asr_mtp_heads import BatchedMTPHeads
 from asr_mtp_metrics import AcceptanceTracker
 from asr_mtp_paged_cache import PagedCacheArena
-from asr_mtp_token_graph import TokenMTPGraphs
+from asr_mtp_token_graph import PackedMTPProgram, TokenMTPGraphs
 from asr_mtp_worker import MTPWorker
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 
@@ -130,6 +130,9 @@ def main():
         baseline_readback = importlib.import_module(
             "baseline.asr_mtp_device_rejection"
         ).RejectionPrelude.readback
+        baseline_stage = importlib.import_module(
+            "baseline.asr_mtp_token_graph"
+        ).PackedMTPProgram.stage
     result = {
         "scope": "synthetic NPU handoff + actual CPU rejection parser + state/proposal update; no target decoder/audio/scheduler",
         "width": cfg.hidden_size,
@@ -141,6 +144,7 @@ def main():
         "torch": torch.__version__,
         "torch_npu": torch_npu.__version__,
         "common_graphs": True,
+        "stage_dispatch": "per variant, shared paged device computation",
         "reset_timing_excluded": True,
         "order": "ABBA",
         "profiled": bool(args.profile_dir),
@@ -259,6 +263,11 @@ def main():
             iteration = sample // len(sequence)
             label = sequence[sample % len(sequence)]
             worker = workers[label]
+            # Shared capture removes graph-pool/order noise, but host staging
+            # must still dispatch the selected source version on every step.
+            stage = baseline_stage if label == "a" else PackedMTPProgram.stage
+            for program, _ in graphs.entries.values():
+                program.stage = MethodType(stage, program)
             for r, s in worker.states.items():
                 s.length = 0 if cold else length
                 for d, h in enumerate(s.heads):

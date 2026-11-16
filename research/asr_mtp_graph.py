@@ -298,7 +298,8 @@ class FixedMTPProgram:
 
     def _write(self, indices, value, valid, sink):
         addresses = torch.where(valid, indices, sink)
-        updates = value.reshape(-1, self.row_width)
+        # Packed QKV leaves V strided; already dense rows retain their storage.
+        updates = value.reshape(-1, self.row_width).contiguous()
         if self.npu_row_update is not None:
             # Explicit device API avoids legacy index_copy_ implementations that
             # fetch each index on the host and cannot be safely captured.
