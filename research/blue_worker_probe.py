@@ -10,6 +10,17 @@ _WEIGHT_HASHES={}
 _BATCH_BRIDGE = 'vllm_ascend.patch.worker.blue_batch_invariant'
 
 
+def physical_device_id():
+    """Read the trusted launcher's physical assignment, never logical device 0."""
+    try:
+        value = int(os.environ.get('LLM_OPT_PHYSICAL_NPU_ID', ''))
+    except (TypeError, ValueError):
+        raise RuntimeError('trusted physical NPU assignment is unavailable') from None
+    if not 0 <= value < 64:
+        raise RuntimeError('trusted physical NPU assignment is out of range')
+    return value
+
+
 def batch_invariant_status():
     """Inspect loaded registration objects without importing operator packages."""
     envs = sys.modules.get('vllm.envs')
@@ -57,8 +68,9 @@ def install_batch_initializer(cls):
 
 
 def probe(self,reset=False):
-    import torch
     if type(reset) is not bool:raise TypeError('reset must be boolean')
+    physical_device = physical_device_id()
+    import torch
     if reset:
         torch.npu.synchronize()
         torch.npu.reset_peak_memory_stats()
@@ -113,6 +125,7 @@ def probe(self,reset=False):
     stats=getattr(online,'stats',{})
     handoff=getattr(online,'device_handoff',None)
     return {'hardware_class':torch.npu.get_device_name(0).replace('Ascend',''),
+        'physical_device':physical_device,
         'memory':memory,'module_files':files,'batch_invariant':batch_invariant_status(),'mtp':{
             'loaded':online is not None,'heads':getattr(getattr(online,'heads',None),'num_heads',0),
             'weights_sha256':weight_sha,'head_batches':int(stats.get('head_batches',0)),

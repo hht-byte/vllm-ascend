@@ -22,7 +22,7 @@
 ## Constraints and decisions
 
 - Shared engine files, shared packages and existing services remain outside the experiment's write set.
-- The new Docker-container probe failed in an OCI prestart hook with ENOSPC despite free host blocks and inodes. The namespace/chroot alternative inside the existing container passed read-only input, import origin, zero-capability, loopback-only and real NPU checks. Only physical card 6 is exposed, addressed as logical device 0 inside the namespace.
+- The new Docker-container probe failed in an OCI prestart hook with ENOSPC despite free host blocks and inodes. The namespace/chroot alternative inside the existing container passed read-only input, import origin, zero-capability, loopback-only and real NPU checks. Each TP1 instance exposes one assigned card, addressed as logical device 0 inside its namespace. The current user-selected resource pool is physical cards 0–3; formal before/after timing stays on physical card 0.
 - Native resumable sessions with first verification are rejected; formal ASR chunks use distinct request IDs. Supporting native session continuation would require a separate lifetime protocol.
 - Candidate text is never an execution instruction. Raw audio, model tensors, transcripts, runtime logs and profiling stay out of tracked files. Controller export approval remains a human operation.
 - Profiling is separate from benchmark measurements. Missing values are errors, and no synthetic timings establish real gains.
