@@ -104,6 +104,7 @@ def make_patch(root):
         'vllm_ascend/spec_decode/asr_mtp_row_copy_kernel.py': directory / 'asr_mtp_row_copy_kernel.py',
         'vllm_ascend/spec_decode/asr_mtp_graph.py': directory / 'asr_mtp_graph.py',
         'vllm_ascend/spec_decode/asr_mtp_staging.py': directory / 'asr_mtp_staging.py',
+        'vllm_ascend/spec_decode/asr_mtp_device_rejection.py': directory / 'asr_mtp_device_rejection.py',
         'vllm_ascend/spec_decode/asr_mtp_token_attention.py': directory / 'asr_mtp_token_attention.py',
         'vllm_ascend/spec_decode/asr_mtp_token_graph.py': directory / 'asr_mtp_token_graph.py',
         'vllm_ascend/spec_decode/asr_mtp_paged_cache.py': directory / 'asr_mtp_paged_cache.py',

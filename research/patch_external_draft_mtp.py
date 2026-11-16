@@ -9,6 +9,7 @@ replaced. Without additional_config.asr_mtp, every original method is retained.
 """
 import inspect
 import logging
+from copy import copy
 
 from vllm_ascend.spec_decode.asr_mtp_worker import load_worker, request_enabled
 from vllm_ascend.spec_decode.external_draft_proposer import AscendExternalDraftProposer
@@ -60,6 +61,11 @@ def install():
     original_get = cls._get_drafter
     original_propose = cls.propose_draft_token_ids
     original_update = cls._update_states
+    original_bookkeeping = cls._bookkeeping_sync
+    if tuple(inspect.signature(original_bookkeeping).parameters) != (
+            'self', 'scheduler_output', 'sampler_output', 'logits', 'hidden_states',
+            'num_scheduled_tokens', 'spec_decode_metadata'):
+        raise RuntimeError('ASR MTP patch requires the supported v0.23 bookkeeping API')
     original_graph_setup = getattr(cls, '_check_and_update_cudagraph_mode', None)
     expected = ('self', 'valid_sampled_token_ids', 'sampling_metadata', 'scheduler_output',
                 'spec_decode_metadata', 'spec_decode_common_attn_metadata', 'positions',
@@ -100,6 +106,29 @@ def install():
             drafter.online.finish(scheduler_output.finished_req_ids)
         return original_update(self, scheduler_output)
 
+    def bookkeeping(self, scheduler_output, sampler_output, logits, hidden_states,
+                    num_scheduled_tokens, spec_decode_metadata):
+        drafter = self.drafter
+        handoff = (getattr(drafter.online, 'device_handoff', None)
+                   if isinstance(drafter, AscendExternalDraftMTPProposer) else None)
+        cpu = None
+        if handoff is not None:
+            cpu = handoff.prepare(scheduler_output, sampler_output, hidden_states)
+        if cpu is None:
+            return original_bookkeeping(self, scheduler_output, sampler_output, logits,
+                                        hidden_states, num_scheduled_tokens, spec_decode_metadata)
+        # The original sampler tensor is still used by other runner paths.
+        # Only bookkeeping sees CPU output; rejection filtering stays upstream.
+        local_sampler = copy(sampler_output)
+        local_sampler.sampled_token_ids = cpu
+        try:
+            return original_bookkeeping(self, scheduler_output, local_sampler, logits,
+                                        hidden_states, num_scheduled_tokens, spec_decode_metadata)
+        except BaseException:
+            handoff.pending = None
+            drafter.online.finish(tuple(self.input_batch.req_ids))
+            raise
+
     def graph_setup(self, attention_backends, kv_cache_groups):
         if (not isinstance(self.drafter, AscendExternalDraftMTPProposer) or
                 self.compilation_config.cudagraph_mode.name != 'FULL'):
@@ -124,6 +153,7 @@ def install():
     cls._get_drafter = get_drafter
     cls.propose_draft_token_ids = propose
     cls._update_states = update
+    cls._bookkeeping_sync = bookkeeping
     cls._check_and_update_cudagraph_mode = graph_setup
     cls._asr_mtp_patch_installed = True
 

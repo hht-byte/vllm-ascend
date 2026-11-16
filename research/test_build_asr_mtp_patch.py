@@ -65,7 +65,8 @@ class PatchExportTests(unittest.TestCase):
             self.assertIn('+++ b/vllm_ascend/spec_decode/asr_mtp_row_copy_kernel.py', patch)
             self.assertIn('+++ b/vllm_ascend/spec_decode/asr_mtp_qkv_rope.py', patch)
             self.assertIn('+++ b/vllm_ascend/spec_decode/asr_mtp_staging.py', patch)
-            self.assertEqual(patch.count('--- /dev/null'), 14)
+            self.assertIn('+++ b/vllm_ascend/spec_decode/asr_mtp_device_rejection.py', patch)
+            self.assertEqual(patch.count('--- /dev/null'), 15)
             self.assertNotIn('+++ b/vllm_ascend/worker/model_runner_v1.py', patch)
             self.assertIn('+++ b/vllm_ascend/worker/worker.py', patch)
             self.assertNotIn('+++ b/vllm_ascend/patch/worker/__init__.py', patch)
@@ -188,6 +189,7 @@ class PatchExportTests(unittest.TestCase):
         self.assertNotIn(' \n', lines)
         for name in ('asr_mtp_heads.py', 'asr_mtp_fused.py', 'asr_mtp_worker.py', 'asr_mtp_graph.py',
                      'asr_mtp_token_attention.py', 'asr_mtp_token_graph.py', 'asr_mtp_staging.py',
+                     'asr_mtp_device_rejection.py',
                      'asr_mtp_paged_cache.py', 'asr_mtp_paged_attention.py',
                      'asr_mtp_qkv_rope.py', 'asr_mtp_row_copy.py', 'asr_mtp_row_copy_kernel.py',
                      'asr_mtp_metrics.py', 'patch_external_draft_mtp.py'):

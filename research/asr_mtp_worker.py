@@ -114,7 +114,7 @@ def stop_ids(params, model_eos):
 class MTPWorker:
     def __init__(self, runner, heads, arena, embedding, logits, eos, *, graphs=None,
                  profile_stages=False, acceptance_stats=False, cold_heads=None, warm_heads=None,
-                 request_heads=None):
+                 request_heads=None, device_rejection=False):
         self.runner, self.heads, self.arena = runner, heads, arena
         self.embedding, self.logits, self.eos = embedding, logits, set(eos)
         self.states, self.disabled = {}, {}
@@ -137,6 +137,20 @@ class MTPWorker:
         self.proposed = set()
         self.stats = Counter(target_forwards=0)
         self.graphs, self.profiled = graphs, False
+        if type(device_rejection) is not bool:
+            raise ValueError('asr_mtp.device_rejection must be a bool')
+        self.device_handoff = None
+        if device_rejection:
+            if (graphs is None or not getattr(graphs.options, 'tokens', ()) or
+                    not getattr(arena, 'paged_kv', False)):
+                raise ValueError('device_rejection requires full paged token graphs')
+            try:
+                from .asr_mtp_device_rejection import DeviceRejectionHandoff
+            except ImportError:
+                from asr_mtp_device_rejection import DeviceRejectionHandoff
+            self.device_handoff = DeviceRejectionHandoff(self)
+            graphs.device_rejection = (runner.speculative_config.num_speculative_tokens+1,
+                                       runner.input_batch.vocab_size)
         self.profile_stages = profile_stages
         self.acceptance = None
         if acceptance_stats:
@@ -147,6 +161,8 @@ class MTPWorker:
             self.acceptance = AcceptanceTracker(heads.num_heads)
 
     def finish(self, request_ids):
+        if self.device_handoff is not None and self.device_handoff.pending is not None:
+            raise RuntimeError('cannot change request lifetimes during device rejection handoff')
         for req_id in request_ids:
             if self.acceptance is not None:
                 self.acceptance.finish(req_id)
@@ -220,6 +236,7 @@ class MTPWorker:
     def propose(self, sampled, scheduler_output, hidden):
         prepare_started = perf_counter() if self.profile_stages else None
         runner, batch = self.runner, self.runner.input_batch
+        pending = None if self.device_handoff is None else self.device_handoff.take(scheduler_output)
         outputs = [[] for _ in sampled]
         states, inputs, limits, indices = [], [], [], []
         fresh_counts = {}
@@ -280,7 +297,8 @@ class MTPWorker:
             if start < state.length:
                 state.crop_heads(start)  # recomputation/preemption overwrites old rows
             query_start = int(runner.query_start_loc.np[i])
-            state.target[start:end].copy_(hidden[query_start:query_start + end - start])
+            if pending is None:
+                state.target[start:end].copy_(hidden[query_start:query_start + end - start])
             state.length = end
             state.crop_heads(end)
             if not tokens or legacy is not None:
@@ -307,8 +325,10 @@ class MTPWorker:
                 fresh_counts[i] = sum(state.length - head.valid for head in state.heads[:limit])
         if states:
             before = self.heads.processed_positions
-            buckets = query_buckets(states, limits, self.graphs)
-            single_group = (len(buckets) == 1 and
+            if pending is not None:
+                before -= sum(pending[2])  # Early execution is already counted.
+            buckets = query_buckets(states, limits, self.graphs) if pending is None else {}
+            single_group = pending is not None or (len(buckets) == 1 and
                             next(iter(buckets.values())) == list(range(len(states))))
             proposal_started = perf_counter() if self.profile_stages else None
             drafts = (None if single_group else
@@ -333,7 +353,14 @@ class MTPWorker:
                     # may be overwritten by the next group using the same graph.
                     drafts[group] = proposal
             to_cpu_started = perf_counter() if self.profile_stages else None
-            rows = drafts.tolist()  # One device-to-host boundary for the whole batch.
+            if pending is None:
+                rows = drafts.tolist()  # One device-to-host boundary for the whole batch.
+            else:
+                rows = [pending[0][i] for i in indices]
+                for i, state, limit in zip(indices, states, limits):
+                    fresh_counts[i] = pending[2][i]
+                    for head in state.heads[:limit]:
+                        head.valid = state.length  # Never trust the optimistic tail.
             postprocess_started = perf_counter() if self.profile_stages else None
             cold_count = sum(batch.req_ids[i] not in self.proposed for i in indices)
             mtp_tokens = 0
@@ -354,9 +381,10 @@ class MTPWorker:
                     self.acceptance.offer(batch.req_ids[i], row,
                         int(batch.num_tokens_no_spec[i]) - 1, fresh_positions=fresh_counts[i])
             self.stats['proposal_batches'] += 1
-            self.stats['head_batches'] += len(buckets)
+            if pending is None:
+                self.stats['head_batches'] += len(buckets)
+                self.stats['head_positions'] += self.heads.processed_positions - before
             self.stats['draft_tokens'] += mtp_tokens
-            self.stats['head_positions'] += self.heads.processed_positions - before
             logger.debug('ASR_MTP_STEP requests=%d draft_tokens=%d new_head_positions=%d '
                          'graph_batches_total=%d eager_batches_total=%d graph_stats=%s '
                          'cold_requests=%d warm_requests=%d cold_heads=%d warm_heads=%d',
@@ -429,10 +457,11 @@ def load_worker(runner, target, settings):
                'native_fusion', 'profile_stages', 'kv_cache_backend',
                'kv_block_size', 'kv_write_backend', 'qkv_rope_backend', 'row_write_backend',
                'acceptance_stats', 'cold_heads', 'warm_heads', 'chunk_cold_heads', 'chunk_warm_heads',
-               'finish_cold_heads', 'finish_warm_heads'}
+               'finish_cold_heads', 'finish_warm_heads', 'device_rejection'}
     if not isinstance(settings, dict) or set(settings) - allowed or not settings.get('checkpoint'):
         raise ValueError('invalid additional_config.asr_mtp settings')
-    for name, default in (('native_fusion', True), ('profile_stages', False), ('acceptance_stats', False)):
+    for name, default in (('native_fusion', True), ('profile_stages', False), ('acceptance_stats', False),
+                          ('device_rejection', False)):
         if type(settings.get(name, default)) is not bool:
             raise ValueError(f'asr_mtp.{name} must be a bool')
     qkv_rope_backend = settings.get('qkv_rope_backend', 'auto')
@@ -532,12 +561,13 @@ def load_worker(runner, target, settings):
     worker = MTPWorker(runner, model, arena, language.embed_input_ids, language.compute_logits,
                        eos, graphs=graphs, profile_stages=settings.get('profile_stages', False),
                        acceptance_stats=settings.get('acceptance_stats', False),
-                       cold_heads=cold_heads, warm_heads=warm_heads, request_heads=request_heads)
+                       cold_heads=cold_heads, warm_heads=warm_heads, request_heads=request_heads,
+                       device_rejection=settings.get('device_rejection', False))
     logger.info('ASR_MTP_CONFIG heads=%d context_cap=%d cache_slots=%d cache_mib=%.1f checkpoint=%s '
                 'verify_base_signature=%s graph_mode=%s graph_scratch_mib=%.2f graph_layout=%s '
                 'native_fusion=%s profile_stages=%s kv_cache_backend=%s kv_write_backend=%s '
                 'qkv_rope_backend=%s row_write_backend=%s acceptance_stats=%s cold_heads=%d warm_heads=%d '
-                'chunk_heads=%s finish_heads=%s',
+                'chunk_heads=%s finish_heads=%s device_rejection=%s',
                 heads, cap, slots, getattr(arena, 'cache_bytes',
                     arena.storage.numel() * arena.storage.element_size()) / 1024 ** 2,
                 settings['checkpoint'], settings.get('verify_base_signature', False),
@@ -549,5 +579,6 @@ def load_worker(runner, target, settings):
                 getattr(arena, 'write_backend', 'separate_scatter_nd'),
                 model.qkv_rope.backend if native_fusion else 'legacy',
                 settings.get('row_write_backend', 'auto'), settings.get('acceptance_stats', False),
-                cold_heads, warm_heads, request_heads['chunk'], request_heads['finish'])
+                cold_heads, warm_heads, request_heads['chunk'], request_heads['finish'],
+                settings.get('device_rejection', False))
     return worker

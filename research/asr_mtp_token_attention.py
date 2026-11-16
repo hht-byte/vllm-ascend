@@ -342,11 +342,13 @@ class PackedNPUCapture:
 
         if getattr(program, "profile_stages", False):
 
-            def replay():
+            def replay(prelude=None):
                 started = perf_counter()
                 updates, reuses = attention.task_updates, attention.task_update_reuses
                 attention.update()
                 updated = perf_counter()
+                if prelude is not None:
+                    prelude()
                 graph.replay()
                 replay.last_timings = {
                     "task_update_host_ms": (updated - started) * 1000,
@@ -356,8 +358,10 @@ class PackedNPUCapture:
                 }
         else:
 
-            def replay():
+            def replay(prelude=None):
                 attention.update()
+                if prelude is not None:
+                    prelude()
                 graph.replay()
 
         return replay

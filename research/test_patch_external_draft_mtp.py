@@ -108,6 +108,11 @@ class WorkerPatchTests(unittest.TestCase):
             def propose(self, tokens):
                 return [[8] if row else [] for row in tokens]
         class Runner:
+            def _bookkeeping_sync(self, scheduler_output, sampler_output, logits, hidden_states,
+                                  num_scheduled_tokens, spec_decode_metadata):
+                self.seen_sampler = sampler_output
+                self.order.append('bookkeeping')
+                return 'bookkept'
             def _get_drafter(self):
                 return 'original'
             def _update_states(self, scheduler_output):
@@ -157,6 +162,40 @@ class WorkerPatchTests(unittest.TestCase):
             cudagraph_mode=SimpleNamespace(name=mode), cudagraph_capture_sizes=CAPTURE_SIZES.copy(),
             max_cudagraph_capture_size=1024)
         return runner, namespace
+
+    def test_device_rejection_precedes_bookkeeping_and_preserves_original_sampler(self):
+        runner, _ = self.graph_runner()
+        runner.order = []
+        raw, cpu = object(), object()
+        sampler = SimpleNamespace(sampled_token_ids=raw, logprobs_tensors=None)
+        handoff = SimpleNamespace(prepare=lambda *a: (runner.order.append('mtp'), cpu)[1])
+        runner.drafter.online = SimpleNamespace(device_handoff=handoff)
+        result = runner._bookkeeping_sync('schedule', sampler, None, 'hidden', 4, 'spec')
+        self.assertEqual(result, 'bookkept')
+        self.assertEqual(runner.order, ['mtp', 'bookkeeping'])
+        self.assertIs(runner.seen_sampler.sampled_token_ids, cpu)
+        self.assertIs(sampler.sampled_token_ids, raw)
+
+    def test_device_rejection_fallback_retains_original_bookkeeping_arguments(self):
+        runner, _ = self.graph_runner()
+        runner.order = []
+        sampler = SimpleNamespace(sampled_token_ids=object(), logprobs_tensors=None)
+        runner.drafter.online = SimpleNamespace(device_handoff=SimpleNamespace(prepare=lambda *a: None))
+        runner._bookkeeping_sync('schedule', sampler, None, 'hidden', 4, 'spec')
+        self.assertEqual(runner.order, ['bookkeeping'])
+        self.assertIs(runner.seen_sampler, sampler)
+
+    def test_non_spec_prefill_handoff_runs_before_bookkeeping(self):
+        runner, _ = self.graph_runner()
+        runner.order = []
+        raw, cpu = object(), object()
+        sampler = SimpleNamespace(sampled_token_ids=raw, logprobs_tensors=None)
+        handoff = SimpleNamespace(prepare=lambda *a: (runner.order.append('mtp'), cpu)[1])
+        runner.drafter.online = SimpleNamespace(device_handoff=handoff)
+        runner._bookkeeping_sync('schedule', sampler, None, 'hidden', 59, None)
+        self.assertEqual(runner.order, ['mtp', 'bookkeeping'])
+        self.assertIs(runner.seen_sampler.sampled_token_ids, cpu)
+        self.assertIs(sampler.sampled_token_ids, raw)
 
     def test_full_graph_preserves_small_buckets_and_real_draft_budget(self):
         runner, _ = self.graph_runner()

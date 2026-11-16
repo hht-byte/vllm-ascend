@@ -190,7 +190,7 @@ class PackedMTPProgram:
             **extra,
         )
 
-    def stage(self, states, inputs, limits):
+    def stage(self, states, inputs, limits, *, allow_inactive=False):
         n, h, r = len(states), self.heads.num_heads, self.max_batch + 1
         if not n or not n == len(inputs) == len(limits) or n > self.max_batch:
             raise ValueError("packed MTP requires aligned bounded requests")
@@ -203,7 +203,7 @@ class PackedMTPProgram:
         for state, tokens, limit in zip(states, inputs, limits):
             if (
                 type(limit) is not int
-                or not 0 < limit <= self.execution_heads
+                or not (0 if allow_inactive else 1) <= limit <= self.execution_heads
                 or not 0 < state.length <= self.context
                 or len(tokens) != state.length + 1
                 or any(
@@ -294,6 +294,8 @@ class PackedMTPProgram:
                 self.attention.set_tables(tables)
         for d, (q_ends, kv_ends) in enumerate(segments[: self.execution_heads]):
             self.attention.stage(d, q_ends, kv_ends)
+        if hasattr(self, 'rejection'):
+            self.rejection.compute_limits.copy_(self.limits)
 
     def _segments(self, index, ends):
         # Bcap is small and fixed. Avoid searchsorted implementations that may
@@ -350,7 +352,12 @@ class PackedMTPProgram:
             segment, relative = self._segments(self.token_index, self.q_ends[d])
             request = self.order[d].index_select(0, segment)
             anchor = self.starts[d].index_select(0, request) + relative
-            valid = self.limits.index_select(0, request) >= depth
+            # Optimistic FIA segments still exist when rejection discovers EOS
+            # or a lower remaining budget. Populate finite KV for their entire
+            # scheduled span; only prediction/output eligibility is shortened.
+            compute_limits = (self.rejection.compute_limits
+                              if hasattr(self, 'rejection') else self.limits)
+            valid = compute_limits.index_select(0, request) >= depth
             positions = anchor.clamp(0, cap - 1)
             base = self.slots.index_select(0, request) * stride
             source_offset = (
@@ -534,6 +541,27 @@ class TokenMTPGraphs:
                         [[0] * (s.length + 1) for s in warm],
                         [depth] * count,
                     )
+                    rejection = getattr(self, 'device_rejection', None)
+                    if rejection is not None:
+                        try:
+                            from .asr_mtp_device_rejection import RejectionPrelude
+                        except ImportError:
+                            from asr_mtp_device_rejection import RejectionPrelude
+                        width, vocab = rejection
+                        program.rejection = RejectionPrelude(program, sample_width=width,
+                                                              vocab_size=vocab)
+                        program.rejection.stage(
+                            [s.length for s in warm], [1]*count, [width+depth]*count,
+                            [width+depth]*count, [0]*count, [set() for _ in warm],
+                            torch.zeros((count, 1), device=self.arena.storage.device,
+                                        dtype=torch.int32),
+                            torch.zeros((count, self.heads.config.hidden_size),
+                                        device=self.arena.storage.device,
+                                        dtype=self.arena.storage.dtype))
+                        if is_npu:
+                            program.rejection.capture(capture.pool)
+                        # Prelude warmup may have changed lengths or limits.
+                        program.stage(warm, [[0]*(s.length+1) for s in warm], [depth]*count)
                     self.entries[depth_key(self.options, depth, tokens)] = (
                         program,
                         capture.capture(program),
@@ -551,7 +579,8 @@ class TokenMTPGraphs:
         logger.info(
             "ASR_MTP_GRAPH_READY layout=tokens graphs=%d max_batch=%d token_sizes=%s "
             "query_capacities=%s context=%d capture_ms=%.2f reserved_mib=%.2f "
-            "allocated_mib=%.2f row_write_backend=%s row_width=%d head_counts=%s",
+            "allocated_mib=%.2f row_write_backend=%s row_width=%d head_counts=%s "
+            "device_rejection=%s prelude_graphs=%d",
             len(self.entries),
             self.options.max_batch,
             self.options.tokens,
@@ -563,6 +592,8 @@ class TokenMTPGraphs:
             next(iter(self.entries.values()))[0].row_write_backend,
             next(iter(self.entries.values()))[0].row_width,
             getattr(self.options, "head_counts", ()) or (self.heads.num_heads,),
+            getattr(self, 'device_rejection', None) is not None,
+            sum(hasattr(program, 'rejection') for program, _ in self.entries.values()),
         )
 
     @torch.inference_mode()
