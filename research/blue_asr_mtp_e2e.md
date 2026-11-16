@@ -47,6 +47,10 @@ credentials and project Python paths are excluded from the child environment.
 Verify the bounded worker probe's `/overlay/` origins and hashes before use.
 Raw model outputs, audio, profiling and logs remain local.
 
+An independently pinned [batch-invariant configuration](blue_batch_invariant.md)
+is available when exact greedy output is affected by batch shape. It requires
+its own complete correctness gates and experiment ID before timing.
+
 ## Correctness before timing
 
 Use `blue_mtp_preflight.py ar` against the native autoregressive service to

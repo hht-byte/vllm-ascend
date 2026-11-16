@@ -10,7 +10,7 @@ SOURCE = Path(__file__).with_name("blue_batch_invariant.py")
 
 
 class FakeOps:
-    """Model the four separately named extension schemas, not TorchNPU's out ABI."""
+    """Model the four explicit 2.0 extension names and named output aliases."""
 
     def __init__(self):
         self.calls = []
@@ -21,7 +21,7 @@ class FakeOps:
         self.calls.append(("default", args, kwargs))
         return self.result
 
-    def npu_fused_infer_attention_score_out_batch_invariant(
+    def npu_fused_infer_attention_score_batch_invariant_out(
         self, query, key, value, *, workspace=None, attention_out, softmax_lse,
         **kwargs,
     ):
@@ -33,13 +33,13 @@ class FakeOps:
         softmax_lse[:] = ["lse-written"]
         return attention_out, softmax_lse
 
-    def npu_fused_infer_attention_score_get_max_workspace_batch_invariant(
+    def _npu_fused_infer_attention_score_batch_invariant_get_max_workspace(
         self, *args, **kwargs,
     ):
         self.calls.append(("workspace", args, kwargs))
         return self.workspace
 
-    def npu_fused_infer_attention_score_infer_output_batch_invariant(
+    def _npu_fused_infer_attention_score_batch_invariant_infer_output(
         self, *args, **kwargs,
     ):
         self.calls.append(("infer_output", args, kwargs))
@@ -131,9 +131,9 @@ class FiaBridgeTests(unittest.TestCase):
     def test_every_missing_extension_operation_fails_before_mutation(self):
         names = (
             "npu_fused_infer_attention_score_batch_invariant",
-            "npu_fused_infer_attention_score_out_batch_invariant",
-            "npu_fused_infer_attention_score_get_max_workspace_batch_invariant",
-            "npu_fused_infer_attention_score_infer_output_batch_invariant",
+            "npu_fused_infer_attention_score_batch_invariant_out",
+            "_npu_fused_infer_attention_score_batch_invariant_get_max_workspace",
+            "_npu_fused_infer_attention_score_batch_invariant_infer_output",
         )
         for missing in names:
             with self.subTest(missing=missing):
@@ -150,10 +150,28 @@ class FiaBridgeTests(unittest.TestCase):
         self.assertEqual(self.ops.calls, [])
 
     def test_non_callable_extension_operation_fails_before_mutation(self):
-        self.ops.npu_fused_infer_attention_score_out_batch_invariant = None
+        self.ops.npu_fused_infer_attention_score_batch_invariant_out = None
         with self.assertRaises((TypeError, ValueError)):
             self.install()
         self.assertIs(self.npu.npu_fused_infer_attention_score, self.original)
+
+    def test_v1_only_namespace_is_rejected_before_torchnpu_mutation(self):
+        legacy = SimpleNamespace(
+            npu_fused_infer_attention_score_batch_invariant=(
+                self.ops.npu_fused_infer_attention_score_batch_invariant),
+            npu_fused_infer_attention_score_out_batch_invariant=(
+                self.ops.npu_fused_infer_attention_score_batch_invariant_out),
+            npu_fused_infer_attention_score_get_max_workspace_batch_invariant=(
+                self.ops._npu_fused_infer_attention_score_batch_invariant_get_max_workspace),
+            npu_fused_infer_attention_score_infer_output_batch_invariant=(
+                self.ops._npu_fused_infer_attention_score_batch_invariant_infer_output),
+        )
+        with self.assertRaises((TypeError, ValueError)):
+            self.module.install_fia_bridge(self.npu, legacy)
+        self.assertIs(self.npu.npu_fused_infer_attention_score, self.original)
+        self.assertIs(self.npu._npu_fused_infer_attention_score_get_max_workspace,
+                      self.old_workspace)
+        self.assertEqual(self.ops.calls, [])
 
     def test_non_callable_existing_fia_fails_before_mutation(self):
         self.npu.npu_fused_infer_attention_score = None
