@@ -199,6 +199,34 @@ class WorkerPatchTests(unittest.TestCase):
         self.assertIs(runner.seen_sampler.sampled_token_ids, cpu)
         self.assertIs(sampler.sampled_token_ids, raw)
 
+    def test_completed_handoff_acknowledges_the_upload_generation_before_bookkeeping(self):
+        runner, _ = self.graph_runner()
+        runner.order = []
+        runner._input_prepare_graph = SimpleNamespace(upload_records=7,
+            complete_upload=lambda generation: runner.order.append(('complete', generation)))
+        handoff = SimpleNamespace(prepare=lambda *a: (runner.order.append('readback_completed'), object())[1])
+        runner.drafter.online = SimpleNamespace(device_handoff=handoff)
+        runner._bookkeeping_sync('s', SimpleNamespace(sampled_token_ids=object()), None, None, 4, None)
+        self.assertEqual(runner.order, ['readback_completed', ('complete', 7), 'bookkeeping'])
+
+    def test_handoff_fallback_or_failure_does_not_release_preparation_upload(self):
+        for error in (False, True):
+            runner, _ = self.graph_runner()
+            runner.order = []
+            complete = unittest.mock.Mock()
+            runner._input_prepare_graph = SimpleNamespace(upload_records=2, complete_upload=complete)
+            def prepare(*args):
+                if error:
+                    raise RuntimeError('readback not completed')
+                return None
+            runner.drafter.online = SimpleNamespace(device_handoff=SimpleNamespace(prepare=prepare))
+            if error:
+                with self.assertRaisesRegex(RuntimeError, 'not completed'):
+                    runner._bookkeeping_sync('s', SimpleNamespace(sampled_token_ids=object()), None, None, 4, None)
+            else:
+                runner._bookkeeping_sync('s', SimpleNamespace(sampled_token_ids=object()), None, None, 4, None)
+            complete.assert_not_called()
+
     def test_device_rejection_fallback_retains_original_bookkeeping_arguments(self):
         runner, _ = self.graph_runner()
         runner.order = []

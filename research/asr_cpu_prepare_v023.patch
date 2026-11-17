@@ -1,0 +1,315 @@
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -1188,7 +1188,11 @@
+         # Sync num_accepted_tokens from CPU (set by
+         # _update_states_after_model_execute for hybrid models).
+         if self.num_accepted_tokens_event is not None:
+-            self.num_accepted_tokens_event.synchronize()
++            # The opt-in preparation owner rejects hybrid and async runners.
++            # Dense speculation allocates this event but never records it;
++            # preserve the CPU count copy without an unnecessary host wait.
++            if getattr(self, "_input_prepare_graph", None) is None:
++                self.num_accepted_tokens_event.synchronize()
+             self._sync_num_accepted_tokens(
+                 num_reqs, has_prev_mapping=bool(prev_req_id_to_index)
+             )
+@@ -1382,8 +1386,13 @@
+             num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
+             # For chunked prefills, use -1 as mask rather than 0, as guided
+             # decoding may rollback speculative tokens.
+-            new_schedule_reqs = [x.req_id for x in scheduler_output.scheduled_new_reqs]
+-            num_decode_draft_tokens = np.full(num_reqs, -1, dtype=np.int32)
++            # These flags serve hybrid attention builders. The preparation
++            # owner is restricted to synchronous dense ASR, whose builders
++            # consume neither this CPU array nor its GPU mirror.
++            prepare_hybrid_decode_metadata = getattr(self, "_input_prepare_graph", None) is None
++            if prepare_hybrid_decode_metadata:
++                new_schedule_reqs = [x.req_id for x in scheduler_output.scheduled_new_reqs]
++                num_decode_draft_tokens = np.full(num_reqs, -1, dtype=np.int32)
+             for (
+                 req_id,
+                 draft_token_ids,
+@@ -1391,12 +1400,13 @@
+                 req_idx = self.input_batch.req_id_to_index[req_id]
+                 draft_len = len(draft_token_ids)
+                 num_draft_tokens[req_idx] = draft_len
+-                if (self.is_kv_consumer and req_id in new_schedule_reqs) or \
+-                   (self.input_batch.num_computed_tokens_cpu[req_idx] >= \
+-                    self.input_batch.num_prompt_tokens[req_idx]):
+-                    num_decode_draft_tokens[req_idx] = draft_len
+-                else:
+-                    num_decode_draft_tokens[req_idx] = -1
++                if prepare_hybrid_decode_metadata:
++                    if (self.is_kv_consumer and req_id in new_schedule_reqs) or (
++                        self.input_batch.num_computed_tokens_cpu[req_idx] >= self.input_batch.num_prompt_tokens[req_idx]
++                    ):
++                        num_decode_draft_tokens[req_idx] = draft_len
++                    else:
++                        num_decode_draft_tokens[req_idx] = -1
+
+             spec_decode_metadata = self._calc_spec_decode_metadata(
+                 num_draft_tokens,
+@@ -1407,9 +1417,10 @@
+             num_sampled_tokens = num_draft_tokens + 1
+
+             # For DECODE only cuda graph of some attention backends (e.g., GDN).
+-            self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
+-            self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
+-            self.num_decode_draft_tokens.copy_to_gpu()
++            if prepare_hybrid_decode_metadata:
++                self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
++                self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
++                self.num_decode_draft_tokens.copy_to_gpu()
+         if self._input_prepare_graph is not None and self._input_prepare_graph.staged is None:
+             self._input_prepare_graph.record_upload()
+             self._log_asr_input_preparation(total_num_scheduled_tokens)
+--- a/vllm_ascend/worker/asr_input_prepare_graph.py
++++ b/vllm_ascend/worker/asr_input_prepare_graph.py
+@@ -404,6 +404,18 @@
+             self.pending_copy = True
+             self.upload_active = False
+
++    def complete_upload(self, generation):
++        """A completed same-stream readback covers this recorded upload.
++
++        Only the engine handoff calls this after its readback event has waited.
++        Old receipts must not clear a later copy; open batches still need their
++        own record. Standalone replay and failed handoffs retain the fence.
++        """
++        if generation != self.upload_records or self.upload_active:
++            return False
++        self.pending_copy = False
++        return True
++
+     def _can_embed(self, scheduler_output, n, t, bucket, padded):
+         r = self.runner
+         return (
+--- a/vllm_ascend/patch/worker/patch_external_draft_mtp.py
++++ b/vllm_ascend/patch/worker/patch_external_draft_mtp.py
+@@ -131,7 +131,14 @@
+                    if isinstance(drafter, AscendExternalDraftMTPProposer) else None)
+         cpu = None
+         if handoff is not None:
++            owner = getattr(self, '_input_prepare_graph', None)
++            complete = getattr(owner, 'complete_upload', None)
++            generation = owner.upload_records if complete is not None else None
+             cpu = handoff.prepare(scheduler_output, sampler_output, hidden_states)
++            if cpu is not None and complete is not None:
++                # prepare returned only after the same-stream readback event
++                # completed. It also covers this generation's earlier H2Ds.
++                complete(generation)
+         if cpu is None:
+             return original_bookkeeping(self, scheduler_output, sampler_output, logits,
+                                         hidden_states, num_scheduled_tokens, spec_decode_metadata)
+--- /dev/null
++++ b/tests/ut/worker/test_asr_dense_prepare_standalone.py
+@@ -0,0 +1,140 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Execute the real runner branches while enforcing dense-ASR dependencies."""
++
++import ast
++import textwrap
++import unittest
++from pathlib import Path
++from types import MethodType
++from types import SimpleNamespace as NS
++from unittest.mock import Mock
++
++import numpy as np
++import torch
++
++SOURCE = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
++
++
++def method(name):
++    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
++    cls = next(x for x in tree.body if isinstance(x, ast.ClassDef) and x.name == "NPUModelRunner")
++    fn = next(x for x in cls.body if isinstance(x, ast.FunctionDef) and x.name == name)
++    env = {"np": np}
++    exec("from __future__ import annotations\n" + ast.unparse(fn), env)
++    return env[name]
++
++
++def region(begin, end):
++    source = SOURCE.read_text(encoding="utf-8")
++    offset = source.index(begin, source.index("    def _prepare_inputs("))
++    return compile(textwrap.dedent(source[offset : source.index(end, offset)]), "<actual preparation branch>", "exec")
++
++
++class AcceptedCountsTests(unittest.TestCase):
++    def runner(self, helper):
++        r = NS(
++            _input_prepare_graph=helper,
++            use_async_scheduling=False,
++            input_batch=NS(num_accepted_tokens_cpu=np.array([3, 2, 7, 8], dtype=np.int32)),
++            num_accepted_tokens_event=NS(synchronize=Mock()),
++            num_accepted_tokens=NS(np=np.full(4, 99, dtype=np.int32), gpu=torch.zeros(4, dtype=torch.int32)),
++        )
++        r._sync_num_accepted_tokens = MethodType(method("_sync_num_accepted_tokens"), r)
++        r.num_accepted_tokens.copy_to_gpu = Mock(
++            side_effect=lambda: r.num_accepted_tokens.gpu.copy_(torch.from_numpy(r.num_accepted_tokens.np))
++        )
++        return r
++
++    def run_branch(self, r, bucket, mapping=None):
++        code = region("        # Sync num_accepted_tokens from CPU", "        # Update num_computed_tokens on GPU.")
++        exec(code, dict(self=r, num_reqs=2, prev_req_id_to_index=mapping or {}, input_prepare_bucket=bucket))
++
++    def test_dense_owner_skips_unrecorded_event_but_keeps_cpu_counts_and_padding(self):
++        for bucket in (8, None):
++            with self.subTest(bucket=bucket):
++                r = self.runner(object())
++                self.run_branch(r, bucket)
++                self.assertEqual(r.num_accepted_tokens_event.synchronize.call_count, 0)
++                self.assertEqual(r.num_accepted_tokens.np.tolist(), [3, 2, 1, 1])
++                self.assertEqual(r.num_accepted_tokens.copy_to_gpu.call_count, int(bucket is None))
++
++    def test_legacy_wait_finishes_cpu_producer_before_copying_counts(self):
++        r = self.runner(None)
++        r.num_accepted_tokens_event.synchronize.side_effect = lambda: r.input_batch.num_accepted_tokens_cpu.__setitem__(
++            slice(0, 2), [5, 4]
++        )
++        self.run_branch(r, None)
++        self.assertEqual(r.num_accepted_tokens_event.synchronize.call_count, 1)
++        self.assertEqual(r.num_accepted_tokens.gpu.tolist(), [5, 4, 1, 1])
++
++    def test_legacy_async_reordering_and_new_request_counts_remain_intact(self):
++        r = self.runner(None)
++        r.use_async_scheduling = True
++        r.prev_positions = NS(np=np.array([-1, 2], dtype=np.int32))
++        r.num_accepted_tokens.np[:] = [3, 2, 6, 9]
++        r._remap_num_accepted_tokens = MethodType(method("_remap_num_accepted_tokens"), r)
++        self.run_branch(r, None, {"old": 2})
++        self.assertEqual(r.num_accepted_tokens_event.synchronize.call_count, 1)
++        self.assertEqual(r.input_batch.num_accepted_tokens_cpu[:2].tolist(), [1, 6])
++        self.assertEqual(r.num_accepted_tokens.gpu.tolist(), [1, 6, 1, 1])
++
++    def test_no_event_keeps_original_default_count_behavior(self):
++        r = self.runner(object())
++        r.num_accepted_tokens_event = None
++        self.run_branch(r, None)
++        self.assertEqual(r.num_accepted_tokens.gpu.tolist(), [1, 1, 1, 1])
++
++
++class DecodeDraftMetadataTests(unittest.TestCase):
++    def run_branch(self, helper, *, kv_consumer):
++        code = region(
++            "            # Get the number of draft tokens for each request.",
++            "        if self._input_prepare_graph is not None and self._input_prepare_graph.staged is None:",
++        )
++        observed = []
++
++        def calculate(drafts, ends, num_pcp_pads):
++            observed.append((drafts.copy(), ends.copy(), num_pcp_pads))
++            return NS(logits_indices="actual-logits")
++
++        r = NS(
++            _input_prepare_graph=helper,
++            input_batch=NS(
++                req_id_to_index={"prefill": 0, "decode": 1, "new-kv": 2},
++                num_computed_tokens_cpu=np.array([0, 10, 0]),
++                num_prompt_tokens=np.array([10, 10, 10]),
++            ),
++            is_kv_consumer=kv_consumer,
++            pcp_size=1,
++            _calc_spec_decode_metadata=calculate,
++            num_decode_draft_tokens=NS(np=np.full(5, -77, dtype=np.int32), copy_to_gpu=Mock()),
++        )
++        schedule = NS(
++            scheduled_new_reqs=[NS(req_id="new-kv")],
++            scheduled_spec_decode_tokens={"prefill": [11, 12], "decode": [21, 22, 23], "new-kv": [31]},
++        )
++        env = dict(self=r, scheduler_output=schedule, num_reqs=3, cu_num_tokens=np.array([3, 7, 9]), np=np)
++        exec(code, env)
++        self.assertEqual(observed[0][0].tolist(), [2, 3, 1])
++        self.assertEqual(observed[0][1].tolist(), [3, 7, 9])
++        self.assertIsNone(observed[0][2])
++        self.assertEqual(env["num_sampled_tokens"].tolist(), [3, 4, 2])
++        self.assertEqual(env["logits_indices"], "actual-logits")
++        return r
++
++    def test_dense_owner_omits_unused_hybrid_cpu_array_and_gpu_upload(self):
++        r = self.run_branch(object(), kv_consumer=True)
++        self.assertEqual(r.num_decode_draft_tokens.copy_to_gpu.call_count, 0)
++        self.assertEqual(r.num_decode_draft_tokens.np.tolist(), [-77] * 5)
++
++    def test_legacy_gdn_mixed_prefill_decode_and_new_kv_flags_are_preserved(self):
++        for consumer in (False, True):
++            with self.subTest(kv_consumer=consumer):
++                r = self.run_branch(None, kv_consumer=consumer)
++                self.assertEqual(r.num_decode_draft_tokens.copy_to_gpu.call_count, 1)
++                self.assertEqual(r.num_decode_draft_tokens.np.tolist(), [-1, 3, 1 if consumer else -1, -1, -1])
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/tests/ut/worker/test_asr_preparation_handoff_standalone.py
++++ b/tests/ut/worker/test_asr_preparation_handoff_standalone.py
+@@ -92,6 +92,29 @@
+         packer.prepare(np.array([2], np.int32), np.array([3]), self.r.input_ids.np, NS)
+         self.graph.record_upload()  # Runner's oversize/fallback exit.
+         self.assertEqual(self.backend.event.records, 3)
++
++    def test_completed_readback_releases_only_the_matching_upload_generation(self):
++        from unittest.mock import patch
++
++        self.graph.capture()
++        self.stage()
++        self.graph.finish(8, 3)
++        first = self.graph.upload_records
++        self.assertTrue(self.graph.pending_copy)
++        self.assertTrue(callable(getattr(self.graph, 'complete_upload', None)), 'completion acknowledgement missing')
++        self.assertTrue(self.graph.complete_upload(first))
++        self.assertFalse(self.graph.pending_copy)
++        with patch.object(self.backend.event, 'query', side_effect=AssertionError('redundant event query')):
++            self.stage()
++            self.graph.finish(8, 3)
++        self.assertTrue(self.graph.pending_copy)
++        self.assertFalse(self.graph.complete_upload(first), 'stale completion cleared a newer upload')
++        self.assertTrue(self.graph.pending_copy)
++        self.stage()  # No matching completion: original fence must wait.
++        self.assertEqual(self.backend.event.waits, 1)
++        self.assertFalse(self.graph.complete_upload(self.graph.upload_records), 'cannot complete an open upload batch')
++        self.assertTrue(self.graph.upload_active)
++        self.graph.finish(8, 3)
+
+     def test_embedding_is_in_same_replay_and_bypasses_preprocess(self):
+         self.graph.capture()
+--- a/examples/910b/tests/test_patch_external_draft_mtp.py
++++ b/examples/910b/tests/test_patch_external_draft_mtp.py
+@@ -199,6 +199,34 @@
+         self.assertIs(runner.seen_sampler.sampled_token_ids, cpu)
+         self.assertIs(sampler.sampled_token_ids, raw)
+
++    def test_completed_handoff_acknowledges_the_upload_generation_before_bookkeeping(self):
++        runner, _ = self.graph_runner()
++        runner.order = []
++        runner._input_prepare_graph = SimpleNamespace(upload_records=7,
++            complete_upload=lambda generation: runner.order.append(('complete', generation)))
++        handoff = SimpleNamespace(prepare=lambda *a: (runner.order.append('readback_completed'), object())[1])
++        runner.drafter.online = SimpleNamespace(device_handoff=handoff)
++        runner._bookkeeping_sync('s', SimpleNamespace(sampled_token_ids=object()), None, None, 4, None)
++        self.assertEqual(runner.order, ['readback_completed', ('complete', 7), 'bookkeeping'])
++
++    def test_handoff_fallback_or_failure_does_not_release_preparation_upload(self):
++        for error in (False, True):
++            runner, _ = self.graph_runner()
++            runner.order = []
++            complete = unittest.mock.Mock()
++            runner._input_prepare_graph = SimpleNamespace(upload_records=2, complete_upload=complete)
++            def prepare(*args):
++                if error:
++                    raise RuntimeError('readback not completed')
++                return None
++            runner.drafter.online = SimpleNamespace(device_handoff=SimpleNamespace(prepare=prepare))
++            if error:
++                with self.assertRaisesRegex(RuntimeError, 'not completed'):
++                    runner._bookkeeping_sync('s', SimpleNamespace(sampled_token_ids=object()), None, None, 4, None)
++            else:
++                runner._bookkeeping_sync('s', SimpleNamespace(sampled_token_ids=object()), None, None, 4, None)
++            complete.assert_not_called()
++
+     def test_device_rejection_fallback_retains_original_bookkeeping_arguments(self):
+         runner, _ = self.graph_runner()
+         runner.order = []

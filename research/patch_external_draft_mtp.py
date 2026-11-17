@@ -131,7 +131,14 @@ def install():
                    if isinstance(drafter, AscendExternalDraftMTPProposer) else None)
         cpu = None
         if handoff is not None:
+            owner = getattr(self, '_input_prepare_graph', None)
+            complete = getattr(owner, 'complete_upload', None)
+            generation = owner.upload_records if complete is not None else None
             cpu = handoff.prepare(scheduler_output, sampler_output, hidden_states)
+            if cpu is not None and complete is not None:
+                # prepare returned only after the same-stream readback event
+                # completed. It also covers this generation's earlier H2Ds.
+                complete(generation)
         if cpu is None:
             return original_bookkeeping(self, scheduler_output, sampler_output, logits,
                                         hidden_states, num_scheduled_tokens, spec_decode_metadata)
