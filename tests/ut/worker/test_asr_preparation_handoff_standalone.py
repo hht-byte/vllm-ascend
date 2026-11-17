@@ -93,6 +93,29 @@ class HandoffTests(unittest.TestCase):
         self.graph.record_upload()  # Runner's oversize/fallback exit.
         self.assertEqual(self.backend.event.records, 3)
 
+    def test_completed_readback_releases_only_the_matching_upload_generation(self):
+        from unittest.mock import patch
+
+        self.graph.capture()
+        self.stage()
+        self.graph.finish(8, 3)
+        first = self.graph.upload_records
+        self.assertTrue(self.graph.pending_copy)
+        self.assertTrue(callable(getattr(self.graph, 'complete_upload', None)), 'completion acknowledgement missing')
+        self.assertTrue(self.graph.complete_upload(first))
+        self.assertFalse(self.graph.pending_copy)
+        with patch.object(self.backend.event, 'query', side_effect=AssertionError('redundant event query')):
+            self.stage()
+            self.graph.finish(8, 3)
+        self.assertTrue(self.graph.pending_copy)
+        self.assertFalse(self.graph.complete_upload(first), 'stale completion cleared a newer upload')
+        self.assertTrue(self.graph.pending_copy)
+        self.stage()  # No matching completion: original fence must wait.
+        self.assertEqual(self.backend.event.waits, 1)
+        self.assertFalse(self.graph.complete_upload(self.graph.upload_records), 'cannot complete an open upload batch')
+        self.assertTrue(self.graph.upload_active)
+        self.graph.finish(8, 3)
+
     def test_embedding_is_in_same_replay_and_bypasses_preprocess(self):
         self.graph.capture()
         self.stage()

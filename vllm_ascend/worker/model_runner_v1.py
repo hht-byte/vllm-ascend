@@ -1188,7 +1188,11 @@ class NPUModelRunner(GPUModelRunner):
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
-            self.num_accepted_tokens_event.synchronize()
+            # The opt-in preparation owner rejects hybrid and async runners.
+            # Dense speculation allocates this event but never records it;
+            # preserve the CPU count copy without an unnecessary host wait.
+            if getattr(self, "_input_prepare_graph", None) is None:
+                self.num_accepted_tokens_event.synchronize()
             self._sync_num_accepted_tokens(
                 num_reqs, has_prev_mapping=bool(prev_req_id_to_index)
             )
@@ -1382,8 +1386,13 @@ class NPUModelRunner(GPUModelRunner):
             num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
             # For chunked prefills, use -1 as mask rather than 0, as guided
             # decoding may rollback speculative tokens.
-            new_schedule_reqs = [x.req_id for x in scheduler_output.scheduled_new_reqs]
-            num_decode_draft_tokens = np.full(num_reqs, -1, dtype=np.int32)
+            # These flags serve hybrid attention builders. The preparation
+            # owner is restricted to synchronous dense ASR, whose builders
+            # consume neither this CPU array nor its GPU mirror.
+            prepare_hybrid_decode_metadata = getattr(self, "_input_prepare_graph", None) is None
+            if prepare_hybrid_decode_metadata:
+                new_schedule_reqs = [x.req_id for x in scheduler_output.scheduled_new_reqs]
+                num_decode_draft_tokens = np.full(num_reqs, -1, dtype=np.int32)
             for (
                 req_id,
                 draft_token_ids,
@@ -1391,12 +1400,13 @@ class NPUModelRunner(GPUModelRunner):
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 draft_len = len(draft_token_ids)
                 num_draft_tokens[req_idx] = draft_len
-                if (self.is_kv_consumer and req_id in new_schedule_reqs) or \
-                   (self.input_batch.num_computed_tokens_cpu[req_idx] >= \
-                    self.input_batch.num_prompt_tokens[req_idx]):
-                    num_decode_draft_tokens[req_idx] = draft_len
-                else:
-                    num_decode_draft_tokens[req_idx] = -1
+                if prepare_hybrid_decode_metadata:
+                    if (self.is_kv_consumer and req_id in new_schedule_reqs) or (
+                        self.input_batch.num_computed_tokens_cpu[req_idx] >= self.input_batch.num_prompt_tokens[req_idx]
+                    ):
+                        num_decode_draft_tokens[req_idx] = draft_len
+                    else:
+                        num_decode_draft_tokens[req_idx] = -1
 
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens,
@@ -1407,9 +1417,10 @@ class NPUModelRunner(GPUModelRunner):
             num_sampled_tokens = num_draft_tokens + 1
 
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
-            self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
-            self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
-            self.num_decode_draft_tokens.copy_to_gpu()
+            if prepare_hybrid_decode_metadata:
+                self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
+                self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
+                self.num_decode_draft_tokens.copy_to_gpu()
         if self._input_prepare_graph is not None and self._input_prepare_graph.staged is None:
             self._input_prepare_graph.record_upload()
             self._log_asr_input_preparation(total_num_scheduled_tokens)

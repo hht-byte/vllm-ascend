@@ -404,6 +404,18 @@ class InputPrepareGraph:
             self.pending_copy = True
             self.upload_active = False
 
+    def complete_upload(self, generation):
+        """A completed same-stream readback covers this recorded upload.
+
+        Only the engine handoff calls this after its readback event has waited.
+        Old receipts must not clear a later copy; open batches still need their
+        own record. Standalone replay and failed handoffs retain the fence.
+        """
+        if generation != self.upload_records or self.upload_active:
+            return False
+        self.pending_copy = False
+        return True
+
     def _can_embed(self, scheduler_output, n, t, bucket, padded):
         r = self.runner
         return (
