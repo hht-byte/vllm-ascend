@@ -335,7 +335,14 @@ class ActualPackedNPUReplayTests(unittest.TestCase):
         )
 
     def test_paged_joint_qkv_rope_and_sparse_rows_coexist_in_full_mtp_graph(self):
+        import torch
+
         import vllm_ascend.ops  # noqa: F401
+        from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+
+        # Match worker startup before invoking the joint Triton operator.
+        torch.npu.set_device(0)
+        init_device_properties_triton()
 
         self._check_token_bucket_replay_changes_request_boundaries(
             native_fusion=True,

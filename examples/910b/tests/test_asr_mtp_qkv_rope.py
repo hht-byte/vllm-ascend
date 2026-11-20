@@ -345,6 +345,11 @@ class ActualQKVRopeTests(unittest.TestCase):
         if importlib.util.find_spec("vllm_ascend") is None:
             self.skipTest("requires the installed vllm-ascend Triton operator")
         import vllm_ascend.ops  # noqa: F401
+        from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+
+        # Match worker startup before invoking the joint Triton operator.
+        torch.npu.set_device(0)
+        init_device_properties_triton()
 
         api = helper_api(self)
         cfg = SimpleNamespace(

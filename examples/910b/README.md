@@ -1,5 +1,11 @@
 # 910B PA token graph feasibility probe
 
+For the directly integrated external-draft/ASR MTP runtime, use
+[Complete ASR engine installation](asr_engine.md). Its only separate engine
+prerequisite is the supplied upstream vLLM first-verification scheduler patch.
+The historical auxiliary upgrade patches below target older checkouts; do not
+apply them over the runtime files now tracked on this branch.
+
 This is an isolated device acceptance tool, not a production model-runner switch.
 It uses ND `[blocks, block_size, kv_heads, head_size]` caches and the native
 `_npu_paged_attention` operator. Query rows, int32 context lengths and

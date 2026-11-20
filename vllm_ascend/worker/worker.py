@@ -74,6 +74,16 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
+# ASR hooks depend on the fully initialized runner and the base draft transport.
+# Keep this order: transport, first-verification metadata, then optional MTP.
+if vllm_version_is("0.23.0"):
+    from vllm_ascend.patch.worker.patch_external_draft import install as install_external_draft
+    from vllm_ascend.patch.worker.patch_external_draft_first_verify import install as install_first_verify
+
+    install_external_draft(NPUModelRunner)
+    install_first_verify()
+    import vllm_ascend.patch.worker.patch_external_draft_mtp  # noqa: E402, F401
+
 # Install after the runner definition to avoid patch-package circular imports.
 if vllm_version_is("0.23.0"):
     from vllm_ascend.patch.worker.patch_full_graph_spec_buckets import install_full_graph_spec_buckets
@@ -1058,3 +1068,10 @@ def parse_text_output(output) -> None:
             if line.split(":")[-1].strip() != "OK":
                 raise RuntimeError("NPU card health status is not OK")
     return
+
+
+# The worker class must exist before its optional graph-memory hooks are installed.
+if vllm_version_is("0.23.0"):
+    from vllm_ascend.patch.worker.patch_external_draft_mtp import install_worker_memory_hook
+
+    install_worker_memory_hook(NPUWorker)

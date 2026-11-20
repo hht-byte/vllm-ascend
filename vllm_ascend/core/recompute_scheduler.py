@@ -122,11 +122,28 @@ class RecomputeScheduler(Scheduler):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            initial_draft = (getattr(request.sampling_params, "extra_args", None) or {}).get(
+                "ascend_external_draft_first_verify", False
+            )
+            if type(initial_draft) is not bool:
+                raise TypeError("ascend_external_draft_first_verify must be a boolean")
+            if initial_draft:
+                prepare_initial_draft = getattr(self, "_prepare_initial_external_draft", None)
+                if prepare_initial_draft is None:
+                    raise RuntimeError(
+                        "First-verify external drafts require the upstream vLLM 0.23.0 scheduler patch: "
+                        "examples/910b/external_draft_first_verify_vllm_v023.patch"
+                    )
+                prepare_initial_draft(request)
             if request.resumable:
                 request.streaming_queue = deque()
             # Fill in placeholder tokens to enable full graph compatibility. Without
             # placeholders, graph matching may fail, forcing eager mode execution.
-            if self.is_mtp_kv_consumer and (self.max_model_len >= (request.num_tokens + self.num_spec_tokens)):
+            if (
+                self.is_mtp_kv_consumer
+                and self.max_model_len >= request.num_tokens + self.num_spec_tokens
+                and not initial_draft
+            ):
                 request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
@@ -558,11 +575,20 @@ class RecomputeScheduler(Scheduler):
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
-                    if self.is_mtp_kv_consumer:
+                    initial_draft = bool(request.spec_token_ids) and bool(
+                        (getattr(request.sampling_params, "extra_args", None) or {}).get(
+                            "ascend_external_draft_first_verify", False
+                        )
+                    )
+                    if self.is_mtp_kv_consumer or initial_draft:
                         num_new_tokens = request.num_tokens_with_spec - num_computed_tokens
                     else:
                         num_new_tokens = request.num_tokens - num_computed_tokens
                     threshold = self.scheduler_config.long_prefill_token_threshold
+                    if initial_draft and (num_new_tokens > token_budget or 0 < threshold < num_new_tokens):
+                        request.spec_token_ids = []
+                        num_new_tokens = request.num_tokens - num_computed_tokens
+                        logger.info("INITIAL_DRAFT request_id=%s status=fallback reason=budget", request.request_id)
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
@@ -615,6 +641,19 @@ class RecomputeScheduler(Scheduler):
                 num_encoder_tokens = 0
                 if self.is_encoder_decoder and request.has_encoder_inputs and encoder_inputs_to_schedule:
                     num_encoder_tokens = sum(request.get_num_encoder_embeds(i) for i in encoder_inputs_to_schedule)
+
+                if (
+                    request.spec_token_ids
+                    and (getattr(request.sampling_params, "extra_args", None) or {}).get(
+                        "ascend_external_draft_first_verify", False
+                    )
+                    and num_computed_tokens + num_new_tokens < request.num_tokens_with_spec
+                ):
+                    request.spec_token_ids = []
+                    num_new_tokens = min(num_new_tokens, request.num_tokens - num_computed_tokens)
+                    logger.info(
+                        "INITIAL_DRAFT request_id=%s status=fallback reason=encoder_or_chunk", request.request_id
+                    )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -678,10 +717,16 @@ class RecomputeScheduler(Scheduler):
 
                 # For spec_token_ids, the waiting queue has the same processing
                 # as the running queue.
-                if self.is_mtp_kv_consumer and request.spec_token_ids:
+                if (
+                    self.is_mtp_kv_consumer
+                    or (getattr(request.sampling_params, "extra_args", None) or {}).get(
+                        "ascend_external_draft_first_verify", False
+                    )
+                ) and request.spec_token_ids:
+                    computed_tokens_for_draft = num_computed_tokens if initial_draft else request.num_computed_tokens
                     num_scheduled_spec_tokens = (
                         num_new_tokens
-                        + request.num_computed_tokens
+                        + computed_tokens_for_draft
                         - request.num_tokens
                         - request.num_output_placeholders
                     )

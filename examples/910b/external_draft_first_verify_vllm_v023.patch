@@ -1,0 +1,85 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -682,7 +682,17 @@
+                     # `request.num_prompt_tokens` to consider the resumed
+                     # requests, which have output tokens.
+                     num_new_tokens = request.num_tokens - num_computed_tokens
++                    initial_draft = bool(request.spec_token_ids) and bool(
++                        (getattr(request.sampling_params, 'extra_args', None) or {})
++                        .get('ascend_external_draft_first_verify', False))
+                     threshold = self.scheduler_config.long_prefill_token_threshold
++                    if initial_draft:
++                        full = request.num_tokens_with_spec - num_computed_tokens
++                        if full <= token_budget and (threshold <= 0 or full <= threshold):
++                            num_new_tokens = full
++                        else:
++                            request.spec_token_ids = []
++                            logger.info('INITIAL_DRAFT request_id=%s status=fallback reason=budget', request.request_id)
+                     if 0 < threshold < num_new_tokens:
+                         num_new_tokens = threshold
+
+@@ -757,6 +767,14 @@
+                     # only if it fits in (free - other in-flight reservations), to
+                     # avoid deadlock and predictable preemptions.
+                     reserved_blocks = self._inflight_prefill_reserved_blocks()
++
++                if (request.spec_token_ids and
++                        (getattr(request.sampling_params, "extra_args", None) or {})
++                        .get("ascend_external_draft_first_verify", False) and
++                        num_computed_tokens + num_new_tokens < request.num_tokens_with_spec):
++                    request.spec_token_ids = []
++                    num_new_tokens = min(num_new_tokens, request.num_tokens - num_computed_tokens)
++                    logger.info("INITIAL_DRAFT request_id=%s status=fallback reason=encoder_or_chunk", request.request_id)
+
+                 new_blocks = self.kv_cache_manager.allocate_slots(
+                     request,
+@@ -822,6 +840,15 @@
+                     request.num_computed_tokens = num_computed_tokens
+                     self._inflight_prefills.add(request)
+                     continue
++
++                if (request.spec_token_ids and
++                        (getattr(request.sampling_params, "extra_args", None) or {})
++                        .get("ascend_external_draft_first_verify", False)):
++                    assert num_computed_tokens + num_new_tokens == request.num_tokens_with_spec
++                    scheduled_spec_decode_tokens[request_id] = request.spec_token_ids
++                    request.spec_token_ids = []
++                    logger.info("INITIAL_DRAFT request_id=%s status=scheduled draft_tokens=%d",
++                                request_id, len(scheduled_spec_decode_tokens[request_id]))
+
+                 self.running.append(request)
+                 if self.log_stats:
+@@ -1798,6 +1825,25 @@
+         """Returns (num_running_reqs, num_waiting_reqs)."""
+         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
+
++    def _prepare_initial_external_draft(self, request: Request) -> None:
++        """Seed first-pass verification before the target is ever executed."""
++        params = request.sampling_params
++        extra = getattr(params, "extra_args", None) or {}
++        first_verify = extra.get("ascend_external_draft_first_verify", False)
++        if type(first_verify) is not bool:
++            raise TypeError("ascend_external_draft_first_verify must be a boolean")
++        if not first_verify:
++            return
++        draft = extra.get("ascend_external_draft")
++        if (not isinstance(draft, (list, tuple)) or not draft
++                or any(type(token) is not int or token < 0 for token in draft)):
++            raise ValueError("first-verify external draft must be nonempty token IDs")
++        if self.num_spec_tokens <= 0 or len(draft) > self.num_spec_tokens:
++            raise ValueError("first-verify draft exceeds speculative kmax")
++        if request.num_tokens + len(draft) >= self.max_model_len:
++            raise ValueError("first-verify draft exceeds model context")
++        request.spec_token_ids = list(draft)
++
+     def add_request(self, request: Request) -> None:
+         existing = self.requests.get(request.request_id)
+         if existing is not None:
+@@ -1813,6 +1859,7 @@
+                 # Streaming-input session finished.
+                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+         else:
++            self._prepare_initial_external_draft(request)
+             if request.resumable:
+                 request.streaming_queue = deque()
+             self._enqueue_waiting_request(request)
